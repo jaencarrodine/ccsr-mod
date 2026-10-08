@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, ModelCompleteResult, RenderElement, RenderInput, Register } from 'claude-code'
 
-import type { ApiChatItem, ApiLobbyItem, ApiMatchSummary, ApiPlayer, ApiQueueState, ApiRankedRow, ApiRecentMatch, ApiRoom, ApiScoreReply, ApiSeason, BacktestRun, RankedMatch, RankedShared, ChatLine, FeedItem, LinkState, Match, ModSettings, OutboxItem, PastSession, Record3, ScanStatus, ScoredCommit, ServerConfig, Surfaces, Tab, WeekTotals } from '../types'
+import type { ApiAccount, ApiChatItem, ApiInstall, ApiLobbyItem, ApiMatchSummary, ApiPlayer, ApiQueueState, ApiRankedRow, ApiRecentMatch, ApiRoom, ApiScoreReply, ApiSeason, BacktestRun, RankedMatch, RankedShared, ChatLine, FeedItem, LinkState, Match, ModSettings, OutboxItem, PastSession, Record3, ScanStatus, SavedAccount, ScoredCommit, ServerConfig, Keyring, Surfaces, Tab, WeekTotals } from '../types'
 import { DEFAULT_SERVER, backoffMs, errorOf, handleProblem, mergeEvents, retryable, scoreBody } from './api'
 import { UPDATE_ARGV, UPDATE_COMMAND, VERSION, standing } from './version'
 import {
@@ -36,7 +36,7 @@ import type { RecentCommit } from './pure'
 import { sessionBars } from './svg'
 import { banner, bandStrip, chatLog, chatRooms, commitBadge, commitList, feed as feedSvg, grind, ladder, numberOne, queue as queueSvg, queueBar, raceClimb, ratingCard, readyCheck, recentMatches, result, scorecard, setupHero, tabsBase, tabsTop, tierFrieze } from './olympia'
 import type { Race, TierKey } from './olympia'
-import { FULL, LINES, MOD, QUIET, ROASTS, SURFACE_ROWS, SURFACE_WHAT, presetOf, resultText, surfacesFrom } from './copy'
+import { ACCOUNT, FULL, LINES, MOD, QUIET, ROASTS, SURFACE_ROWS, SURFACE_WHAT, presetOf, resultText, surfacesFrom } from './copy'
 import type { SurfaceKey } from './copy'
 
 // Every function that is handed $ lives in this file: the engine follows $
@@ -68,12 +68,14 @@ const expanded = atom({ plugin: 'ccsr', key: 'expanded' } as const, null)
 const btLimit = atom({ plugin: 'ccsr', key: 'btLimit' } as const, 15)
 const labNote = atom({ plugin: 'ccsr', key: 'labNote' } as const, '')
 const chatDraft = atom({ plugin: 'ccsr', key: 'chatDraft' } as const, '')
-const LINK0: LinkState = { online: null, note: '', me: null, season: null, grind: null, grindRank: null, outbox: 0, queue: null, ranked: null, ladder: null, myRank: null, grindOf: null, rooms: null, room: 'world', lobby: null, recent: null, release: null, updateNote: '' }
+const LINK0: LinkState = { online: null, note: '', me: null, season: null, grind: null, grindRank: null, outbox: 0, queue: null, ranked: null, ladder: null, myRank: null, grindOf: null, rooms: null, room: 'world', lobby: null, recent: null, release: null, updateNote: '', account: null, installs: null, linkCode: null, unknownToken: false, recoveryFresh: false, confirmRemove: false }
 const link = atom({ plugin: 'ccsr', key: 'link' } as const, LINK0)
 const badges = atom({ plugin: 'ccsr', key: 'badges' } as const, {})
 const turnMarks = atom({ plugin: 'ccsr', key: 'turnMarks' } as const, {})
 const dirty = atom({ plugin: 'ccsr', key: 'dirty' } as const, null)
 const forfeitAsk = atom({ plugin: 'ccsr', key: 'forfeitAsk' } as const, false)
+/** Which way in the first-run card shows: a new handle, a link code, or a recovery key. */
+const joinMode = atom({ plugin: 'ccsr', key: 'joinMode' } as const, 'new' as 'new' | 'link' | 'recover')
 
 // ================================================================== STORE
 
@@ -103,6 +105,8 @@ const K = {
   outbox: 'outbox',
   sent: 'sent',
   salt: 'salt',
+  // Set when the player removed this install, so the keyring doesn't sign it straight back in.
+  optOut: 'optOut',
   // Ranked: idle, queued, offered, live or done, and which match; every session follows it.
   ranked: 'ranked',
   // The newest release the update toast has shown, so it shows once per release.
@@ -637,8 +641,10 @@ type ScoreOut = ScoredCommit | { skip: 'claimed' | 'resting' }
  * any session already judged it, else a skip rule or the judge. Skips (and
  * says why) when another session holds the claim or the commit is resting
  * after three real failures. Transient failures never count toward resting.
+ * `sends`: this commit's score goes to the server, so the server may be asked
+ * about it first; a backtest or a commit kept on this machine never is.
  */
-async function scoreRaw($: $, root: string, raw: RawCommit, pool: RawCommit[]): Promise<ScoreOut> {
+async function scoreRaw($: $, root: string, raw: RawCommit, pool: RawCommit[], sends = false): Promise<ScoreOut> {
   const pid = await patchId($, root, raw.sha)
   const model = (await read($, settings)).model
   const meta = {
@@ -658,6 +664,14 @@ async function scoreRaw($: $, root: string, raw: RawCommit, pool: RawCommit[]): 
   try {
     const skip = await skipReason($, root, raw)
     let v: Verdict
+    // Another install of this account may already have judged this change, or be judging it now.
+    const remote = skip || !sends ? null : await serverClaim($, pid)
+    if (remote === 'taken') return { skip: 'claimed' }
+    if (remote && remote !== 'mine') {
+      v = { points: remote.points, base: remote.base, craft: remote.craft as Verdict['craft'], category: remote.category, reason: ACCOUNT.scoredElsewhere, judge: remote.model, asked: model, rubric: remote.rubric, scoredAt: await $.clock.now() }
+      await putVerdict($, pid, v)
+      return { ...meta, ...v }
+    }
     if (skip) {
       v = { points: 0, base: 0, craft: 'neutral', category: 'chore', reason: skip, judge: 'rule', asked: model, rubric: RUBRIC, scoredAt: await $.clock.now() }
     } else {
@@ -674,6 +688,23 @@ async function scoreRaw($: $, root: string, raw: RawCommit, pool: RawCommit[]): 
   } finally {
     await unclaim($, pid)
   }
+}
+
+type RemoteScore = { fingerprint: string; points: number; base: number; craft: string; category: string; model: string; rubric: string }
+
+/**
+ * Asks the server before judging a change: 'mine' to judge it (also whenever
+ * there's no account or no answer, so scoring never waits on the server),
+ * 'taken' while another install judges it, or the score another install sent.
+ */
+async function serverClaim($: $, pid: string): Promise<'mine' | 'taken' | RemoteScore> {
+  if (!(await serverCfg($)).token) return 'mine'
+  const r = await api($, 'POST', '/scores/claims', { fingerprints: [pid] })
+  if (r.status !== 200) return 'mine'
+  const j = r.json as { claimed: string[]; taken: string[]; scored: RemoteScore[] }
+  const done = j.scored?.find(x => x.fingerprint === pid)
+  if (done) return done
+  return j.taken?.includes(pid) ? 'taken' : 'mine'
 }
 
 /** Earlier commits in the pool get the points they already scored, so the judge sees them. */
@@ -699,7 +730,7 @@ export type ScanResult = {
 /**
  * The Grind: every commit you authored since tracking started, in every repo a
  * Claude Code session has opened (with tracking off, only commits inside a
- * live match, kept as match-only rows). Commit identity:
+ * live match, ranked or practice, kept as match-only rows). Commit identity:
  * - an amended or rebased commit (same author time and subject, old sha gone)
  *   replaces its row; while the old sha is still reachable on another history
  *   (a backup ref), the two count once;
@@ -714,7 +745,15 @@ async function scanGrind($: $, force: boolean, notify?: (c: ScoredCommit) => Pro
   const s = await read($, settings)
   const stored = await storeGet<Match | null>($, K.match, null)
   const liveMatch = stored && stored.status === 'live' && stored.kind === 'practice' && Array.isArray(stored.plan) ? stored : null
-  if (!s.tracking && !liveMatch) return result
+  // A ranked match running on the server (or counting after its bell), its window from the last poll.
+  const rk = (await read($, link)).ranked?.summary
+  const rankedOn = rk?.status === 'live' || rk?.status === 'grace'
+  const rankedWindow = rankedOn && rk?.started_at && rk.deadline ? { startAt: Date.parse(rk.started_at), deadline: Date.parse(rk.deadline) } : null
+  // With tracking off only a match's commits are scored: a ranked one, else a practice match here.
+  const matchWindow = rankedWindow ?? liveMatch
+  if (!s.tracking && !matchWindow) return result
+  // The same rule as onScore: the Grind goes to the server while tracking is on, a ranked match's commits whenever one runs.
+  const sends = s.tracking || rankedOn
   await update($, scan, cur => ({ ...SCAN0, ...cur, busy: true, note: 'Looking for new commits' }))
   try {
     const since = await storeGet($, K.since, await read($, trackingSince))
@@ -760,8 +799,8 @@ async function scanGrind($: $, force: boolean, notify?: (c: ScoredCommit) => Pro
           })
         }
         await withPoints($, listed)
-        const scoreFrom = s.tracking ? floor : Math.max(floor, liveMatch!.startAt)
-        const scoreTo = s.tracking ? t + 60_000 : liveMatch!.deadline
+        const scoreFrom = s.tracking ? floor : Math.max(floor, matchWindow!.startAt)
+        const scoreTo = s.tracking ? t + 60_000 : matchWindow!.deadline
         let incomplete = false
         for (const raw of kept.sort((a, b) => a.authoredAt - b.authoredAt)) {
           if (raw.authoredAt < scoreFrom || raw.authoredAt > scoreTo) continue
@@ -780,7 +819,7 @@ async function scanGrind($: $, force: boolean, notify?: (c: ScoredCommit) => Pro
           await update($, scan, cur => ({ ...SCAN0, ...cur, busy: true, note: `Scoring "${raw.title.slice(0, 50)}"` }))
           let out: ScoreOut
           try {
-            out = await scoreRaw($, root, raw, listed)
+            out = await scoreRaw($, root, raw, listed, sends)
           } catch (err) {
             const msg = clean((err as Error).message)
             result.errors.push(`${name} ${raw.sha.slice(0, 7)} "${raw.title.slice(0, 40)}": ${msg}`)
@@ -1531,8 +1570,8 @@ async function serverCfg($: $) {
 }
 
 /** One request: `{ status, json }`, status 0 when the server couldn't be reached. */
-async function api($: $, method: string, path: string, body?: unknown): Promise<{ status: number; json: unknown }> {
-  const cfg = await serverCfg($)
+async function api($: $, method: string, path: string, body?: unknown, as: { url?: string; token?: string | null } = {}): Promise<{ status: number; json: unknown }> {
+  const cfg = { ...(await serverCfg($)), ...as }
   // Which mod and Claude Code this is: below the server's floor, ranked play is refused (docs/api.md, "Versions").
   const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json', 'x-ccsr-mod': VERSION }
   const claude = await claudeVersion($)
@@ -1624,19 +1663,156 @@ async function saltOf($: $) {
   return salt
 }
 
-/** Who we are and the season's judge, from the server, into this session's link. */
+// ------------------------------------------------------------------ accounts and installs
+// A handle is one player on the server with one token per install (a Claude
+// Code config dir on some machine). The token is the only thing this install
+// needs, and it is never dropped on a doubt: only the server saying the install
+// was removed (`token_revoked`) forgets it. Three ways back in when it's gone:
+// the machine's keyring (~/.ccsr/keyring.json, read by every config dir on the
+// machine), a link code from another install, or the account's recovery key.
+
+/** The keyring's path, or null where there's no home directory to keep it in. */
+async function keyringPath($: $) {
+  const home = (await $.env.get('HOME').catch(() => undefined)) || (await $.env.get('USERPROFILE').catch(() => undefined))
+  return home ? `${home.replace(/[\\/]+$/, '')}/.ccsr/keyring.json` : null
+}
+
+/** The keyring, or an empty one when it's missing, unreadable, or there's no fs here (tests). */
+async function readKeyring($: $): Promise<Keyring> {
+  const empty: Keyring = { v: 1, servers: {} }
+  try {
+    const path = await keyringPath($)
+    if (!path) return empty
+    const k = JSON.parse(String(await $.fs.read(path))) as Keyring
+    return k && k.v === 1 && k.servers && typeof k.servers === 'object' ? k : empty
+  } catch {
+    return empty
+  }
+}
+
+/** Sets or clears this server's entry. Best effort: a keyring that can't be written never stops a sign-in. */
+async function writeKeyring($: $, url: string, entry: Keyring['servers'][string] | null) {
+  try {
+    const path = await keyringPath($)
+    if (!path) return
+    const k = await readKeyring($)
+    if (entry) k.servers[url] = entry
+    else delete k.servers[url]
+    await $.fs.write(path, JSON.stringify(k, null, 2) + '\n')
+  } catch {
+    // No fs on this surface, or the home directory isn't writable.
+  }
+}
+
+/** What Settings calls this install: its config dir, with the home directory as ~. */
+async function installLabel($: $) {
+  const home = (await $.env.get('HOME').catch(() => undefined)) ?? ''
+  const dir = (await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)) || '~/.claude'
+  return (home && dir.startsWith(home) ? `~${dir.slice(home.length)}` : dir).slice(0, 64)
+}
+
+/**
+ * Who we are and the season's judge, from the server, into this session's
+ * link. With no token, the keyring may sign this install in on its own.
+ */
 async function refreshAccount($: $) {
   const cfg = await serverCfg($)
   const season = await api($, 'GET', '/season')
   if (season.status === 200) await update($, link, l => ({ ...l, season: (season.json as { season: ApiSeason }).season }))
-  if (!cfg.token) return
-  const me = await api($, 'GET', '/me')
-  if (me.status === 200) await update($, link, l => ({ ...l, me: (me.json as { player: ApiPlayer }).player }))
-  // A token the server no longer knows is gone; the player signs up again.
-  if (me.status === 401) {
-    await save($, K.server, { ...cfg, token: null })
-    await update($, link, l => ({ ...l, me: null, note: 'The server did not know this account. Pick a handle to join again.' }))
+  if (!cfg.token) {
+    await linkFromKeyring($)
+    return
   }
+  const me = await api($, 'GET', '/me')
+  if (me.status === 200) {
+    const j = me.json as { player: ApiPlayer; account?: ApiAccount }
+    await update($, link, l => ({ ...l, me: j.player, account: j.account ?? null, unknownToken: false }))
+    if (j.account) await adoptSalt($, j.account.salt)
+    // Accounts from before the keyring: put this one in it, so the machine's other config dirs find it.
+    const k = await readKeyring($)
+    if (!k.servers[cfg.url]) await writeKeyring($, cfg.url, { handle: j.player.handle, token: cfg.token, recovery_key: cfg.recoveryKey ?? null })
+    await loadInstalls($)
+    return
+  }
+  if (me.status !== 401) return
+  if (errorOf(me.json)?.code === 'token_revoked') {
+    await forgetHere($, ACCOUNT.removed)
+    return
+  }
+  // Unknown is not gone: a wrong server address or a restored database. Keep the token and offer the ways in.
+  await update($, link, l => ({ ...l, me: null, unknownToken: true, note: ACCOUNT.unknown }))
+}
+
+/** A new config dir on a machine that already plays: link it with the keyring's token, no code needed. */
+async function linkFromKeyring($: $) {
+  if (await storeGet<boolean>($, K.optOut, false)) return
+  const cfg = await serverCfg($)
+  const entry = (await readKeyring($)).servers[cfg.url]
+  if (!entry?.token) return
+  const code = await api($, 'POST', '/accounts/link-code', {}, { token: entry.token })
+  if (code.status === 401) {
+    if (errorOf(code.json)?.code === 'token_revoked') await writeKeyring($, cfg.url, null)
+    return
+  }
+  if (code.status !== 201) return
+  const r = await api($, 'POST', '/accounts/link', { code: (code.json as { code: string }).code, install: await installLabel($) }, { token: null })
+  if (r.status !== 201) return
+  await signedIn($, r.json as SignInReply, entry.recovery_key ?? null)
+  await update($, link, l => ({ ...l, note: ACCOUNT.autoLinked((r.json as SignInReply).player.handle) }))
+}
+
+type SignInReply = { token: string; player: ApiPlayer; salt: string | null; has_recovery_key: boolean; recovery_key?: string }
+
+/** Every way in ends here: keep the token, take the account's salt, write the keyring, send this week's scores. */
+async function signedIn($: $, j: SignInReply, knownKey: string | null = null) {
+  const cfg = await serverCfg($)
+  const handle = j.player.handle
+  const recoveryKey = j.recovery_key ?? knownKey ?? (cfg.handle === handle ? (cfg.recoveryKey ?? null) : null)
+  await save($, K.server, { ...cfg, token: j.token, handle, recoveryKey })
+  await $.store.delete(K.optOut)
+  await saveSettings($, { handle })
+  await update($, link, l => ({ ...l, me: j.player, note: '', unknownToken: false, confirmRemove: false, recoveryFresh: !!j.recovery_key, linkCode: null }))
+  await adoptSalt($, j.salt)
+  await writeKeyring($, cfg.url, { handle, token: j.token, recovery_key: recoveryKey })
+  await refreshAccount($)
+  // This week's scored commits go up with the account, so the Grind starts where the player already is.
+  // Last, so what the outbox says (a refused score) is the note left on screen.
+  const list = await storeGet<ScoredCommit[]>($, K.ledger, [])
+  const since = periodStart('week', await $.clock.now())
+  await enqueue(
+    $,
+    list.filter(c => c.authoredAt >= since && !c.matchOnly),
+  )
+  await flushOutbox($)
+}
+
+/**
+ * Every install of an account hashes repo names with the account's salt, so
+ * the server sees one repo and one commit identity whichever install sent it.
+ * An account from before the server kept salts gets this install's.
+ */
+async function adoptSalt($: $, serverSalt: string | null) {
+  const local = await saltOf($)
+  let salt = serverSalt
+  if (!salt) {
+    const r = await api($, 'POST', '/me/salt', { salt: local })
+    if (r.status !== 200) return
+    salt = (r.json as { salt: string }).salt
+  }
+  if (salt === local) return
+  await save($, K.salt, salt)
+  // Scores still waiting were hashed with the old salt: hash them again.
+  const box = await storeGet<OutboxItem[]>($, K.outbox, [])
+  if (box.length === 0) return
+  const pids = new Set(box.map(b => b.pid))
+  const rows = (await storeGet<ScoredCommit[]>($, K.ledger, [])).filter(c => pids.has(c.pid))
+  await save($, K.outbox, [])
+  await enqueue($, rows)
+}
+
+function signInProblem(r: { status: number; json: unknown }) {
+  if (r.status === 0) return "Can't reach the server."
+  return errorOf(r.json)?.message ?? `The server answered ${r.status}.`
 }
 
 /** Joins with a handle. Returns a problem to show, or '' when joined. */
@@ -1654,42 +1830,117 @@ async function signup($: $, raw: string): Promise<string> {
   } catch {
     tz = 'UTC'
   }
-  const r = await api($, 'POST', '/accounts', { handle, grind_tracking: s.tracking, share_titles: s.share, time_zone: tz })
+  const r = await api($, 'POST', '/accounts', { handle, grind_tracking: s.tracking, share_titles: s.share, time_zone: tz, salt: await saltOf($), install: await installLabel($) }, { token: null })
   if (r.status !== 201) {
-    const e = errorOf(r.json)
-    const why = e?.code === 'handle_taken' ? 'That handle is taken.' : (e?.message ?? (r.status === 0 ? "Can't reach the server." : `The server answered ${r.status}.`))
+    const why = errorOf(r.json)?.code === 'handle_taken' ? 'That handle is taken.' : signInProblem(r)
     await update($, link, l => ({ ...l, note: why }))
     return why
   }
-  const { token, player } = r.json as { token: string; player: ApiPlayer }
-  const cfg = await serverCfg($)
-  await save($, K.server, { ...cfg, token, handle })
-  await saveSettings($, { handle })
-  await update($, link, l => ({ ...l, me: player }))
-  // This week's scored commits go up with the account, so the Grind starts where the player already is.
-  const list = await storeGet<ScoredCommit[]>($, K.ledger, [])
-  const since = periodStart('week', await $.clock.now())
-  await enqueue(
-    $,
-    list.filter(c => c.authoredAt >= since && !c.matchOnly),
-  )
-  await flushOutbox($)
+  await signedIn($, r.json as SignInReply)
   return ''
 }
 
-async function signOut($: $) {
-  const cfg = await serverCfg($)
-  await save($, K.server, { ...cfg, token: null, handle: null })
-  await save($, K.outbox, [])
-  await update($, link, () => ({ ...LINK0, online: null }))
+/** Joins the account another install is signed in to, with the code it showed. */
+async function joinWithCode($: $, raw: string) {
+  const code = raw.trim()
+  if (!code) return
+  const r = await api($, 'POST', '/accounts/link', { code, install: await installLabel($) }, { token: null })
+  if (r.status !== 201) return update($, link, l => ({ ...l, note: signInProblem(r) }))
+  await signedIn($, r.json as SignInReply)
 }
 
+/** Back in with the account's recovery key. */
+async function recoverWith($: $, raw: string) {
+  const key = raw.trim()
+  if (!key) return
+  const r = await api($, 'POST', '/accounts/recover', { recovery_key: key, install: await installLabel($) }, { token: null })
+  if (r.status !== 201) return update($, link, l => ({ ...l, note: signInProblem(r) }))
+  await signedIn($, r.json as SignInReply, key)
+}
+
+/** A code another install can join with, shown in Settings for 10 minutes. */
+async function makeLinkCode($: $) {
+  const r = await api($, 'POST', '/accounts/link-code', {})
+  if (r.status !== 201) return update($, link, l => ({ ...l, note: signInProblem(r) }))
+  const j = r.json as { code: string; expires_at: string }
+  await update($, link, l => ({ ...l, linkCode: { code: j.code, expiresAt: j.expires_at } }))
+}
+
+/** A new recovery key; the old one stops working. Shown until copied. */
+async function newRecoveryKey($: $) {
+  const r = await api($, 'POST', '/me/recovery', {})
+  if (r.status !== 201) return update($, link, l => ({ ...l, note: signInProblem(r) }))
+  const key = (r.json as { recovery_key: string }).recovery_key
+  const cfg = await serverCfg($)
+  await save($, K.server, { ...cfg, recoveryKey: key })
+  if (cfg.token) await writeKeyring($, cfg.url, { handle: cfg.handle, token: cfg.token, recovery_key: key })
+  await update($, link, l => ({ ...l, recoveryFresh: true }))
+  await refreshAccount($)
+}
+
+async function copyRecoveryKey($: $, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') {
+  const key = (await serverCfg($)).recoveryKey
+  if (!key) return
+  const c = await $.ui.copy({ text: key, surface }).catch(() => ({ isCopied: false }))
+  await update($, link, l => ({ ...l, recoveryFresh: false, note: c.isCopied ? ACCOUNT.copied : key }))
+}
+
+async function loadInstalls($: $) {
+  const r = await api($, 'GET', '/me/installs')
+  if (r.status === 200) await update($, link, l => ({ ...l, installs: (r.json as { installs: ApiInstall[] }).installs }))
+}
+
+/** Removes another install of this account. */
+async function removeInstall($: $, id: number) {
+  const r = await api($, 'DELETE', `/me/installs/${id}`)
+  if (r.status === 200) await update($, link, l => ({ ...l, installs: (r.json as { installs: ApiInstall[] }).installs }))
+  else await update($, link, l => ({ ...l, note: signInProblem(r) }))
+}
+
+/** Remove this install: the first press warns, the second removes it on the server, then here. */
+async function removeThisInstall($: $) {
+  const l = await read($, link)
+  if (!l.confirmRemove) {
+    await update($, link, x => ({ ...x, confirmRemove: true, note: ACCOUNT.removeWarn(l.me?.handle ?? 'your account') }))
+    return
+  }
+  const id = l.account?.install.id
+  const r = id ? await api($, 'DELETE', `/me/installs/${id}`) : { status: 401, json: { error: { code: 'token_revoked' } } }
+  if (r.status === 200 || (r.status === 401 && errorOf(r.json)?.code === 'token_revoked')) {
+    await save($, K.optOut, true)
+    await forgetHere($, '')
+    return
+  }
+  await update($, link, x => ({ ...x, confirmRemove: false, note: signInProblem(r) }))
+}
+
+/** Forgets this install's sign-in, here and in the keyring when the keyring holds this same token. */
+async function forgetHere($: $, note: string) {
+  const cfg = await serverCfg($)
+  const k = await readKeyring($)
+  if (cfg.token && k.servers[cfg.url]?.token === cfg.token) await writeKeyring($, cfg.url, null)
+  await save($, K.server, { ...cfg, token: null, handle: null })
+  await save($, K.outbox, [])
+  await update($, link, () => ({ ...LINK0, online: null, note }))
+}
+
+/**
+ * Points the mod at another server address. The account for the old address
+ * is kept under `saved`; the new address gets its own saved account, or, when
+ * the current token works there too (the same server under a new name, like
+ * Railway's address moving to api.ccsr.gg), keeps the current one.
+ */
 async function setServerUrl($: $, url: string) {
   const u = url.trim().replace(/\/+$/, '')
   if (!/^https?:\/\/[^\s]+$/.test(u)) return
   const cfg = await serverCfg($)
-  // Another server is another account: the token stays with the server it came from.
-  await save($, K.server, { ...cfg, url: u, token: u === cfg.url ? cfg.token : null, handle: u === cfg.url ? cfg.handle : null })
+  if (u === cfg.url) return
+  const saved: Record<string, SavedAccount> = { ...(cfg.saved ?? {}) }
+  if (cfg.token) saved[cfg.url] = { token: cfg.token, handle: cfg.handle, recoveryKey: cfg.recoveryKey ?? null }
+  let next: SavedAccount | null = saved[u] ?? null
+  if (!next && cfg.token && (await api($, 'GET', '/me', undefined, { url: u })).status === 200) next = saved[cfg.url]!
+  delete saved[u]
+  await save($, K.server, { url: u, token: next?.token ?? null, handle: next?.handle ?? null, recoveryKey: next?.recoveryKey ?? null, saved })
   await update($, link, () => ({ ...LINK0 }))
   await refreshAccount($)
 }
@@ -2115,7 +2366,15 @@ export type Actions = {
   resetGrind: () => void
   lab: (what: string, surface: string) => void
   signup: (handle: string) => void
-  signOut: () => void
+  joinWithCode: (code: string) => void
+  recoverWith: (key: string) => void
+  setJoinMode: (mode: 'new' | 'link' | 'recover') => void
+  makeLinkCode: () => void
+  newRecoveryKey: () => void
+  copyRecoveryKey: (surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void
+  recoverySaved: () => void
+  removeInstall: (id: number) => void
+  removeThisInstall: () => void
   setServer: (url: string) => void
   queue: () => void
   leaveQueue: () => void
@@ -2772,6 +3031,57 @@ function recentRow(x: ApiRecentMatch) {
  * the result. Every line is approved in docs/copy.md; the mod's own come from MOD in copy.ts.
  */
 async function rankedBox($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: number): Promise<RenderElement> {
+  const body = await rankedBody($, e, els, a, t)
+  const banner = await recoveryBanner($, e, els, a)
+  if (!banner) return body
+  const { Box } = els
+  return (
+    <Box flexDirection="column" gap={1}>
+      {banner}
+      {body}
+    </Box>
+  )
+}
+
+/** Right after a recovery key is made: say why it matters and copy it, until copied or waved off. */
+async function recoveryBanner($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promise<RenderElement | null> {
+  const l = await read($, link)
+  const cfg = await serverCfg($)
+  if (!l.recoveryFresh || !cfg.token || !cfg.recoveryKey) return null
+  const { Box, Text, Button } = els
+  return (
+    <Box flexDirection="column">
+      <Text color={ORANGE} wrap="wrap">
+        {ACCOUNT.saveKey(cfg.handle ?? '')}
+      </Text>
+      <Box gap={1}>
+        <Button key="recovery-copy" label={ACCOUNT.copyKey} variant="primary" onPress={() => a.copyRecoveryKey(e.surface)} />
+        <Button key="recovery-saved" label={ACCOUNT.savedIt} onPress={() => a.recoverySaved()} />
+      </Box>
+    </Box>
+  )
+}
+
+/** The ways in: pick a new handle, link with a code from another install, or a recovery key. */
+async function joinBlock($: $, e: RenderInput<'Pane'>, els: El, a: Actions, prefix: string): Promise<RenderElement | null> {
+  if (e.surface === 'mobile') return null
+  const { Box, Button, Input } = els
+  const mode = await read($, joinMode)
+  return (
+    <Box flexDirection="column" gap={1}>
+      {mode === 'new' && <Input key={`${prefix}join`} label="Handle" placeholder="2 to 20 of a-z, 0-9 and _" submitLabel="Join" onSubmit={v => a.signup(v)} />}
+      {mode === 'link' && <Input key={`${prefix}link`} label={ACCOUNT.codeLabel} placeholder={ACCOUNT.codePlaceholder} submitLabel={ACCOUNT.codeSubmit} onSubmit={v => a.joinWithCode(v)} />}
+      {mode === 'recover' && <Input key={`${prefix}recover`} label={ACCOUNT.keyLabel} placeholder={ACCOUNT.keyPlaceholder} submitLabel={ACCOUNT.keySubmit} onSubmit={v => a.recoverWith(v)} />}
+      <Box gap={1}>
+        {mode !== 'new' && <Button key={`${prefix}mode-new`} label={ACCOUNT.newHandle} onPress={() => a.setJoinMode('new')} />}
+        {mode !== 'link' && <Button key={`${prefix}mode-link`} label={ACCOUNT.linkWith} onPress={() => a.setJoinMode('link')} />}
+        {mode !== 'recover' && <Button key={`${prefix}mode-recover`} label={ACCOUNT.recoverWith} onPress={() => a.setJoinMode('recover')} />}
+      </Box>
+    </Box>
+  )
+}
+
+async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: number): Promise<RenderElement> {
   const { Box, Text, Button, Svg, Input } = els
   const rich = e.surface !== 'terminal'
   const cfg = await serverCfg($)
@@ -2781,11 +3091,11 @@ async function rankedBox($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: n
   const draft = await read($, chatDraft)
   const me = cfg.handle ?? ''
 
-  if (!cfg.token)
+  if (!cfg.token || l.unknownToken)
     return (
       <Box flexDirection="column" gap={1}>
         {rich ? <Svg source={setupHero({ placementMatches: 3 })} alt={`${LINES.handle} Everyone starts in the mud.`} /> : <Text bold>{LINES.handle}</Text>}
-        {e.surface !== 'mobile' && <Input key="match-join" label="Handle" placeholder="2 to 20 of a-z, 0-9 and _" submitLabel="Join" onSubmit={v => a.signup(v)} />}
+        {await joinBlock($, e, els, a, 'match-')}
         {l.note && (
           <Text color={ORANGE} wrap="wrap">
             {l.note}
@@ -3545,6 +3855,60 @@ function coinSvg() {
 
 // ---------------------------------------------------------------- settings tab
 
+/** "4 min ago" from an ISO time. */
+function ago(iso: string | null, now: number) {
+  if (!iso) return 'never'
+  const m = Math.max(0, Math.round((now - Date.parse(iso)) / 60_000))
+  if (m < 1) return 'now'
+  if (m < 60) return `${m} min ago`
+  const h = Math.round(m / 60)
+  return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`
+}
+
+/** Settings, signed in: the recovery key, the account's installs, link another, remove this one. */
+async function accountRows($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promise<RenderElement> {
+  const { Box, Text, Button } = els
+  const l = await read($, link)
+  const cfg = await serverCfg($)
+  const now = await $.clock.now()
+  const has = l.account?.has_recovery_key ?? false
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column">
+        <Text dimColor wrap="wrap">
+          {!has ? ACCOUNT.noKey : cfg.recoveryKey ? ACCOUNT.hasKey : ACCOUNT.keyElsewhere}
+        </Text>
+        <Box gap={1}>
+          {has && cfg.recoveryKey && <Button key="recovery-copy-settings" label={ACCOUNT.copyKey} onPress={() => a.copyRecoveryKey(e.surface)} />}
+          <Button key="recovery-new" label={ACCOUNT.newKey} variant={has ? 'secondary' : 'primary'} onPress={() => a.newRecoveryKey()} />
+        </Box>
+      </Box>
+      <Box flexDirection="column">
+        <Text bold color={STONE}>
+          {ACCOUNT.installs.toUpperCase()}
+        </Text>
+        {(l.installs ?? []).map(i => (
+          <Box key={`install-${i.id}`} gap={1} alignItems="center">
+            <Text wrap="truncate-end">
+              {i.label || 'unnamed'} · {i.this ? ACCOUNT.thisInstall : ACCOUNT.seen(ago(i.last_seen_at, now))}
+            </Text>
+            {!i.this && <Button key={`install-remove-${i.id}`} label={ACCOUNT.remove} onPress={() => a.removeInstall(i.id)} />}
+          </Box>
+        ))}
+        {l.linkCode && Date.parse(l.linkCode.expiresAt) > now ? (
+          <Text color={ORANGE} wrap="wrap">
+            {ACCOUNT.codeShown(l.linkCode.code)}
+          </Text>
+        ) : null}
+        <Box gap={1}>
+          <Button key="link-another" label={ACCOUNT.linkAnother} onPress={() => a.makeLinkCode()} />
+          <Button key="remove-this" label={ACCOUNT.removeThis} variant={l.confirmRemove ? 'primary' : 'secondary'} onPress={() => a.removeThisInstall()} />
+        </Box>
+      </Box>
+    </Box>
+  )
+}
+
 async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promise<RenderElement> {
   const { Box, Text, Button, Input, Select, Link } = els
   const s = await read($, settings)
@@ -3563,17 +3927,15 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
         {l.season ? ` · season ${l.season.id}: ${l.season.model}, ${l.season.rubric}` : ''}
       </Text>
       {l.me ? (
-        <Box gap={1} alignItems="center">
-          <Text>
-            Signed in as {l.me.handle} · {l.me.placement ? `${l.me.tier}, placing ${l.me.placement.played} of ${l.me.placement.of}` : `${l.me.tier} ${l.me.rating}`}
-          </Text>
-          <Button key="sign-out" label="Sign out" onPress={() => a.signOut()} />
-        </Box>
-      ) : cfg.token ? (
+        <Text>
+          Signed in as {l.me.handle} · {l.me.placement ? `${l.me.tier}, placing ${l.me.placement.played} of ${l.me.placement.of}` : `${l.me.tier} ${l.me.rating}`}
+        </Text>
+      ) : cfg.token && !l.unknownToken ? (
         <Text dimColor>Signed in as {cfg.handle}; checking with the server.</Text>
       ) : (
-        e.surface !== 'mobile' && <Input key="join" label="Pick a handle" placeholder="2 to 20 of a-z, 0-9 and _" submitLabel="Join" onSubmit={v => a.signup(v)} />
+        await joinBlock($, e, els, a, '')
       )}
+      {l.me && (await accountRows($, e, els, a))}
       {l.note && <Text color={ORANGE} wrap="wrap">{l.note}</Text>}
       {e.surface !== 'mobile' && <Input key="server-url" label="Server URL" value={cfg.url} submitLabel="Use" onSubmit={v => a.setServer(v)} />}
     </Box>
@@ -3640,6 +4002,7 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
       </Text>
       <Text bold>Version</Text>
       <Text dimColor>{MOD.version(VERSION)}</Text>
+      <Text dimColor>{MOD.autoUpdate}</Text>
       {l.release && standing(l.release) !== 'current' && (
         <Box gap={1} alignItems="center" flexWrap="wrap">
           <Text>{MOD.updateOut(l.release.latest)}</Text>
@@ -4059,7 +4422,15 @@ function actions($: $): Actions {
     resetGrind: () => go(resetGrind($)),
     lab: (what, surface) => go(lab($, what, surface)),
     signup: h => go(signup($, h)),
-    signOut: () => go(signOut($)),
+    joinWithCode: code => go(joinWithCode($, code)),
+    recoverWith: key => go(recoverWith($, key)),
+    setJoinMode: mode => go(update($, joinMode, () => mode)),
+    makeLinkCode: () => go(makeLinkCode($)),
+    newRecoveryKey: () => go(newRecoveryKey($)),
+    copyRecoveryKey: surface => go(copyRecoveryKey($, surface)),
+    recoverySaved: () => go(update($, link, l => ({ ...l, recoveryFresh: false }))),
+    removeInstall: id => go(removeInstall($, id)),
+    removeThisInstall: () => go(removeThisInstall($)),
     setServer: url => go(setServerUrl($, url)),
     queue: () => go(joinQueue($)),
     leaveQueue: () => go(leaveQueue($)),

@@ -252,8 +252,24 @@ export type ApiScoreReply = {
 /** A score waiting to reach the server, kept in the store until it does or is refused for good. */
 export type OutboxItem = { pid: string; body: ApiScoreBody; tries: number; nextAt: number; lastError?: string }
 
-/** The server connection as the mod keeps it in `$.store`. */
-export type ServerConfig = { url: string; token: string | null; handle: string | null }
+/** One account on one server, as an install keeps it. */
+export type SavedAccount = { token: string; handle: string | null; recoveryKey?: string | null }
+
+/**
+ * The server connection as the mod keeps it in `$.store`. `saved` holds the
+ * accounts for other server addresses, so switching servers never loses one.
+ * `recoveryKey` is the account's recovery key when this install made or saw it.
+ */
+export type ServerConfig = { url: string; token: string | null; handle: string | null; recoveryKey?: string | null; saved?: Record<string, SavedAccount> }
+
+/** `GET /me`'s account block: the salt every install hashes repos with, recovery, which install this is. */
+export type ApiAccount = { salt: string | null; has_recovery_key: boolean; recovery_made_at: string | null; install: { id: number; label: string } }
+
+/** One install (a Claude Code config dir on some machine) signed in to the account. */
+export type ApiInstall = { id: number; label: string; created_at: string; last_seen_at: string | null; this: boolean }
+
+/** The machine-wide keyring at ~/.ccsr/keyring.json: survives a wiped config dir, a reinstall, a second config dir. */
+export type Keyring = { v: 1; servers: Record<string, { handle: string | null; token: string; recovery_key?: string | null }> }
 
 /** A ranked match as the mod follows it: the summary from the last poll, the feed and chat so far, the cursor. */
 export type RankedMatch = { id: string; summary: ApiMatchSummary | null; events: ApiMatchEvent[]; cursor: number; polledAt: number }
@@ -295,6 +311,16 @@ export type LinkState = {
   release: { latest: string; min: string } | null
   /** What the last Update press did. */
   updateNote: string
+  /** The account block from `/me`, the account's installs, and an open link code. */
+  account: ApiAccount | null
+  installs: ApiInstall[] | null
+  linkCode: { code: string; expiresAt: string } | null
+  /** The server answered `unauthorized` for the token this install holds: kept, never dropped, until the player signs in another way. */
+  unknownToken: boolean
+  /** A recovery key was just made and not yet copied. */
+  recoveryFresh: boolean
+  /** Remove this install was pressed once; the second press removes it. */
+  confirmRemove: boolean
 }
 
 export type ApiRecentMatch = {
@@ -344,6 +370,7 @@ declare module 'claude-code' {
       dirty: { repo: string; files: number } | null
       /** Forfeit was pressed once: the pane asks to confirm before it costs rating. */
       forfeitAsk: boolean
+      joinMode: 'new' | 'link' | 'recover'
     }
   }
 }

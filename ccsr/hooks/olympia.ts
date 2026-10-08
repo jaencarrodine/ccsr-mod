@@ -39,7 +39,7 @@ export const COPY = {
   lengths: '1h for a quick L. 3h for a long one.',
 }
 
-/** Lines drawn inside a graphic that aren't in docs/copy.md yet. TODO copy: listed in docs/ui-spec.md for Jaen. */
+/** Lines drawn inside a graphic, approved in docs/copy.md ("Inside the mod's graphics", 2026-10-08). */
 export const TODO_COPY = {
   mud: 'Everyone starts in the mud.',
   quiet: 'quiet in here',

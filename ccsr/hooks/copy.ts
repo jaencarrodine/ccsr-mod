@@ -91,14 +91,49 @@ export const MOD = {
   notRanked: 'Not ranked until placed.',
   locked: 'Rooms above your tier are locked.',
   practice: 'Practice against a bot. Your commits score for real; the rating is practice only.',
-  // Updates (docs/copy.md, "The mod", approved 2026-10-08 as Jaen's defaults).
+  // Updates (docs/copy.md, "The mod", approved 2026-10-08).
   updateOut: (latest: string) => `CCSR ${latest} is out. Update between matches.`,
   updateNeeded: (min: string, version: string) => `Ranked needs CCSR ${min}. You're on CCSR ${version}.`,
   updated: 'Updated. Restart Claude Code to load it.',
-  // TODO copy: the rest of the update lines.
   updating: 'Updating CCSR.',
   updateCopied: 'Copied the update command. Run it in a terminal, then restart Claude Code.',
   version: (v: string) => `CCSR ${v}`,
+  autoUpdate: "Turn on auto-update for ccsr in /plugin and you'll never see the Update button.",
+}
+
+// ------------------------------------------------------------------ accounts and installs
+
+/** The account lines (link codes, recovery keys, installs), approved in docs/copy.md on 2026-10-08. */
+export const ACCOUNT = {
+  linkWith: 'Link with a code',
+  recoverWith: 'Use a recovery key',
+  newHandle: 'Pick a handle',
+  codeLabel: 'Link code',
+  codePlaceholder: 'The 6 letters from your other install',
+  codeSubmit: 'Link',
+  keyLabel: 'Recovery key',
+  keyPlaceholder: 'ccsr_rec_...',
+  keySubmit: 'Sign in',
+  saveKey: (h: string) => `Save your recovery key. It gets you back into ${h} from any machine if this one loses its sign-in.`,
+  copyKey: 'Copy recovery key',
+  copied: 'Copied. Keep it somewhere safe, like a password manager.',
+  savedIt: 'Saved it',
+  hasKey: 'Recovery key on this install.',
+  keyElsewhere: 'Your recovery key was made on another install. Make a new one here to see it; the old one stops working.',
+  noKey: 'No recovery key yet. Make one so you can get back in from another machine.',
+  newKey: 'Make a new recovery key',
+  linkAnother: 'Link another install',
+  codeShown: (code: string) => `Enter ${code} in the other install's Match tab, under Link with a code. Works once, for 10 minutes.`,
+  installs: 'Installs',
+  thisInstall: 'this install',
+  seen: (ago: string) => `seen ${ago}`,
+  remove: 'Remove',
+  removeThis: 'Remove this install',
+  removeWarn: (h: string) => `This signs this install out of ${h}. Press again to remove it. Without another install or your recovery key, you can't get back in.`,
+  removed: 'This install was removed from its account. Link it again or use your recovery key.',
+  unknown: "The server doesn't know this install's sign-in. Check the server address, link with a code, or use your recovery key.",
+  autoLinked: (h: string) => `Signed in as ${h} from another install on this machine.`,
+  scoredElsewhere: 'Scored by your other install.',
 }
 
 // ------------------------------------------------------------------ the surface switches (docs/ui-spec.md, Settings)

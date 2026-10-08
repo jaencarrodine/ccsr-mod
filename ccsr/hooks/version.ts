@@ -4,7 +4,7 @@
 // scripts/publish-mod.sh bumps both and refuses to publish when they differ.
 // Pure: no `$` here, so register.tsx can import it.
 
-export const VERSION = '0.2.0'
+export const VERSION = '0.3.0'
 
 /** Updates an installed mod from the install repo; it loads once Claude Code restarts. */
 export const UPDATE_ARGV = [
