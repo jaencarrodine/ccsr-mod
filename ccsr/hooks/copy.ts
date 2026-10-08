@@ -1,7 +1,6 @@
-// Every user-facing line the mod draws that isn't data. Approved lines come
-// from docs/copy.md (change them there first); TODO lines are placeholders in
-// the voice, listed in docs/ui-spec.md (Copy) until Jaen approves them. Pure:
-// no `$` here, so register.tsx can import it.
+// Every user-facing line the mod draws that isn't data, all approved in
+// docs/copy.md (change a line there first, then here). Pure: no `$` here, so
+// register.tsx can import it.
 
 import type { Surfaces } from '../types'
 
@@ -77,8 +76,8 @@ export const ROASTS = [
   'Microwaving fish at the desk to intimidate an opponent in another country',
 ]
 
-/** TODO copy: placeholders, not approved. Listed in docs/ui-spec.md. */
-export const TODO = {
+/** The mod's own lines (docs/copy.md, "The mod", approved 2026-10-08). */
+export const MOD = {
   warn10: '10 minutes to the bell. Only commits score.',
   warn1: '1 minute to the bell. Only commits score.',
   uncommitted: (n: number, repo: string) => `${n} file${n === 1 ? '' : 's'} uncommitted in ${repo}. Only commits score.`,
@@ -92,6 +91,14 @@ export const TODO = {
   notRanked: 'Not ranked until placed.',
   locked: 'Rooms above your tier are locked.',
   practice: 'Practice against a bot. Your commits score for real; the rating is practice only.',
+  // Updates (docs/copy.md, "The mod", approved 2026-10-08 as Jaen's defaults).
+  updateOut: (latest: string) => `CCSR ${latest} is out. Update between matches.`,
+  updateNeeded: (min: string, version: string) => `Ranked needs CCSR ${min}. You're on CCSR ${version}.`,
+  updated: 'Updated. Restart Claude Code to load it.',
+  // TODO copy: the rest of the update lines.
+  updating: 'Updating CCSR.',
+  updateCopied: 'Copied the update command. Run it in a terminal, then restart Claude Code.',
+  version: (v: string) => `CCSR ${v}`,
 }
 
 // ------------------------------------------------------------------ the surface switches (docs/ui-spec.md, Settings)
@@ -101,7 +108,7 @@ export const QUIET: Surfaces = { band: 'off', bandMatch: 'on', bandChat: 'off', 
 
 export type SurfaceKey = keyof Surfaces
 
-/** TODO copy as a set: the switch labels and their notes. */
+/** The switch labels and their notes (docs/copy.md, "The mod", approved 2026-10-08). */
 export const SURFACE_ROWS: (['group', string] | [SurfaceKey, string, [string, string][]])[] = [
   ['group', 'In the band'],
   ['band', 'Band when idle', [['after', 'After a score'], ['always', 'Always'], ['off', 'Off']]],

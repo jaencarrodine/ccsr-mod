@@ -170,7 +170,7 @@ export type ApiQueueState = {
   range: { min: number; max: number } | null
   widening: { after_ms: number; range: { min: number; max: number } }[] | null
   per_length: Record<'1' | '3', { waiting: number; wait_ms: number | null; ratings: number[] }>
-  cancelled: { reason: 'opponent_declined' | 'opponent_expired' | 'you_expired' } | null
+  cancelled: { reason: 'opponent_declined' | 'opponent_expired' | 'you_expired' | 'update_required' } | null
 }
 
 export type ApiMatchStatus = 'offered' | 'live' | 'grace' | 'finished' | 'void' | 'cancelled'
@@ -291,6 +291,10 @@ export type LinkState = {
   lobby: { room: ApiRoom; events: ApiLobbyItem[]; cursor: number } | null
   /** Your last ranked matches from your profile, newest first, for the Match tab. */
   recent: ApiRecentMatch[] | null
+  /** The mod's release line from the server's x-ccsr-latest and x-ccsr-min headers; null until a server sends it. */
+  release: { latest: string; min: string } | null
+  /** What the last Update press did. */
+  updateNote: string
 }
 
 export type ApiRecentMatch = {

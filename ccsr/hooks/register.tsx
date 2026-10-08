@@ -3,6 +3,7 @@ import type { Elements, EngineInterface, ModelCompleteResult, RenderElement, Ren
 
 import type { ApiChatItem, ApiLobbyItem, ApiMatchSummary, ApiPlayer, ApiQueueState, ApiRankedRow, ApiRecentMatch, ApiRoom, ApiScoreReply, ApiSeason, BacktestRun, RankedMatch, RankedShared, ChatLine, FeedItem, LinkState, Match, ModSettings, OutboxItem, PastSession, Record3, ScanStatus, ScoredCommit, ServerConfig, Surfaces, Tab, WeekTotals } from '../types'
 import { DEFAULT_SERVER, backoffMs, errorOf, handleProblem, mergeEvents, retryable, scoreBody } from './api'
+import { UPDATE_ARGV, UPDATE_COMMAND, VERSION, standing } from './version'
 import {
   DEFAULT_MODEL,
   FALLBACK_MODEL,
@@ -35,7 +36,7 @@ import type { RecentCommit } from './pure'
 import { sessionBars } from './svg'
 import { banner, bandStrip, chatLog, chatRooms, commitBadge, commitList, feed as feedSvg, grind, ladder, numberOne, queue as queueSvg, queueBar, raceClimb, ratingCard, readyCheck, recentMatches, result, scorecard, setupHero, tabsBase, tabsTop, tierFrieze } from './olympia'
 import type { Race, TierKey } from './olympia'
-import { FULL, LINES, QUIET, ROASTS, SURFACE_ROWS, SURFACE_WHAT, TODO, presetOf, resultText, surfacesFrom } from './copy'
+import { FULL, LINES, MOD, QUIET, ROASTS, SURFACE_ROWS, SURFACE_WHAT, presetOf, resultText, surfacesFrom } from './copy'
 import type { SurfaceKey } from './copy'
 
 // Every function that is handed $ lives in this file: the engine follows $
@@ -67,7 +68,7 @@ const expanded = atom({ plugin: 'ccsr', key: 'expanded' } as const, null)
 const btLimit = atom({ plugin: 'ccsr', key: 'btLimit' } as const, 15)
 const labNote = atom({ plugin: 'ccsr', key: 'labNote' } as const, '')
 const chatDraft = atom({ plugin: 'ccsr', key: 'chatDraft' } as const, '')
-const LINK0: LinkState = { online: null, note: '', me: null, season: null, grind: null, grindRank: null, outbox: 0, queue: null, ranked: null, ladder: null, myRank: null, grindOf: null, rooms: null, room: 'world', lobby: null, recent: null }
+const LINK0: LinkState = { online: null, note: '', me: null, season: null, grind: null, grindRank: null, outbox: 0, queue: null, ranked: null, ladder: null, myRank: null, grindOf: null, rooms: null, room: 'world', lobby: null, recent: null, release: null, updateNote: '' }
 const link = atom({ plugin: 'ccsr', key: 'link' } as const, LINK0)
 const badges = atom({ plugin: 'ccsr', key: 'badges' } as const, {})
 const turnMarks = atom({ plugin: 'ccsr', key: 'turnMarks' } as const, {})
@@ -104,6 +105,8 @@ const K = {
   salt: 'salt',
   // Ranked: idle, queued, offered, live or done, and which match; every session follows it.
   ranked: 'ranked',
+  // The newest release the update toast has shown, so it shows once per release.
+  updateSeen: 'updateSeen',
 } as const
 
 type Verdict = Pick<ScoredCommit, 'points' | 'base' | 'craft' | 'category' | 'reason' | 'judge' | 'asked' | 'rubric' | 'scoredAt'>
@@ -1134,8 +1137,8 @@ async function syncMatch($: $) {
 }
 
 const BELL_MARKS: readonly [number, string][] = [
-  [600, TODO.warn10],
-  [60, TODO.warn1],
+  [600, MOD.warn10],
+  [60, MOD.warn1],
 ]
 const warned = new Set<string>()
 let lastSeenLive = ''
@@ -1530,9 +1533,12 @@ async function serverCfg($: $) {
 /** One request: `{ status, json }`, status 0 when the server couldn't be reached. */
 async function api($: $, method: string, path: string, body?: unknown): Promise<{ status: number; json: unknown }> {
   const cfg = await serverCfg($)
-  const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json' }
+  // Which mod and Claude Code this is: below the server's floor, ranked play is refused (docs/api.md, "Versions").
+  const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json', 'x-ccsr-mod': VERSION }
+  const claude = await claudeVersion($)
+  if (claude) headers['x-ccsr-claude'] = claude
   if (cfg.token) headers.authorization = `Bearer ${cfg.token}`
-  let res: { status: number; text: string }
+  let res: { status: number; text: string; headers?: Record<string, string> }
   try {
     res = await $.http.fetch(`${cfg.url}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) })
   } catch (err) {
@@ -1548,7 +1554,66 @@ async function api($: $, method: string, path: string, body?: unknown): Promise<
   // A proxy's error page means the server itself isn't answering.
   const reached = res.status < 502 || res.status > 504
   await update($, link, l => (reached ? (l.online === true && !l.note ? l : { ...l, online: true, note: '' }) : { ...l, online: false, note: `The server answered ${res.status}` }))
+  const latest = res.headers?.['x-ccsr-latest']
+  const min = res.headers?.['x-ccsr-min']
+  if (latest && min) await noteRelease($, latest, min)
   return { status: res.status, json }
+}
+
+/** This session's Claude Code version for x-ccsr-claude, or null where the API doesn't say. */
+async function claudeVersion($: $) {
+  try {
+    const v = await $.session.version()
+    return v.base ?? v.version
+  } catch {
+    return null
+  }
+}
+
+/** The server's release line, from its headers: keep it, and toast once per release that an update is out, between matches. */
+async function noteRelease($: $, latest: string, min: string) {
+  const l = await read($, link)
+  if (l.release?.latest !== latest || l.release?.min !== min) await update($, link, x => ({ ...x, release: { latest, min } }))
+  if (standing({ latest, min }) === 'current') return
+  if ((await rankedShared($)).phase !== 'idle') return
+  if ((await storeGet<string>($, K.updateSeen, '')) === latest) return
+  await save($, K.updateSeen, latest)
+  await ambient($, MOD.updateOut(latest))
+}
+
+/**
+ * A 426 from the queue or a ready check: true when it was one. A mod below the
+ * floor keeps the release line, and the Ranked box shows the update line and
+ * button; a Claude Code below its floor gets the server's line as the note.
+ */
+async function refusedForUpdate($: $, r: { status: number; json: unknown }) {
+  if (r.status !== 426) return false
+  const u = (r.json as { update?: { what: 'mod' | 'claude'; min: string; latest: string | null } } | null)?.update
+  if (u?.what === 'mod') await update($, link, l => ({ ...l, release: { latest: u.latest ?? u.min, min: u.min }, note: '' }))
+  else await update($, link, l => ({ ...l, note: errorOf(r.json)?.message ?? 'Update Claude Code to play ranked.' }))
+  return true
+}
+
+/**
+ * Update from the install repo: run the two commands where the mods API runs
+ * processes (the terminal), or copy them for a terminal (the desktop app). The
+ * new version loads once Claude Code restarts.
+ */
+async function updateMod($: $, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') {
+  const say = (text: string) => update($, link, l => ({ ...l, updateNote: text }))
+  await say(MOD.updating)
+  try {
+    for (const argv of UPDATE_ARGV) {
+      const r = await $.process.run(argv, { timeoutMs: 120_000 })
+      if (r.exitCode !== 0) throw new Error(`exit ${r.exitCode}`)
+    }
+    await say(MOD.updated)
+    await ambient($, MOD.updated, 'match')
+  } catch {
+    // No processes here, no claude on the PATH, or the update failed: hand over the command instead.
+    const c = await $.ui.copy({ text: UPDATE_COMMAND, surface }).catch(() => ({ isCopied: false }))
+    await say(c.isCopied ? MOD.updateCopied : UPDATE_COMMAND)
+  }
 }
 
 async function saltOf($: $) {
@@ -1574,7 +1639,7 @@ async function refreshAccount($: $) {
   }
 }
 
-/** Joins with a handle (TODO copy for the error lines). Returns a problem to show, or '' when joined. */
+/** Joins with a handle. Returns a problem to show, or '' when joined. */
 async function signup($: $, raw: string): Promise<string> {
   const handle = raw.trim().toLowerCase()
   const problem = handleProblem(handle)
@@ -1741,8 +1806,10 @@ async function pollQueue($: $, sh: RankedShared) {
   if (r.status !== 200) return
   const q = r.json as ApiQueueState
   await update($, link, l => ({ ...l, queue: q }))
-  // TODO copy: the two dead-offer lines (docs/ui-spec.md, Copy).
-  if (q.cancelled) await ambient($, q.cancelled.reason === 'you_expired' ? "You didn't accept. Out of the queue." : `${q.cancelled.reason === 'opponent_declined' ? 'They declined' : "They didn't accept"}. Back in the queue.`, 'match')
+  const rel = (await read($, link)).release
+  if (q.cancelled?.reason === 'update_required') {
+    if (rel) await ambient($, MOD.updateNeeded(rel.min, VERSION), 'match')
+  } else if (q.cancelled) await ambient($, q.cancelled.reason === 'you_expired' ? "You didn't accept. Out of the queue." : `${q.cancelled.reason === 'opponent_declined' ? 'They declined' : "They didn't accept"}. Back in the queue.`, 'match')
   if (q.status === 'offered' && q.offer) {
     if (sh.phase !== 'offered' || sh.matchId !== q.offer.match_id) {
       await setRanked($, { phase: 'offered', matchId: q.offer.match_id })
@@ -1791,8 +1858,8 @@ async function pollMatch($: $, id: string) {
   if (s.status === 'live' && s.deadline) {
     const left = Date.parse(s.deadline) - t
     for (const [mark, text] of [
-      [10 * 60_000, TODO.warn10],
-      [60_000, TODO.warn1],
+      [10 * 60_000, MOD.warn10],
+      [60_000, MOD.warn1],
     ] as const)
       if (left <= mark && left > 0 && !rankedWarned.has(`${id}:${mark}`)) {
         rankedWarned.add(`${id}:${mark}`)
@@ -1816,7 +1883,7 @@ async function pollMatch($: $, id: string) {
   await refreshStatus($)
 }
 
-/** The result in one line. Approved lines for a win, a draw and a forfeit (docs/copy.md); the rest TODO copy. */
+/** The result in one line, from the approved results table (docs/copy.md). */
 function rankedResultLine(s: ApiMatchSummary, me: string) {
   const mine = s.sides.find(x => x.player.handle === me) ?? s.sides[0]
   const delta = (mine.rating_after ?? mine.rating_before) - mine.rating_before
@@ -1829,6 +1896,7 @@ async function joinQueue($: $) {
   const sh = await rankedShared($)
   if (sh.lengths.length === 0) return
   const r = await api($, 'POST', '/queue', { lengths: sh.lengths })
+  if (await refusedForUpdate($, r)) return
   if (r.status !== 200) {
     await update($, link, l => ({ ...l, note: errorOf(r.json)?.message ?? (r.status === 0 ? "Can't reach the server." : `The server answered ${r.status}.`) }))
     return
@@ -1856,6 +1924,8 @@ async function acceptOffer($: $) {
   const sh = await rankedShared($)
   if (!sh.matchId) return
   const r = await api($, 'POST', `/matches/${sh.matchId}/accept`)
+  // Below the floor: decline now rather than hold the opponent for the full minute.
+  if (await refusedForUpdate($, r)) return declineOffer($)
   if (r.status === 200) {
     const summary = (r.json as { match: ApiMatchSummary }).match
     if (summary.status === 'live') return enterLive($, summary)
@@ -2057,6 +2127,7 @@ export type Actions = {
   rankedClear: () => void
   setRoom: (room: ApiRoom) => void
   roomChat: (text: string) => void
+  updateMod: (surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void
 }
 
 export const ORANGE = '#FF6A2A'
@@ -2308,10 +2379,10 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
               </Text>
             )}
             {sm.status === 'grace' ? (
-              <Text color={ORANGE}>{TODO.counting}</Text>
+              <Text color={ORANGE}>{MOD.counting}</Text>
             ) : offline ? (
               <Text dimColor wrap="truncate-end">
-                {TODO.offline}
+                {MOD.offline}
               </Text>
             ) : hot ? (
               <Box flexDirection="column">
@@ -2320,7 +2391,7 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
                     {LINES.behind(behind)}
                   </Text>
                 )}
-                {d && d.files > 0 && <Text dimColor>{TODO.uncommitted(d.files, d.repo)}</Text>}
+                {d && d.files > 0 && <Text dimColor>{MOD.uncommitted(d.files, d.repo)}</Text>}
               </Box>
             ) : lastChat && chatOk ? (
               <Text dimColor wrap="truncate-end">
@@ -2698,7 +2769,7 @@ function recentRow(x: ApiRecentMatch) {
 /**
  * Ranked, from the server (docs/ui-spec.md, States): first run, the queue bar
  * and where you stand, the queue, the ready check, the live match, counting,
- * the result. Lines not in docs/copy.md come from TODO in copy.ts.
+ * the result. Every line is approved in docs/copy.md; the mod's own come from MOD in copy.ts.
  */
 async function rankedBox($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: number): Promise<RenderElement> {
   const { Box, Text, Button, Svg, Input } = els
@@ -2740,6 +2811,8 @@ async function rankedBox($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: n
     const mine = l.me
     const placing = mine?.placement ?? undefined
     const recent = (l.recent ?? []).slice(0, 3).map(recentRow)
+    // Below the server's floor: Update takes Queue's place (the server would refuse the queue anyway).
+    const gated = standing(l.release) === 'required'
     return (
       <Box flexDirection="column" gap={1}>
         {rich ? (
@@ -2765,8 +2838,22 @@ async function rankedBox($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: n
           {lanes.map(x => (
             <Button key={`rl-${x.hours}`} label={`${x.ticked ? '✓ ' : ''}${x.hours}h`} onPress={() => a.toggleLength(x.hours)} />
           ))}
-          <Button key="ranked-queue" label="Queue" variant="primary" onPress={() => a.queue()} />
+          {gated ? (
+            <Button key="ranked-update" label="Update" variant="primary" onPress={x => a.updateMod(x.surface)} />
+          ) : (
+            <Button key="ranked-queue" label="Queue" variant="primary" onPress={() => a.queue()} />
+          )}
         </Box>
+        {gated && l.release && (
+          <Text color={ORANGE} wrap="wrap">
+            {MOD.updateNeeded(l.release.min, VERSION)}
+          </Text>
+        )}
+        {gated && l.updateNote && (
+          <Text dimColor wrap="wrap">
+            {l.updateNote}
+          </Text>
+        )}
         {l.note && (
           <Text color={ORANGE} wrap="wrap">
             {l.note}
@@ -2885,7 +2972,7 @@ async function rankedBox($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: n
     const asking = await read($, forfeitAsk)
     return (
       <Box flexDirection="column" gap={1}>
-        {live && l.online === false && <Text color={ORANGE}>{TODO.offline}</Text>}
+        {live && l.online === false && <Text color={ORANGE}>{MOD.offline}</Text>}
         {rich && race && !closed && <Svg source={raceClimb(race)} alt={`Ranked ${sm.length}h: ${mine.player.handle} ${mine.points}, ${them.player.handle} ${them.points}. ${clock(left)} to the bell.`} />}
         {rich && race && closed && (
           <Svg
@@ -2909,7 +2996,7 @@ async function rankedBox($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: n
           </Text>
         )}
         {closed && rich && <Text bold>{line}</Text>}
-        {sm.status === 'grace' && <Text color={ORANGE}>{TODO.counting}</Text>}
+        {sm.status === 'grace' && <Text color={ORANGE}>{MOD.counting}</Text>}
         {hot && them.points > mine.points && (
           <Text bold color={ORANGE}>
             {LINES.behind(them.points - mine.points)}
@@ -2992,7 +3079,7 @@ async function matchTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: nu
           <Text bold color={STONE}>
             PRACTICE
           </Text>
-          <Text dimColor>{TODO.practice}</Text>
+          <Text dimColor>{MOD.practice}</Text>
           <Box gap={1} flexWrap="wrap">
             <Button key="m-1" label="1h" onPress={() => a.start(1)} />
             <Button key="m-3" label="3h" onPress={() => a.start(3)} />
@@ -3233,7 +3320,7 @@ function serverRanked(els: El, rich: boolean, l: LinkState) {
           )}
         </Box>
       )}
-      {placing ? <Text dimColor>{TODO.notRanked}</Text> : l.myRank && l.myRank > 30 ? <Text dimColor>{LINES.farDown(l.myRank)}</Text> : null}
+      {placing ? <Text dimColor>{MOD.notRanked}</Text> : l.myRank && l.myRank > 30 ? <Text dimColor>{LINES.farDown(l.myRank)}</Text> : null}
     </Box>
   )
 }
@@ -3259,7 +3346,7 @@ function numberOneCard(els: El, rich: boolean, top: { handle: string; rating: nu
 // ---------------------------------------------------------------- chat tab
 
 const SYSTEM_LINE: Record<'placed' | 'promoted' | 'reached_number_one', (h: string, tier: string) => string> = {
-  // TODO copy: the rooms' system lines.
+  // Approved (docs/copy.md, "The mod").
   placed: (h, tier) => `${h} placed in ${tier}.`,
   promoted: (h, tier) => `${h} reached ${tier}.`,
   reached_number_one: h => `${h} is the new #1.`,
@@ -3279,7 +3366,6 @@ async function chatTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promi
         <Button key="chat-join" label="Open Settings" onPress={() => a.setTab('settings')} />
       </Box>
     )
-  // TODO copy: the Chat tab's lines (docs/ui-spec.md, Copy).
   if (s.surfaces.chat !== 'on') return <Text dimColor>Chat is off. Turn it on in Settings.</Text>
   const rooms = l.rooms ?? []
   const lines = (l.lobby && l.lobby.room === l.room ? l.lobby.events : []).slice(-12)
@@ -3298,7 +3384,7 @@ async function chatTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promi
         {open.map(x => (
           <Button key={`room-${x.room}`} label={roomName(x.room)} variant={x.room === l.room ? 'primary' : 'secondary'} onPress={() => a.setRoom(x.room)} />
         ))}
-        {rooms.length > open.length && <Text dimColor>{TODO.locked}</Text>}
+        {rooms.length > open.length && <Text dimColor>{MOD.locked}</Text>}
       </Box>
       {rich ? (
         <Svg source={chatLog({ me, messages: msgs })} alt={msgs.length ? msgs.map(m => `${m.handle}: ${m.text}`).join(' / ') : 'No messages yet.'} />
@@ -3467,7 +3553,7 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
   const sw = s.surfaces
   const l = await read($, link)
   const cfg = await serverCfg($)
-  // TODO copy: the Server section's lines are placeholders until docs/copy.md has them.
+  // The Server section's lines: approved with the rest of the mod's copy (docs/copy.md, "The mod").
   const server = (
     <Box flexDirection="column">
       <Text bold>Server</Text>
@@ -3549,10 +3635,22 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
       </Box>
       <Text bold>What leaves your machine</Text>
       <Text dimColor>Your code never leaves your machine. Only the points do. And the trash talk.</Text>
-      {/* TODO copy: the facts below aren't in docs/copy.md yet. */}
       <Text dimColor>
         Each scored commit sends its points, category, size and author time, with salted hashes standing in for the repo and the commit. Its title goes only if you share titles. Each judge call runs on your own Claude plan, one call per new commit. Rubric {RUBRIC}.
       </Text>
+      <Text bold>Version</Text>
+      <Text dimColor>{MOD.version(VERSION)}</Text>
+      {l.release && standing(l.release) !== 'current' && (
+        <Box gap={1} alignItems="center" flexWrap="wrap">
+          <Text>{MOD.updateOut(l.release.latest)}</Text>
+          <Button key="settings-update" label="Update" onPress={x => a.updateMod(x.surface)} />
+        </Box>
+      )}
+      {l.updateNote && (
+        <Text dimColor wrap="wrap">
+          {l.updateNote}
+        </Text>
+      )}
       <Text bold>Report a bug</Text>
       <Box gap={1} alignItems="center" flexWrap="wrap">
         <Text>Tag or DM</Text>
@@ -3803,7 +3901,7 @@ async function tellChat($: $) {
 /** Ask Claude to commit (the band at the bell): a line in the chat box. The player presses Enter; the mod never sends it. */
 async function askCommit($: $) {
   try {
-    await $.prompt.fill({ text: TODO.fill, mode: 'insert' })
+    await $.prompt.fill({ text: MOD.fill, mode: 'insert' })
   } catch {
     // The chat box isn't there (a headless session): nothing to fill.
   }
@@ -3973,6 +4071,7 @@ function actions($: $): Actions {
     rankedClear: () => go(clearRanked($)),
     setRoom: room => go(setRoom($, room)),
     roomChat: text => go(postRoom($, text)),
+    updateMod: surface => go(updateMod($, surface)),
   }
 }
 
@@ -4234,7 +4333,7 @@ async function inMatch($: $) {
 async function beforeCommit($: $, id: string) {
   if ((await read($, settings)).surfaces.marks !== 'on' || !(await inMatch($))) return
   try {
-    $.ui.notice(id, TODO.notice)
+    $.ui.notice(id, MOD.notice)
   } catch {
     // No dialog open for this call: nothing to annotate.
   }
@@ -4302,16 +4401,16 @@ async function spinnerFor($: $, e: RenderInput<'Spinner'>) {
   if ((await read($, settings)).surfaces.spinner !== 'on') return null
   await read($, now)
   const left = await bellLeft($)
-  return left === null ? null : { ...e, props: { ...e.props, message: TODO.spin(mmss(left)), suffix: '' } }
+  return left === null ? null : { ...e, props: { ...e.props, message: MOD.spin(mmss(left)), suffix: '' } }
 }
 
 async function hintFor($: $, e: RenderInput<'PromptHint'>) {
   if ((await read($, settings)).surfaces.hint !== 'auto') return null
   const l = await read($, link)
   if ((await rankedShared($)).phase !== 'live' || (l.me?.matches_played ?? 0) >= 3) return null
-  if (e.surface === 'terminal') return { ...e, props: { ...e.props, tail: TODO.hint } }
+  if (e.surface === 'terminal') return { ...e, props: { ...e.props, tail: MOD.hint } }
   if (e.props.isWorking || e.props.isDraft) return null
-  return { ...e, props: { ...e.props, hint: e.props.hint ? `${e.props.hint} · ${TODO.hint}` : TODO.hint } }
+  return { ...e, props: { ...e.props, hint: e.props.hint ? `${e.props.hint} · ${MOD.hint}` : MOD.hint } }
 }
 
 async function modeFor($: $, e: RenderInput<'SessionMode'>) {
