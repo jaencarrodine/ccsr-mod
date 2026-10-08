@@ -1,0 +1,15 @@
+{
+  "name": "ccsr",
+  "description": "Ranked Claude Code. Now your skill issue has a number.",
+  "owner": {
+    "name": "Jaen Carrodine",
+    "url": "https://x.com/speedrunjaen"
+  },
+  "plugins": [
+    {
+      "name": "ccsr",
+      "source": "./ccsr",
+      "description": "Claude Code Ship Race: ranked 1v1s on the work you're already doing. Your own Claude scores every commit; most points at the bell wins."
+    }
+  ]
+}

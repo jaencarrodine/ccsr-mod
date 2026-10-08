@@ -1,0 +1,11 @@
+{
+  "name": "ccsr",
+  "version": "0.1.0",
+  "description": "Claude Code Ship Race: ranked 1v1s on the work you're already doing. Your own Claude scores every commit; most points at the bell wins. Plus the Grind, a board that counts every commit.",
+  "types": "./types/index.d.ts",
+  "homepage": "https://ccsr.gg",
+  "author": {
+    "name": "Jaen Carrodine",
+    "url": "https://x.com/speedrunjaen"
+  }
+}
