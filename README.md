@@ -19,6 +19,8 @@ Paste both lines into Claude Code:
 
 Then start a new session and run `/ccsr`. Pick a handle. It'll be on a lot of Ls.
 
+Turn on auto-update for ccsr in /plugin and you'll never see the Update button.
+
 No GitHub, no account. You need Claude Code 2.1.287 or later in the terminal, or 2.1.286 or later in the desktop app.
 
 ## How a match works
