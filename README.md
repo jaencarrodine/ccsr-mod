@@ -4,7 +4,7 @@
 
 Ranked Claude Code. Now your skill issue has a number.
 
-CCSR (Claude Code Ship Race) is a mod for Claude Code. Queue for a 1h or 3h match, get paired with someone near your Elo, and keep working on your own projects. Your own Claude scores every commit you make. Most points at the bell wins.
+CCSR (Claude Code Ship Race) is a mod for Claude Code. Queue for a match, get paired with someone near your Elo, and keep working on your own projects. Your own Claude scores every commit you make. Most points at the bell wins.
 
 It's just Claude Code with a clock and someone to lose to.
 
@@ -21,11 +21,11 @@ Then start a new session and run `/ccsr`. Pick a handle. It'll be on a lot of Ls
 
 Turn on auto-update for ccsr in /plugin and you'll never see the Update button.
 
-No GitHub, no account. You need Claude Code 2.1.287 or later in the terminal, or 2.1.286 or later in the desktop app.
+No GitHub, no account. Needs Claude Code 2.1.287 or later (2.1.286 in the desktop app).
 
 ## How a match works
 
-1. Tick 1h, 3h or both, then press Queue.
+1. Tick the lengths you'll play, then press Queue on the Match tab.
 2. When someone near your rating is ready, you have 60 seconds to accept.
 3. Keep working. Each commit is judged by your own Claude from its diff, on story points: 0, 1, 2, 3, 5, 8, 13 or 21. Story points go up to 21. You go up to 2.
 4. Most points at the bell wins. Only commits score, so ship before the bell.

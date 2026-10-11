@@ -37,6 +37,8 @@ export const COPY = {
   queueUp: 'Queue up.',
   queueUp2: 'Lose in public.',
   lengths: '1h for a quick L. 3h for a long one.',
+  /** The ladder's badge for a handle with GitHub linked (W5b), drawn uppercase in a hairline pill. A word, never GitHub's mark. */
+  github: 'GitHub',
 }
 
 /** Lines drawn inside a graphic, approved in docs/copy.md ("Inside the mod's graphics", 2026-10-08). */
@@ -57,8 +59,21 @@ export function esc(s: string | number) {
 
 const f = (n: number) => String(Math.round(n * 100) / 100)
 
-/** A match length label: 1H, 3H, or 5M for the practice sprint. */
+/** A match length label from its hours: 15M, 30M, 1H, 3H, or 5M for the practice sprint. */
 const hrs = (h: number) => (h < 1 ? `${Math.round(h * 60)}M` : `${h}H`)
+
+/**
+ * The marks along a chart's time axis, as [minute, label]: every hour past 1h, the
+ * quarters of 1h, and under an hour a step that divides the length into at most five
+ * (5m at 15m, 10m at 30m, 1m for the 5 minute sprint).
+ */
+function lengthMarks(hours: number): [number, string][] {
+  const len = Math.round(hours * 60)
+  if (hours > 1) return Array.from({ length: Math.floor(hours) + 1 }, (_, i) => [i * 60, `${i}h`] as [number, string])
+  if (len >= 60) return [0, 15, 30, 45, 60].map(m => [m, m === 60 ? '1h' : `${m}m`] as [number, string])
+  const step = [1, 5, 10, 15, 20, 30].find(x => len % x === 0 && len / x <= 5) ?? Math.max(1, len)
+  return Array.from({ length: Math.floor(len / step) + 1 }, (_, i) => [i * step, `${i * step}m`] as [number, string])
+}
 
 /** Deterministic noise in 0..1, so a drawing is the same every render. */
 function hh(a: number, b: number) {
@@ -471,28 +486,32 @@ function placingCard(p: Placing, wins: number, losses: number) {
   return svg(W, 134, `Mud, placing: ${p.played} of ${p.of} matches played, ${wins}-${losses}.`, s, C.bone)
 }
 
-export type Lane = { hours: 1 | 3; ticked: boolean; wait: string; waiting: number }
+/** One length on the queue bar: its length in hours (0.25 is 15m), whether it's ticked, the wait and who's waiting, and what an even match there is worth to you either way. */
+export type Lane = { hours: number; ticked: boolean; wait: string; waiting: number; swing?: number }
 
 /**
  * The top of the Match tab between matches: the call to queue, each length as a
  * lane on the stadion's starting line (the stone sill with its toe grooves, your
  * coin on it when that length is ticked), and the four steps of a match. The
- * length toggles and Queue sit right under it; an Svg takes no clicks.
+ * length toggles and Queue sit right under it; an Svg takes no clicks. `line` is
+ * the length picker's line (the caller fills it from the lengths offered, so it
+ * never names one that isn't); '' draws none, and without it the approved default.
  */
-export function queueBar(a: { lanes: Lane[] }) {
+export function queueBar(a: { lanes: Lane[]; line?: string }) {
   const anyTicked = a.lanes.some(l => l.ticked)
   const waiting = a.lanes.reduce((n, l) => n + l.waiting, 0)
   let s = T(18, 24, 'RANKED · SOLO QUEUE', { s: 9.5, c: C.stone2, ls: 2 }) + T(462, 24, `{ ${waiting} waiting now }`, { s: 9.5, a: 'end' })
   s += T(18, 58, COPY.queueUp.toUpperCase(), { s: 26, w: 600, ls: -0.5 }) + T(172, 58, COPY.queueUp2, { s: 13, c: C.stone2 })
-  s += T(18, 78, COPY.lengths, { s: 10.5, c: C.stone2 })
+  const line = a.line ?? COPY.lengths
+  if (line) s += T(18, 78, line, { s: 10.5, c: C.stone2 })
   s += binRow(318, 64, 144, 8, C.ink, 0.2)
   s += `<line x1="18" y1="88" x2="462" y2="88" stroke="${C.ink}" stroke-opacity=".35" stroke-dasharray="3 4"/>` + T(430, 100, '{ the bell }', { s: 7.5, c: C.stone2, a: 'middle' })
   a.lanes.forEach((l, i) => {
     const y = 114 + i * 26
     s += `<rect x="18" y="${y - 9}" width="36" height="18" fill="${C.bone2}" stroke="${C.ink}" stroke-width=".8"/><path d="M29 ${y - 6}V${y + 6}M43 ${y - 6}V${y + 6}" stroke="${C.ink}" stroke-width="1.2"/>`
     s += l.ticked ? token(36, y, 7, true) : `<circle cx="36" cy="${y}" r="6.5" fill="${C.bone}" stroke="${C.stone2}" stroke-dasharray="2 2"/>`
-    s += T(64, y + 5, `${l.hours}H`, { s: 15, w: 700, c: l.ticked ? C.ink : C.stone2 })
-    s += T(102, y - 3, `${l.wait} · ${l.waiting} waiting`, { s: 8.5, c: l.ticked ? C.ink : C.stone2 })
+    s += T(64, y + 5, hrs(l.hours), { s: 15, w: 700, c: l.ticked ? C.ink : C.stone2 })
+    s += T(102, y - 3, `${l.wait} · ${l.waiting} waiting${l.swing != null ? ` · ±${l.swing}` : ''}`, { s: 8.5, c: l.ticked ? C.ink : C.stone2 })
     s += `<line x1="102" y1="${y + 3}" x2="424" y2="${y + 3}" stroke="${C.ink}" stroke-opacity="${l.ticked ? 0.75 : 0.25}" stroke-dasharray="2 4"/>`
     if (l.ticked) s += `<line x1="102" y1="${y + 3}" x2="168" y2="${y + 3}" stroke="${C.or}" stroke-width="3"/>`
     s += `<path d="M430 ${y - 8}V${y + 8}" stroke="${C.ink}" stroke-width="1.6"/><circle cx="430" cy="${y - 9}" r="2.2" fill="${C.ink}"/>`
@@ -512,7 +531,7 @@ export function queueBar(a: { lanes: Lane[] }) {
     if (e != null && nx != null) s += `<line x1="${e + 5}" y1="${y}" x2="${nx - 9}" y2="${y}" stroke="${C.ink}" stroke-opacity=".35" stroke-dasharray="2 3"/>`
     if (state === 'now') s += `<path d="M${x - 4} ${y + 12}l4 4l4 -4" fill="none" stroke="${C.or}" stroke-width="1.6"/>`
   })
-  const lanes = a.lanes.map(l => `${l.hours}h ${l.ticked ? 'ticked' : 'not ticked'}, ${l.wait}, ${l.waiting} waiting`).join('; ')
+  const lanes = a.lanes.map(l => `${hrs(l.hours).toLowerCase()} ${l.ticked ? 'ticked' : 'not ticked'}, ${l.wait}, ${l.waiting} waiting${l.swing != null ? `, swing ${l.swing}` : ''}`).join('; ')
   return svg(W, y + 22, `${COPY.queueUp} ${COPY.queueUp2} ${lanes}. ${TODO_COPY.steps.join(', then ')}.`, s, C.bone)
 }
 
@@ -538,9 +557,10 @@ export function lengthPlaques(rows: { hours: 1 | 3; ticked: boolean; wait: strin
   return svg(W, 118, `Match lengths: ${rows.map(r => `${r.hours}h${r.ticked ? ' ticked' : ''}, ${r.waiting} waiting`).join('; ')}`, s)
 }
 
-export type RecentMatch = { day: string; result: 'won' | 'lost' | 'draw'; hours: number; mine: number; theirs: number; opponent: string; opponentRating: number; delta: number; series: { mine: number[]; theirs: number[] } }
+/** `rated: false` (a challenge, W6b): the row says UNRATED where a ranked one draws its Elo change, never +0. */
+export type RecentMatch = { day: string; result: 'won' | 'lost' | 'draw'; hours: number; mine: number; theirs: number; opponent: string; opponentRating: number; delta: number; series: { mine: number[]; theirs: number[] }; rated?: false }
 
-/** Recent matches: result coin, length, score, opponent with badge, the race as two tiny lines, the Elo change. */
+/** Recent matches: result coin, length, score, opponent with badge, the race as two tiny lines, the Elo change (UNRATED for a challenge). */
 export function recentMatches(rows: RecentMatch[]) {
   let s = T(16, 20, 'RECENT', { s: 9.5, c: C.stone2, ls: 2 }) + T(464, 20, `{ last ${rows.length} }`, { s: 9, c: C.stone2, a: 'end' })
   rows.forEach((r, i) => {
@@ -555,7 +575,7 @@ export function recentMatches(rows: RecentMatch[]) {
       const d = pts.map((v, ii) => `${ii ? 'L' : 'M'}${f(300 + (ii / Math.max(1, pts.length - 1)) * 96)} ${f(y + 8 - (v / mx) * 16)}`).join('')
       s += `<path d="${d}" fill="none" stroke="${mine ? C.or : C.ink}" stroke-width="${mine ? 1.8 : 1}"/>`
     }
-    s += T(464, y + 4.5, `${r.delta > 0 ? '+' : ''}${r.delta}`, { s: 11, w: 700, c: won ? C.or : C.stone2, a: 'end' })
+    s += r.rated === false ? T(464, y + 4, 'UNRATED', { s: 8, w: 700, c: C.stone2, a: 'end', ls: 1 }) : T(464, y + 4.5, `${r.delta > 0 ? '+' : ''}${r.delta}`, { s: 11, w: 700, c: won ? C.or : C.stone2, a: 'end' })
   })
   return svg(W, 34 + rows.length * 30, `Recent matches: ${rows.map(r => `${r.result} ${r.mine}-${r.theirs} vs ${r.opponent}`).join('; ')}`, s, C.bone)
 }
@@ -564,7 +584,8 @@ export function recentMatches(rows: RecentMatch[]) {
 
 /**
  * The queue: timer, the lengths you ticked, a rating axis with your coin,
- * the window being searched, how it widens, and everyone waiting as dots.
+ * the window being searched, how it widens, and everyone waiting as dots
+ * (a row per length, up to four).
  */
 export function queue(a: {
   seconds: number
@@ -583,7 +604,7 @@ export function queue(a: {
   let s = T(18, 24, 'IN QUEUE', { s: 9.5, c: C.stone2, ls: 2 })
   a.hours.forEach((hr, i) => {
     const x = 418 - (a.hours.length - 1 - i) * 48
-    s += `<rect x="${x}" y="12" width="40" height="18" fill="${C.or}" stroke="${C.ink}" stroke-width=".9"/>` + T(x + 20, 25, `${hr}H`, { s: 10, w: 700, a: 'middle' })
+    s += `<rect x="${x}" y="12" width="40" height="18" fill="${C.or}" stroke="${C.ink}" stroke-width=".9"/>` + T(x + 20, 25, hrs(hr), { s: 10, w: 700, a: 'middle' })
   })
   s += T(16, 74, `${mm}:${ss}`, { s: 46, w: 300, ls: -2 }) + T(140, 60, `{ searching ${a.rating} ±${a.range} }`, { s: 10 }) + T(140, 74, 'the window widens the longer you wait', { s: 9, c: C.stone2 })
   for (const g of [...a.widens].sort((p, q) => q.range - p.range)) {
@@ -598,35 +619,47 @@ export function queue(a: {
   for (let r = lo; r <= hi; r += 50) s += `<line x1="${f(X(r))}" y1="${ay}" x2="${f(X(r))}" y2="${ay + (r % 100 ? 3 : 6)}" stroke="${C.ink}"/>` + (r % 100 === 0 ? T(X(r), ay + 16, r, { s: 8, c: C.stone2, a: 'middle' }) : '')
   for (const t of TIERS) if (t.min > lo && t.min < hi) s += `<line x1="${f(X(t.min))}" x2="${f(X(t.min))}" y1="${ay - 46}" y2="${ay}" stroke="${C.stone2}" stroke-opacity=".5" stroke-dasharray="1 3"/>` + badgeAt(t.key, X(t.min) - 6, ay - 60, 12, 0.8)
   s += token(X(a.rating), ay - 4, 8, true)
-  a.waiting.slice(0, 2).forEach((row, i) => {
+  const rows = a.waiting.slice(0, 4)
+  rows.forEach((row, i) => {
     const y = ay + 40 + i * 16
-    s += T(16, y + 3, `${row.hours}H`, { s: 8.5, w: 600 }) + T(464, y + 3, `${row.count} WAITING`, { s: 8, c: C.stone2, a: 'end', ls: 1 })
+    s += T(16, y + 3, hrs(row.hours), { s: 8.5, w: 600 }) + T(464, y + 3, `${row.count} WAITING`, { s: 8, c: C.stone2, a: 'end', ls: 1 })
     for (const v of row.ratings) {
       if (v < lo || v > hi) continue
       const inside = Math.abs(v - a.rating) <= a.range
       s += `<circle cx="${f(X(v))}" cy="${y}" r="3.4" fill="${inside ? C.or : 'none'}" stroke="${C.ink}" stroke-width=".9"/>`
     }
   })
-  return svg(W, 228, `In queue for ${a.hours.map(h => `${h}h`).join(' and ')}, ${mm}:${ss}, searching ${a.rating} plus or minus ${a.range}`, s, C.bone)
+  return svg(W, Math.max(228, ay + 40 + (rows.length - 1) * 16 + 16), `In queue for ${a.hours.map(h => hrs(h).toLowerCase()).join(' and ')}, ${mm}:${ss}, searching ${a.rating} plus or minus ${a.range}`, s, C.bone)
 }
 
 export type Player = { handle: string; rating: number; wins: number; losses: number; rank: number; placing?: Placing }
 
-/** The ready check: two medallions facing each other, the draining ring, the stakes. */
-export function readyCheck(a: { hours: number; seconds: number; me: Player; them: Player; stakes: { win: number; draw: number; loss: number } }) {
+/**
+ * The ready check: two medallions facing each other, the draining ring, the stakes. A challenge
+ * (W6b, `mode: 'challenge'`) is unrated: `stakes` null draws UNRATED in their place, never +0,
+ * and its ready check runs longer than a minute: `of` is how many seconds it runs (60 if not given).
+ */
+export function readyCheck(a: { hours: number; seconds: number; me: Player; them: Player; stakes: { win: number; draw: number; loss: number } | null; mode?: 'ranked' | 'challenge'; of?: number }) {
   const id = idMaker()
   const top = (p: Player) => (p.placing ? `${p.handle.toUpperCase()} · MUD · PLACING` : `${p.handle.toUpperCase()} · ${tierOf(p.rating).name.toUpperCase()} ${p.rating}`)
   const bottom = (p: Player) => (p.placing ? `${p.placing.played} OF ${p.placing.of} · ${p.wins}-${p.losses}` : `${p.wins}-${p.losses} · RANK ${p.rank}`)
-  let s = T(18, 24, `OPPONENT FOUND · RANKED ${a.hours}H`, { s: 9.5, c: C.stone2, ls: 2 })
+  const challenge = a.mode === 'challenge'
+  const of = a.of !== undefined && a.of > 0 ? a.of : 60
+  const secs = Math.max(0, Math.round(a.seconds))
+  let s = T(18, 24, challenge ? `CHALLENGE · ${hrs(a.hours)}` : `OPPONENT FOUND · RANKED ${hrs(a.hours)}`, { s: 9.5, c: C.stone2, ls: 2 })
   s += coinAt(id, { fill: C.or, line: C.ink, bust: C.ink, top: top(a.me), bottom: bottom(a.me), fs: 14 }, 104, 124, 84)
   s += coinAt(id, { fill: C.ink2, line: C.bone, bust: C.bone, flip: true, ring: true, top: top(a.them), bottom: bottom(a.them), fs: 14 }, 376, 124, 84)
-  s += `<circle cx="240" cy="124" r="26" fill="${C.paper}" stroke="${C.ink}" stroke-dasharray="2 3"/>${ring(240, 124, 26, a.seconds / 60, C.or, 5)}`
-  s += T(240, 129, `0:${String(a.seconds).padStart(2, '0')}`, { s: 14, w: 700, a: 'middle' }) + T(240, 170, 'TO ACCEPT', { s: 8, c: C.stone2, a: 'middle', ls: 1.5 })
-  ;([['WIN', a.stakes.win, true], ['DRAW', a.stakes.draw, false], ['LOSS', a.stakes.loss, false]] as [string, number, boolean][]).forEach(([lab, v, hot], i) => {
-    const x = 96 + i * 100
-    s += `<rect x="${x}" y="218" width="88" height="24" fill="${hot ? C.or : 'none'}" stroke="${C.ink}" stroke-width=".9"/>` + T(x + 10, 234, lab, { s: 8.5, w: 600, ls: 1.5 }) + T(x + 80, 235, `${v > 0 ? '+' : ''}${v}`, { s: 12, w: 700, a: 'end' })
-  })
-  return svg(W, 252, `Opponent found: ${a.them.handle}, ${tierOf(a.them.rating).name} ${a.them.rating}. ${a.seconds} seconds to accept. Win ${a.stakes.win}, draw ${a.stakes.draw}, loss ${a.stakes.loss}.`, s, C.bone)
+  s += `<circle cx="240" cy="124" r="26" fill="${C.paper}" stroke="${C.ink}" stroke-dasharray="2 3"/>${ring(240, 124, 26, secs / of, C.or, 5)}`
+  s += T(240, 129, `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`, { s: 14, w: 700, a: 'middle' }) + T(240, 170, 'TO ACCEPT', { s: 8, c: C.stone2, a: 'middle', ls: 1.5 })
+  const st = a.stakes
+  if (st)
+    ([['WIN', st.win, true], ['DRAW', st.draw, false], ['LOSS', st.loss, false]] as [string, number, boolean][]).forEach(([lab, v, hot], i) => {
+      const x = 96 + i * 100
+      s += `<rect x="${x}" y="218" width="88" height="24" fill="${hot ? C.or : 'none'}" stroke="${C.ink}" stroke-width=".9"/>` + T(x + 10, 234, lab, { s: 8.5, w: 600, ls: 1.5 }) + T(x + 80, 235, `${v > 0 ? '+' : ''}${v}`, { s: 12, w: 700, a: 'end' })
+    })
+  else s += `<rect x="96" y="218" width="288" height="24" fill="none" stroke="${C.ink}" stroke-width=".9" stroke-dasharray="3 2"/>` + T(240, 234, 'UNRATED · BRAGGING RIGHTS ONLY', { s: 8.5, w: 600, a: 'middle', ls: 1.5 })
+  const who = `${challenge ? 'Challenge' : 'Opponent found'}: ${a.them.handle}, ${tierOf(a.them.rating).name} ${a.them.rating}. ${secs} seconds to accept.`
+  return svg(W, 252, st ? `${who} Win ${st.win}, draw ${st.draw}, loss ${st.loss}.` : `${who} Unrated.`, s, C.bone)
 }
 
 // ------------------------------------------------------------------ the live race
@@ -704,12 +737,14 @@ function chartFrame(r: Race, x0: number, x1: number, base: number, top: number, 
   let s = ''
   const step = maxP > 60 ? 20 : 10
   for (let p = step; p <= maxP; p += step) s += `<line x1="${x0}" x2="${x1}" y1="${f(Y(p))}" y2="${f(Y(p))}" stroke="${C.ink}" stroke-opacity=".1" stroke-dasharray="2 4"/>` + T(x0 - 6, Y(p) + 3, `{${p}}`, { s: 7.5, c: C.stone2, a: 'end' })
-  const tick = r.hours > 1 ? 15 : 5
-  for (let t = tick; t < len; t += tick) s += `<line x1="${f(X(t))}" x2="${f(X(t))}" y1="${base - (t % 60 ? 3 : 6)}" y2="${base}" stroke="${C.ink}" stroke-opacity=".5"/>`
+  const marks = lengthMarks(r.hours)
+  // Tall ticks on the hours, or under an hour on the marks; short ones between.
+  const major = r.hours >= 1 ? 60 : (marks[1]?.[0] ?? len)
+  const tick = r.hours > 1 ? 15 : r.hours >= 1 || major >= 10 ? 5 : 1
+  for (let t = tick; t < len; t += tick) s += `<line x1="${f(X(t))}" x2="${f(X(t))}" y1="${base - (t % major ? 3 : 6)}" y2="${base}" stroke="${C.ink}" stroke-opacity=".5"/>`
   if (r.now < len) s += binRow(X(r.now) + 6, base - 5, x1 - X(r.now) - 10, 7, C.ink, 0.18)
   s += `<line x1="${f(X(len))}" x2="${f(X(len))}" y1="${top - 8}" y2="${base}" stroke="${r.hot ? C.or : C.ink}" stroke-opacity="${r.hot ? 1 : 0.55}" stroke-width="${r.hot ? 2 : 1}" stroke-dasharray="1 4"/>` + (X(r.now) + 72 < X(len) - 62 || r.now >= len ? T(X(len), top - 12, '{ the bell }', { s: 8.5, c: r.hot ? C.or : C.stone2, a: 'end' }) : '')
   s += stylobate(x0, base, x1 - x0, C.ink, 2)
-  const marks = r.hours > 1 ? Array.from({ length: r.hours + 1 }, (_, i) => [i * 60, `${i}h`] as [number, string]) : [0, 15, 30, 45, 60].map(m => [m, m === 60 ? '1h' : `${m}m`] as [number, string])
   for (const [m, lab] of marks) s += T(X(m), base + 22, lab, { s: 8.5, c: C.stone2, a: 'middle' })
   return { s, X, Y }
 }
@@ -820,8 +855,7 @@ export function raceTug(r: Race) {
   s += `<line x1="${x0}" x2="${x1}" y1="${mid}" y2="${mid}" stroke="${C.ink}" stroke-width="1.2"/><path d="${d}" fill="none" stroke="${C.ink}" stroke-width="1.6"/>`
   s += T(x0 + 4, mid - amp - 6, `↑ ${r.me.handle.toUpperCase()} LEADS`, { s: 8, w: 600, c: C.or, ls: 1 }) + T(x0 + 4, mid + amp + 14, `↓ ${r.them.handle.toUpperCase()} LEADS`, { s: 8, w: 600, c: C.stone2, ls: 1 })
   s += `<line x1="${f(X(len))}" x2="${f(X(len))}" y1="${mid - amp - 10}" y2="${mid + amp + 6}" stroke="${r.hot ? C.or : C.ink}" stroke-opacity="${r.hot ? 1 : 0.55}" stroke-dasharray="1 4"/>` + T(X(len), mid - amp - 14, '{ the bell }', { s: 8.5, c: r.hot ? C.or : C.stone2, a: 'end' })
-  const marks = r.hours > 1 ? Array.from({ length: r.hours + 1 }, (_, i) => [i * 60, `${i}h`] as [number, string]) : [0, 15, 30, 45, 60].map(m => [m, m === 60 ? '1h' : `${m}m`] as [number, string])
-  for (const [m, lab] of marks) s += T(X(m), 258, lab, { s: 8.5, c: C.stone2, a: 'middle' })
+  for (const [m, lab] of lengthMarks(r.hours)) s += T(X(m), 258, lab, { s: 8.5, c: C.stone2, a: 'middle' })
   if (r.now < len) s += `<line x1="${f(X(r.now))}" x2="${f(X(r.now))}" y1="${mid - amp - 8}" y2="${mid + amp + 8}" stroke="${C.or}" stroke-width="1.4" stroke-dasharray="4 3"/>`
   s += `<circle cx="${f(X(r.now))}" cy="${f(Y(cl))}" r="5" fill="${cl >= 0 ? C.or : C.ink}" stroke="${C.ink}"/>` + T(Math.min(X(r.now) + 9, 430), Y(cl) + (cl >= 0 ? -6 : 14), `${cl > 0 ? '+' : ''}${cl}`, { s: 13, w: 700, c: cl >= 0 ? C.or : C.ink })
   return svg(W, 272, `${cl >= 0 ? r.me.handle : r.them.handle} up ${Math.abs(cl)}, ${mine} to ${theirs}, ${hms(len - r.now)} to the bell`, s, C.bone)
@@ -854,26 +888,41 @@ export function feed(rows: FeedRow[], o: { flashFirst?: boolean } = {}) {
   return svg(W, 28 + rows.length * 26, `Feed: ${rows.map(r => `${r.handle} +${r.points} ${r.category}`).join('; ')}`, s, C.bone)
 }
 
-/** The result: a wreath around the Elo change, the final score, the whole race with the last ten minutes marked. */
-export function result(a: { outcome: 'won' | 'lost' | 'draw'; race: Race; delta: number; ratingBefore: number; ratingAfter: number; commits: { mine: number; theirs: number }; biggest: { points: number; craft: Craft }; mode?: string; placing?: Placing & { placedIn?: TierKey } }) {
+/**
+ * The result: a wreath around the Elo change, the final score, the whole race with the last ten
+ * minutes marked. `rated: false` (a challenge, W6b): UNRATED in the wreath and the rating line,
+ * never +0 or Elo.
+ */
+export function result(a: { outcome: 'won' | 'lost' | 'draw'; race: Race; delta: number; ratingBefore: number; ratingAfter: number; commits: { mine: number; theirs: number }; biggest: { points: number; craft: Craft }; mode?: string; placing?: Placing & { placedIn?: TierKey }; rated?: false }) {
   const r = a.race
   const len = r.hours * 60
   const mine = total(r.me.commits, len)
   const theirs = total(r.them.commits, len)
   const won = a.outcome === 'won'
   const label = a.outcome === 'won' ? 'VICTORY' : a.outcome === 'lost' ? 'LOSS' : 'DRAW'
+  const unrated = a.rated === false
   let s = wreath(104, 112, 74, C.ink, won ? C.or : C.stone, 11)
-  s += T(104, 86, `{ ${r.me.handle} }`, { s: 9.5, c: C.stone2, a: 'middle' }) + T(104, 128, `${a.delta > 0 ? '+' : ''}${a.delta}`, { s: 44, w: 300, c: won ? C.or : C.ink, a: 'middle', ls: -2 }) + T(104, 146, 'ELO', { s: 9, a: 'middle', ls: 1.5 })
+  s += T(104, 86, `{ ${r.me.handle} }`, { s: 9.5, c: C.stone2, a: 'middle' })
+  s += unrated
+    ? T(104, 120, 'UNRATED', { s: 16, w: 700, c: won ? C.or : C.ink, a: 'middle', ls: 1.5 }) + T(104, 138, 'BRAGGING RIGHTS', { s: 7.5, c: C.stone2, a: 'middle', ls: 1 })
+    : T(104, 128, `${a.delta > 0 ? '+' : ''}${a.delta}`, { s: 44, w: 300, c: won ? C.or : C.ink, a: 'middle', ls: -2 }) + T(104, 146, 'ELO', { s: 9, a: 'middle', ls: 1.5 })
   s += T(204, 40, `${label} · ${a.mode ?? 'RANKED'} ${hrs(r.hours)}`, { s: 10, w: 700, c: won ? C.or : C.stone2, ls: 2 })
   const xs = 204 + String(mine).length * 27
   s += T(204, 90, mine, { s: 44, w: 300, c: C.or, ls: -2 }) + T(xs + 4, 84, ':', { s: 26, c: C.stone2 }) + T(xs + 22, 90, theirs, { s: 44, w: 300, ls: -2 })
   s += T(204, 110, `{ ${a.outcome === 'won' ? `${r.me.handle} beat ${r.them.handle}` : a.outcome === 'lost' ? `${r.them.handle} beat ${r.me.handle}` : 'no diff'} }`, { s: 9.5 })
   s += T(204, 128, `${a.commits.mine} commits to ${a.commits.theirs} · biggest +${a.biggest.points}${a.biggest.craft === 'clean' ? ' ▲' : ''}`, { s: 9, c: C.stone2 })
   const pl = a.placing
-  const placedTier = pl?.placedIn ? TIERS.find(t => t.key === pl.placedIn) : undefined
+  // A challenge never places anyone: still placing, it says so, with no tier the hidden rating would give away.
+  const placedTier = pl?.placedIn && !unrated ? TIERS.find(t => t.key === pl.placedIn) : undefined
   const tb = pl ? (placedTier ?? TIERS[0]!) : tierOf(a.ratingAfter)
-  const line = pl ? (placedTier ? `PLACED IN ${placedTier.name.toUpperCase()}` : `MUD · PLACING ${pl.played} OF ${pl.of}`) : `${a.ratingBefore} → ${a.ratingAfter} · ${tb.name}`
-  s += T(204, 146, line, { s: 10, w: 600, c: placedTier ? C.or : C.ink, ls: pl ? 1 : 0 }) + badgeAt(tb.key, 412, 24, 48)
+  const line = unrated
+    ? `${pl ? `MUD · PLACING ${pl.played} OF ${pl.of}` : tb.name.toUpperCase()} · UNRATED`
+    : pl
+      ? placedTier
+        ? `PLACED IN ${placedTier.name.toUpperCase()}`
+        : `MUD · PLACING ${pl.played} OF ${pl.of}`
+      : `${a.ratingBefore} → ${a.ratingAfter} · ${tb.name}`
+  s += T(204, 146, line, { s: 10, w: 600, c: placedTier ? C.or : C.ink, ls: pl || unrated ? 1 : 0 }) + badgeAt(tb.key, 412, 24, 48)
   const x0 = 20
   const x1 = 460
   const base = 236
@@ -883,9 +932,13 @@ export function result(a: { outcome: 'won' | 'lost' | 'draw'; race: Race; delta:
   const Y = (p: number) => base - (p / maxP) * (base - top)
   s += `<line x1="${x0}" x2="${x1}" y1="${base}" y2="${base}" stroke="${C.ink}"/>` + T(204, 190, 'THE WHOLE RACE', { s: 7.5, c: C.stone2, ls: 1.5 })
   s += `<path d="${stepPath(steps(r.them.commits, len), X, Y)}" fill="none" stroke="${C.ink}" stroke-width="1.2"/><path d="${stepPath(steps(r.me.commits, len), X, Y)}" fill="none" stroke="${C.or}" stroke-width="2.2"/>`
-  if (len > 20) s += `<line x1="${f(X(len - 10))}" x2="${f(X(len - 10))}" y1="${top}" y2="${base}" stroke="${C.stone2}" stroke-dasharray="1 3"/>` + T(X(len - 10) - 3, top - 6, '{ last 10 min }', { s: 7.5, c: C.stone2, a: 'end' })
-  for (let hr = 0; hr <= r.hours; hr++) s += T(X(hr * 60), base + 13, `${hr}h`, { s: 7.5, c: C.stone2, a: 'middle' })
-  return svg(W, 262, `${label}: ${r.me.handle} ${mine}, ${r.them.handle} ${theirs}. Elo ${a.delta > 0 ? 'plus' : 'minus'} ${Math.abs(a.delta)} to ${a.ratingAfter}.`, s, C.bone)
+  // The last 10 minutes, from 1h up: under an hour its label would sit on THE WHOLE RACE, and the warnings come at the grace there (3 or 5 minutes).
+  if (len >= 60) s += `<line x1="${f(X(len - 10))}" x2="${f(X(len - 10))}" y1="${top}" y2="${base}" stroke="${C.stone2}" stroke-dasharray="1 3"/>` + T(X(len - 10) - 3, top - 6, '{ last 10 min }', { s: 7.5, c: C.stone2, a: 'end' })
+  // The hours, or under an hour the minute marks the live chart had.
+  const ends = r.hours >= 1 ? Array.from({ length: Math.floor(r.hours) + 1 }, (_, i) => [i * 60, `${i}h`] as [number, string]) : lengthMarks(r.hours)
+  for (const [m, lab] of ends) s += T(X(m), base + 13, lab, { s: 7.5, c: C.stone2, a: 'middle' })
+  const elo = unrated ? 'Unrated.' : `Elo ${a.delta > 0 ? 'plus' : 'minus'} ${Math.abs(a.delta)} to ${a.ratingAfter}.`
+  return svg(W, 262, `${label}: ${r.me.handle} ${mine}, ${r.them.handle} ${theirs}. ${elo}`, s, C.bone)
 }
 
 /** Offline: a broken column, what waits to send, the retry ring. */
@@ -992,9 +1045,15 @@ export function tierDial(a: { rating: number }) {
   return svg(W, 230, `Tier dial: ${cur.name} ${a.rating}`, s, C.bone)
 }
 
-export type LadderRow = { rank: number; handle: string; rating: number; wins: number; losses: number; me?: boolean } | null
+/** `github`: the handle has a GitHub account linked and the caller shows badges (config's sign-in on), so the row carries the GitHub pill. */
+export type LadderRow = { rank: number; handle: string; rating: number; wins: number; losses: number; me?: boolean; github?: boolean } | null
 
-/** The ladder's top rows and yours, with badges and the top-100 laurel. A null row draws the gap. */
+/** The GitHub badge (W5b): the word in a full hairline pill, the same idiom as the site's. 36 wide, centred on `y`. */
+function githubPill(x: number, y: number, col: string) {
+  return `<rect x="${f(x)}" y="${f(y - 6)}" width="36" height="12" rx="6" fill="none" stroke="${col}" stroke-opacity=".8"/>` + T(x + 18, y + 2.5, COPY.github.toUpperCase(), { s: 7, w: 600, c: col, a: 'middle', ls: 0.6 })
+}
+
+/** The ladder's top rows and yours, with badges, the top-100 laurel and the GitHub pill. A null row draws the gap. */
 export function ladder(rows: LadderRow[]) {
   let s = T(16, 20, 'TOP 10', { s: 9.5, c: C.stone2, ls: 2 }) + T(16, 34, COPY.top10, { s: 9.5 })
   rows.forEach((r, i) => {
@@ -1010,9 +1069,11 @@ export function ladder(rows: LadderRow[]) {
     const name = r.handle.length > 15 ? r.handle.slice(0, 14) + '…' : r.handle
     s += T(70, y + 4, name, { s: 11, w: r.me ? 700 : 500, c: r.me ? C.or : C.ink })
     if (r.rank <= 100) s += laurel(70 + name.length * 6.7 + 4, y - 7, 13, r.me ? C.or : C.stone2)
+    // After the name and its laurel; a 15-character name with both still ends before the tier column at 270.
+    if (r.github) s += githubPill(70 + name.length * 6.7 + (r.rank <= 100 ? 22 : 6), y, r.me ? C.or : C.stone2)
     s += T(270, y + 4, t.name, { s: 9.5, c: C.stone2 }) + T(400, y + 4, r.rating, { s: 11, w: 600, a: 'end' }) + T(464, y + 4, `${r.wins}-${r.losses}`, { s: 9.5, c: C.stone2, a: 'end' })
   })
-  return svg(W, 46 + rows.length * 26, `Ranked ladder: ${rows.filter(Boolean).map(r => `${r!.rank} ${r!.handle} ${r!.rating}`).join('; ')}`, s, C.bone)
+  return svg(W, 46 + rows.length * 26, `Ranked ladder: ${rows.filter(Boolean).map(r => `${r!.rank} ${r!.handle} ${r!.rating}${r!.github ? ` ${COPY.github}` : ''}`).join('; ')}`, s, C.bone)
 }
 
 /** The Grind: this week's points, rank, and a fluted column per day, today in orange. */
@@ -1091,29 +1152,47 @@ export function commitBadge(a: { points: number; category: string; craft: Craft;
   return svg(w, 22, a.where === 'scoring' ? 'Scoring this commit' : `+${a.points} ${a.category}${a.craft !== 'neutral' ? `, ${a.craft}` : ''}, ${a.where}`, s)
 }
 
-/** The /ccsr last scorecard. Its text reaches Claude, so it carries scores and handles only. */
-export function scorecard(a: { outcome: 'won' | 'lost' | 'draw'; hours: number; me: string; them: string; mine: number; theirs: number; commits: { mine: number; theirs: number }; delta: number; ratingBefore: number; ratingAfter: number; placing?: Placing & { placedIn?: TierKey } }) {
+/**
+ * The /ccsr last scorecard. Its text reaches Claude, so it carries scores and handles only.
+ * `rated: false` (a challenge, W6b, with `mode` CHALLENGE): unrated in the wreath and the
+ * rating line, never +0 or Elo.
+ */
+export function scorecard(a: { outcome: 'won' | 'lost' | 'draw'; hours: number; me: string; them: string; mine: number; theirs: number; commits: { mine: number; theirs: number }; delta: number; ratingBefore: number; ratingAfter: number; placing?: Placing & { placedIn?: TierKey }; mode?: string; rated?: false }) {
   const won = a.outcome === 'won'
   const label = won ? 'VICTORY' : a.outcome === 'lost' ? 'LOSS' : 'DRAW'
+  const unrated = a.rated === false
   const pl = a.placing
-  const t = pl ? (TIERS.find(x => x.key === pl.placedIn) ?? TIERS[0]!) : tierOf(a.ratingAfter)
-  let s = wreath(62, 60, 42, C.ink, won ? C.or : C.stone, 8) + T(62, 68, `${a.delta > 0 ? '+' : ''}${a.delta}`, { s: 22, w: 300, c: won ? C.or : C.ink, a: 'middle', ls: -1 })
-  s += T(124, 30, `CCSR · RANKED ${a.hours}H · ${label}`, { s: 9, w: 700, c: won ? C.or : C.stone2, ls: 1.5 })
+  const placed = unrated ? undefined : pl?.placedIn
+  const t = pl ? (TIERS.find(x => x.key === placed) ?? TIERS[0]!) : tierOf(a.ratingAfter)
+  let s = wreath(62, 60, 42, C.ink, won ? C.or : C.stone, 8)
+  s += unrated ? T(62, 64, 'UNRATED', { s: 9, w: 700, c: won ? C.or : C.ink, a: 'middle', ls: 1 }) : T(62, 68, `${a.delta > 0 ? '+' : ''}${a.delta}`, { s: 22, w: 300, c: won ? C.or : C.ink, a: 'middle', ls: -1 })
+  s += T(124, 30, `CCSR · ${a.mode ?? 'RANKED'} ${hrs(a.hours)} · ${label}`, { s: 9, w: 700, c: won ? C.or : C.stone2, ls: 1.5 })
   const xs = 124 + String(a.mine).length * 21
   s += T(124, 70, a.mine, { s: 34, w: 300, c: C.or, ls: -1.5 }) + T(xs + 2, 66, ':', { s: 20, c: C.stone2 }) + T(xs + 16, 70, a.theirs, { s: 34, w: 300, ls: -1.5 })
   s += T(xs + 16 + String(a.theirs).length * 21 + 16, 52, won ? `${a.me} beat ${a.them}` : a.outcome === 'lost' ? `${a.them} beat ${a.me}` : `${a.me} and ${a.them}, level`, { s: 10 }) + T(xs + 16 + String(a.theirs).length * 21 + 16, 68, `${a.commits.mine} commits to ${a.commits.theirs}`, { s: 9, c: C.stone2 })
-  s += T(124, 96, pl ? (pl.placedIn ? `Placed in ${t.name}` : `Mud · placing ${pl.played} of ${pl.of}`) : `Elo ${a.ratingBefore} → ${a.ratingAfter} (${a.delta > 0 ? '+' : ''}${a.delta}) · ${t.name}`, { s: 10, w: 600, c: pl?.placedIn ? C.or : C.ink }) + badgeAt(t.key, 420, 30, 40)
-  return svg(W, 120, `${label}: ${a.me} ${a.mine}, ${a.them} ${a.theirs}. Elo ${a.ratingBefore} to ${a.ratingAfter}.`, s, C.bone)
+  const line = unrated
+    ? `${pl ? `Mud · placing ${pl.played} of ${pl.of}` : t.name} · unrated`
+    : pl
+      ? placed
+        ? `Placed in ${t.name}`
+        : `Mud · placing ${pl.played} of ${pl.of}`
+      : `Elo ${a.ratingBefore} → ${a.ratingAfter} (${a.delta > 0 ? '+' : ''}${a.delta}) · ${t.name}`
+  s += T(124, 96, line, { s: 10, w: 600, c: placed ? C.or : C.ink }) + badgeAt(t.key, 420, 30, 40)
+  return svg(W, 120, `${label}: ${a.me} ${a.mine}, ${a.them} ${a.theirs}. ${unrated ? 'Unrated.' : `Elo ${a.ratingBefore} to ${a.ratingAfter}.`}`, s, C.bone)
 }
 
-/** Band strips: a 300 by 36 graphic at the left of the band; the line of text and the buttons sit beside it. */
+/**
+ * Band strips: a 300 by 36 graphic at the left of the band; the line of text and the buttons sit
+ * beside it. W6b: a challenge's ready check (`found`, `mode: 'challenge'`) runs `of` seconds (60
+ * if not given), and its result (`rated: false`) says UNRATED where a ranked one has its rating.
+ */
 export type Strip =
   | { kind: 'setup' }
   | { kind: 'grind'; points: number; category: string; craft: Craft; week: number; rank?: number }
   | { kind: 'queue'; seconds: number; hours: number[]; rating: number; range: number }
-  | { kind: 'found'; me: string; them: string; theirRating: number; seconds: number }
+  | { kind: 'found'; me: string; them: string; theirRating: number; seconds: number; mode?: 'ranked' | 'challenge'; of?: number }
   | { kind: 'race'; race: Race; offlineAgo?: string; mode?: string }
-  | { kind: 'result'; mode?: string; outcome: 'won' | 'lost' | 'draw'; hours: number; delta: number; ratingBefore: number; ratingAfter: number; mine: number; theirs: number; placing?: Placing & { placedIn?: TierKey } }
+  | { kind: 'result'; mode?: string; outcome: 'won' | 'lost' | 'draw'; hours: number; delta: number; ratingBefore: number; ratingAfter: number; mine: number; theirs: number; placing?: Placing & { placedIn?: TierKey }; rated?: false }
 
 export function bandStrip(a: Strip) {
   const w = 300
@@ -1136,13 +1215,14 @@ export function bandStrip(a: Strip) {
   } else if (a.kind === 'queue') {
     const t = `${Math.floor(a.seconds / 60)}:${String(a.seconds % 60).padStart(2, '0')}`
     s += `<circle cx="16" cy="18" r="6" fill="${C.or}"/><circle cx="16" cy="18" r="10" fill="none" stroke="${C.or}" stroke-dasharray="2 2"/>` + T(32, 25, t, { s: 18, w: 300 }) + T(84, 15, 'IN QUEUE', { s: 8, w: 700, ls: 1 }) + T(84, 28, `${a.rating} ±${a.range}`, { s: 8.5, c: C.stone2 })
-    a.hours.forEach((hr, i) => (s += `<rect x="${176 + i * 30}" y="10" width="26" height="16" fill="${C.or}" stroke="${C.ink}" stroke-width=".8"/>` + T(189 + i * 30, 22, `${hr}H`, { s: 9, w: 700, a: 'middle' })))
+    a.hours.slice(0, 4).forEach((hr, i) => (s += `<rect x="${176 + i * 30}" y="10" width="26" height="16" fill="${C.or}" stroke="${C.ink}" stroke-width=".8"/>` + T(189 + i * 30, 22, hrs(hr), { s: 9, w: 700, a: 'middle' })))
     alt = `In queue ${t}`
   } else if (a.kind === 'found') {
     bg = C.or
-    s += token(16, 18, 10, false, a.me.slice(0, 1).toUpperCase()) + T(31, 22, 'vs', { s: 9 }) + token(56, 18, 10, false, a.them.slice(0, 1).toUpperCase()) + T(76, 15, 'OPPONENT FOUND', { s: 8.5, w: 700, ls: 1 }) + T(76, 28, `${a.them} · ${tierOf(a.theirRating).name} ${a.theirRating}`, { s: 8.5 })
-    s += `<circle cx="276" cy="18" r="13" fill="${C.paper}" stroke="${C.ink}" stroke-dasharray="2 2"/>${ring(276, 18, 13, a.seconds / 60, C.ink, 3)}` + T(276, 21.5, a.seconds, { s: 9, w: 700, a: 'middle' })
-    alt = `Opponent found: ${a.them}. ${a.seconds} seconds to accept.`
+    const challenge = a.mode === 'challenge'
+    s += token(16, 18, 10, false, a.me.slice(0, 1).toUpperCase()) + T(31, 22, 'vs', { s: 9 }) + token(56, 18, 10, false, a.them.slice(0, 1).toUpperCase()) + T(76, 15, challenge ? 'CHALLENGE' : 'OPPONENT FOUND', { s: 8.5, w: 700, ls: 1 }) + T(76, 28, `${a.them} · ${tierOf(a.theirRating).name} ${a.theirRating}`, { s: 8.5 })
+    s += `<circle cx="276" cy="18" r="13" fill="${C.paper}" stroke="${C.ink}" stroke-dasharray="2 2"/>${ring(276, 18, 13, a.seconds / (a.of !== undefined && a.of > 0 ? a.of : 60), C.ink, 3)}` + T(276, 21.5, a.seconds, { s: 9, w: 700, a: 'middle' })
+    alt = `${challenge ? 'Challenge' : 'Opponent found'}: ${a.them}. ${a.seconds} seconds to accept.`
   } else if (a.kind === 'race') {
     const r = a.race
     const { mine, theirs, asOf } = raceTotals(r)
@@ -1161,8 +1241,10 @@ export function bandStrip(a: Strip) {
     alt = `${mine} to ${theirs}, ${hms(len - r.now)} to the bell`
   } else {
     const won = a.outcome === 'won'
-    s += wreath(18, 19, 13, C.ink, won ? C.or : C.stone, 5) + T(18, 23, `${a.delta > 0 ? '+' : ''}${a.delta}`, { s: 8, w: 700, a: 'middle', c: won ? C.or : C.ink })
-    s += T(40, 15, won ? 'VICTORY' : a.outcome === 'lost' ? 'LOSS' : 'DRAW', { s: 9, w: 700, c: won ? C.or : C.stone2, ls: 1.5 }) + T(40, 28, a.placing ? (a.placing.placedIn ? `PLACED · ${(TIERS.find(t => t.key === a.placing?.placedIn) ?? TIERS[0]!).name.toUpperCase()}` : `PLACING ${a.placing.played}/${a.placing.of}`) : `${a.ratingBefore} → ${a.ratingAfter}`, { s: 8.5, c: a.placing?.placedIn ? C.or : C.stone2 })
+    const unrated = a.rated === false
+    s += wreath(18, 19, 13, C.ink, won ? C.or : C.stone, 5) + (unrated ? '' : T(18, 23, `${a.delta > 0 ? '+' : ''}${a.delta}`, { s: 8, w: 700, a: 'middle', c: won ? C.or : C.ink }))
+    const sub = unrated ? 'UNRATED' : a.placing ? (a.placing.placedIn ? `PLACED · ${(TIERS.find(t => t.key === a.placing?.placedIn) ?? TIERS[0]!).name.toUpperCase()}` : `PLACING ${a.placing.played}/${a.placing.of}`) : `${a.ratingBefore} → ${a.ratingAfter}`
+    s += T(40, 15, won ? 'VICTORY' : a.outcome === 'lost' ? 'LOSS' : 'DRAW', { s: 9, w: 700, c: won ? C.or : C.stone2, ls: 1.5 }) + T(40, 28, sub, { s: 8.5, c: !unrated && a.placing?.placedIn ? C.or : C.stone2 })
     s += T(150, 26, a.mine, { s: 18, w: 300, c: C.or }) + T(150 + String(a.mine).length * 11 + 4, 24, ':', { s: 12, c: C.stone2 }) + T(150 + String(a.mine).length * 11 + 12, 26, a.theirs, { s: 18, w: 300 }) + T(292, 23, `${a.mode ?? 'RANKED'} ${hrs(a.hours)}`, { s: 7.5, w: 600, a: 'end', c: C.stone2, ls: 1 })
     alt = `${won ? 'Victory' : a.outcome === 'lost' ? 'Loss' : 'Draw'}, ${a.mine} to ${a.theirs}`
   }

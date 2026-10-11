@@ -1,4 +1,5 @@
-import type { Craft, FeedItem, ScoredCommit, WeekTotals } from '../types'
+import type { ApiLane, Craft, FeedItem, ScoredCommit, WeekTotals } from '../types'
+import { cleanServer } from './config'
 
 // Pure values and helpers: no $ in this file, so everything here is unit tested.
 
@@ -105,6 +106,142 @@ export function elo(mine: number, theirs: number, result: 0 | 0.5 | 1, played: n
   const expected = 1 / (1 + Math.pow(10, (theirs - mine) / 400))
   const k = played < 10 ? 40 : 24
   return Math.round(mine + k * (result - expected))
+}
+
+// ------------------------------------------------------------------ match lengths (W2b)
+// Ranked lengths are minutes (API v0.5). The server says which are offered to you
+// (GET /queue's `lanes`); the mod never names a length it hasn't been offered, and
+// never reads the deprecated hours.
+
+/** The bounds the server holds a length to (server/src/lengths.ts): whole minutes from 5 to 1440, at most 8 at a time. */
+export const LENGTH_MIN = 5
+export const LENGTH_MAX = 1440
+export const LENGTHS_MAX = 8
+/** The longest length label the mod draws; the server's own cap is 12 too. */
+export const LENGTH_LABEL_MAX = 12
+/** The warning before the bell when the server doesn't say how long the match's grace is, and practice's always. */
+export const WARN_MS = 10 * 60_000
+
+const isMinutes = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x >= LENGTH_MIN && x <= LENGTH_MAX
+/** Numeric order: a bare sort puts 180 before 30. */
+const numeric = (x: number, y: number) => x - y
+
+/** Whole minutes in range, once each, in numeric order, at most 8; anything else is dropped. */
+export function minutesOf(list: unknown): number[] {
+  if (!Array.isArray(list)) return []
+  return [...new Set(list.filter(isMinutes))].sort(numeric).slice(0, LENGTHS_MAX)
+}
+
+/** A length as the mod writes it, like the server's formatLength: 15m, 1h, 1h 30m. */
+export function lengthLabel(min: number) {
+  const m = Math.max(0, Math.round(Number.isFinite(min) ? min : 0))
+  if (m % 60 === 0 && m > 0) return `${m / 60}h`
+  if (m < 60) return `${m}m`
+  return `${Math.floor(m / 60)}h ${m % 60}m`
+}
+
+/** A label from the server as one clean line of 1 to 12 characters, or null. */
+function serverLabel(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  const s = cleanServer(raw).trim()
+  return s.length >= 1 && s.length <= LENGTH_LABEL_MAX ? s : null
+}
+
+const count = (x: unknown) => (typeof x === 'number' && Number.isFinite(x) && x >= 0 ? Math.round(x) : 0)
+
+/**
+ * GET /queue's `lanes` as the mod draws them: a lane needs a length in whole minutes
+ * (5 to 1440); everything else on it is held to something drawable (a bad label is
+ * the mod's own, a bad count 0, a bad wait unknown, ratings finite numbers, at most
+ * 100, a bad swing none). The first of a repeated length wins; numeric order, at most
+ * 8. Null when the answer has no lanes at all (a server from before W2).
+ */
+export function lanesOf(raw: unknown): ApiLane[] | null {
+  if (!Array.isArray(raw)) return null
+  const out: ApiLane[] = []
+  for (const x of raw) {
+    if (!x || typeof x !== 'object') continue
+    const o = x as Record<string, unknown>
+    const min = o.length_min
+    if (!isMinutes(min) || out.some(l => l.length_min === min)) continue
+    const wait = o.wait_ms
+    out.push({
+      length_min: min,
+      label: serverLabel(o.label) ?? lengthLabel(min),
+      waiting: count(o.waiting),
+      wait_ms: typeof wait === 'number' && Number.isFinite(wait) && wait >= 0 ? wait : null,
+      ratings: Array.isArray(o.ratings) ? o.ratings.filter((r): r is number => typeof r === 'number' && Number.isFinite(r)).slice(0, 100) : [],
+      swing: typeof o.swing === 'number' && Number.isFinite(o.swing) ? Math.abs(Math.round(o.swing)) : null,
+    })
+  }
+  return out.sort((a, b) => a.length_min - b.length_min).slice(0, LENGTHS_MAX)
+}
+
+/** Config's `lengths` catalog (W2), for the label of a length the lanes don't hold: { min, label } in numeric order, [] without one. */
+export function catalogOf(raw: Record<string, unknown>): { min: number; label: string }[] {
+  const list = raw.lengths
+  if (!Array.isArray(list)) return []
+  const out: { min: number; label: string }[] = []
+  for (const x of list) {
+    if (!x || typeof x !== 'object') continue
+    const o = x as Record<string, unknown>
+    if (!isMinutes(o.min) || out.some(l => l.min === o.min)) continue
+    out.push({ min: o.min, label: serverLabel(o.label) ?? lengthLabel(o.min) })
+  }
+  return out.sort((a, b) => a.min - b.min).slice(0, LENGTHS_MAX)
+}
+
+/** A length's label for the pane: the lane's, else the catalog's (both the server's), else the mod's own. Never for text that reaches Claude: that takes lengthLabel. */
+export function labelFor(min: number, lanes: readonly ApiLane[] | null, catalog: readonly { min: number; label: string }[] = []) {
+  return lanes?.find(l => l.length_min === min)?.label ?? catalog.find(l => l.min === min)?.label ?? lengthLabel(min)
+}
+
+/**
+ * The lengths picked, from the store. 0.3.0 kept `lengths` in hours, and everyone
+ * who ever queued has [1, 3] stored without choosing it, so that (or anything else
+ * this can't read) is null: every length offered. [1] is [60] and [3] is [180].
+ * From W2b on `lengthsMin` is kept instead: null, or minutes ([] when every length
+ * was unticked).
+ */
+export function lengthsFromStore(stored: unknown): number[] | null {
+  const o = stored && typeof stored === 'object' ? (stored as Record<string, unknown>) : {}
+  if ('lengthsMin' in o) return Array.isArray(o.lengthsMin) ? minutesOf(o.lengthsMin) : null
+  const old = Array.isArray(o.lengths) ? [...new Set(o.lengths)] : []
+  if (old.length === 1 && old[0] === 1) return [60]
+  if (old.length === 1 && old[0] === 3) return [180]
+  return null
+}
+
+/** What a Queue press asks for: the pick (null is every length) within the lanes offered now, in numeric order. [] is nothing to queue for. */
+export function pickedLengths(picked: readonly number[] | null, lanes: readonly Pick<ApiLane, 'length_min'>[] | null): number[] {
+  const offered = minutesOf((lanes ?? []).map(l => l.length_min))
+  if (picked === null) return offered
+  return minutesOf(picked).filter(m => offered.includes(m))
+}
+
+/**
+ * The pick after pressing one length's toggle, over the lanes offered now. Every
+ * lane ticked is null (every length, so a length offered later is ticked too).
+ */
+export function toggledLengths(picked: readonly number[] | null, min: number, lanes: readonly Pick<ApiLane, 'length_min'>[]): number[] | null {
+  const offered = minutesOf(lanes.map(l => l.length_min))
+  const now = pickedLengths(picked, lanes)
+  const next = now.includes(min) ? now.filter(m => m !== min) : minutesOf([...now, min]).filter(m => offered.includes(m))
+  return offered.length > 0 && offered.every(m => next.includes(m)) ? null : next
+}
+
+/**
+ * How long before the bell a ranked match warns: its grace (grace_ends_at minus the
+ * deadline: 3 minutes at 15m, 5 at 30m, 10 at 1h and 3h), in whole minutes, held to
+ * 1 to 10. WARN_MS when the server doesn't say. The toast, the band and status line's
+ * last minutes, the working line and the uncommitted-files check all follow it.
+ */
+export function warnMs(s: { deadline: string | null; grace_ends_at?: string | null } | null | undefined) {
+  const d = s?.deadline ? Date.parse(s.deadline) : NaN
+  const g = s?.grace_ends_at ? Date.parse(s.grace_ends_at) : NaN
+  const ms = g - d
+  if (!Number.isFinite(ms) || ms <= 0) return WARN_MS
+  return Math.min(WARN_MS, Math.max(60_000, Math.round(ms / 60_000) * 60_000))
 }
 
 // ------------------------------------------------------------------ scale and craft

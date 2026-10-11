@@ -4,7 +4,14 @@
 // scripts/publish-mod.sh bumps both and refuses to publish when they differ.
 // Pure: no `$` here, so register.tsx can import it.
 
-export const VERSION = '0.3.0'
+export const VERSION = '0.4.0'
+
+/**
+ * The oldest Claude Code that runs mods, which Settings > Version names: the
+ * terminal needs 2.1.287, the desktop app 2.1.286 (the plugin.json floor
+ * sentence says the same).
+ */
+export const CLAUDE_FLOOR = { terminal: '2.1.287', desktop: '2.1.286' } as const
 
 /** Updates an installed mod from the install repo; it loads once Claude Code restarts. */
 export const UPDATE_ARGV = [

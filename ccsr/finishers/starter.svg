@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 408" width="960" height="408">
+  <!-- CCSR finisher starter. Your stage is 960 by 408, between our HUD above and our result strip below. -->
+  <!-- The bell rings at 0.8 s. Animate with CSS keyframes only, finish by 8 s, and the last frame holds. -->
+  <!-- Every rule or style that animates names its keyframes there, with the animation shorthand or animation-name. -->
+  <!-- The rules are in SPEC.md next to this file. -->
+  <style>
+    .temple { fill: none; stroke: #E6DED1; stroke-opacity: 0.16; stroke-width: 1.2; stroke-dasharray: 4 4 }
+    .drum rect, #capital rect { fill: #D9CFBF }
+    .flute { fill: none; stroke: #9A9286; stroke-width: 2 }
+    #capital { animation: rise 0.2s ease-out 0.6s }
+    #ring { fill: none; stroke: #FF6A2A; stroke-width: 4; transform-box: fill-box; transform-origin: center; animation: ring 0.6s ease-out 0.8s }
+    .ray { fill: none; stroke: #FF6A2A; stroke-width: 3; stroke-linecap: round; stroke-dasharray: 1; animation: draw 0.4s ease-out 0.8s }
+    #coin { animation: land 0.6s ease-in 1s }
+    #headline { fill: #FF6A2A; animation: fade 0.4s ease-out 1.6s }
+    #bits { fill: #E6DED1; fill-opacity: 0.35; animation: fade 0.6s linear 2s }
+    @keyframes rise { from { opacity: 0; transform: translateY(28px) } to { opacity: 1; transform: translateY(0) } }
+    @keyframes ring { from { opacity: 0.9; transform: scale(0.3) } to { opacity: 0; transform: scale(1.8) } }
+    @keyframes draw { from { stroke-dashoffset: 1 } to { stroke-dashoffset: 0 } }
+    @keyframes land { 0% { opacity: 0; transform: translateY(-120px) } 70% { opacity: 1; transform: translateY(8px) } 100% { opacity: 1; transform: translateY(0) } }
+    @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+  </style>
+  <defs>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="4" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="960" height="408" fill="#141312"/>
+  <!-- The temple: dashed linework that stays still. -->
+  <path class="temple" d="M96 116L480 50L864 116ZM110 116H850V134H110ZM80 388H880M64 396H896"/>
+  <!-- The column rises drum by drum. -->
+  <g class="drum">
+    <g style="animation: rise 0.3s ease-out 0s"><rect x="448" y="338" width="64" height="34"/><path class="flute" d="M462 342V368M480 342V368M498 342V368"/></g>
+    <g style="animation: rise 0.3s ease-out 0.12s"><rect x="448" y="302" width="64" height="34"/><path class="flute" d="M462 306V332M480 306V332M498 306V332"/></g>
+    <g style="animation: rise 0.3s ease-out 0.24s"><rect x="448" y="266" width="64" height="34"/><path class="flute" d="M462 270V296M480 270V296M498 270V296"/></g>
+    <g style="animation: rise 0.3s ease-out 0.36s"><rect x="448" y="230" width="64" height="34"/><path class="flute" d="M462 234V260M480 234V260M498 234V260"/></g>
+    <g style="animation: rise 0.3s ease-out 0.48s"><rect x="448" y="194" width="64" height="34"/><path class="flute" d="M462 198V224M480 198V224M498 198V224"/></g>
+  </g>
+  <g id="capital"><rect x="432" y="176" width="96" height="16"/><rect x="424" y="166" width="112" height="10"/></g>
+  <!-- The bell: a ring and rays at 0.8 s. -->
+  <circle id="ring" cx="480" cy="128" r="56" filter="url(#glow)"/>
+  <g>
+    <path class="ray" pathLength="1" d="M408 128L356 128"/>
+    <path class="ray" pathLength="1" d="M413.48 100.45L365.44 80.55"/>
+    <path class="ray" pathLength="1" d="M429.09 77.09L392.32 40.32"/>
+    <path class="ray" pathLength="1" d="M452.45 61.48L432.55 13.44"/>
+    <path class="ray" pathLength="1" d="M480 56L480 4"/>
+    <path class="ray" pathLength="1" d="M507.55 61.48L527.45 13.44"/>
+    <path class="ray" pathLength="1" d="M530.91 77.09L567.68 40.32"/>
+    <path class="ray" pathLength="1" d="M546.52 100.45L594.56 80.55"/>
+    <path class="ray" pathLength="1" d="M552 128L604 128"/>
+  </g>
+  <!-- The coin lands on the column. -->
+  <g id="coin">
+    <circle cx="480" cy="128" r="34" fill="#E6DED1"/>
+    <circle cx="480" cy="128" r="27" fill="none" stroke="#141312" stroke-width="2" stroke-dasharray="3 3"/>
+    <path d="M459 113h6v6h-6zM465 113h6v6h-6zM471 113h6v6h-6zM459 119h6v6h-6zM471 119h6v6h-6zM459 125h6v6h-6zM471 125h6v6h-6zM459 131h6v6h-6zM471 131h6v6h-6zM459 137h6v6h-6zM465 137h6v6h-6zM471 137h6v6h-6zM489 113h6v6h-6zM483 119h6v6h-6zM489 119h6v6h-6zM489 125h6v6h-6zM489 131h6v6h-6zM483 137h6v6h-6zM489 137h6v6h-6zM495 137h6v6h-6z" fill="#FF6A2A"/>
+  </g>
+  <!-- The headline, drawn as paths, not text. -->
+  <path id="headline" d="M108 150h10v10h-10zM120 150h10v10h-10zM132 150h10v10h-10zM96 162h10v10h-10zM144 162h10v10h-10zM96 174h10v10h-10zM96 186h10v10h-10zM120 186h10v10h-10zM132 186h10v10h-10zM144 186h10v10h-10zM96 198h10v10h-10zM144 198h10v10h-10zM96 210h10v10h-10zM144 210h10v10h-10zM108 222h10v10h-10zM120 222h10v10h-10zM132 222h10v10h-10zM180 150h10v10h-10zM192 150h10v10h-10zM204 150h10v10h-10zM168 162h10v10h-10zM216 162h10v10h-10zM168 174h10v10h-10zM168 186h10v10h-10zM192 186h10v10h-10zM204 186h10v10h-10zM216 186h10v10h-10zM168 198h10v10h-10zM216 198h10v10h-10zM168 210h10v10h-10zM216 210h10v10h-10zM180 222h10v10h-10zM192 222h10v10h-10zM204 222h10v10h-10zM240 222h10v10h-10z"/>
+  <!-- Binary fill, as text. -->
+  <text id="bits" font-family="monospace" font-size="14">
+      <tspan x="744" y="150">0 1 0 1 0 0</tspan>
+      <tspan x="744" y="172">0 0 0 1 1 0</tspan>
+      <tspan x="744" y="194">1 1 0 0 1 1</tspan>
+      <tspan x="744" y="216">0 0 0 0 0 0</tspan>
+      <tspan x="744" y="238">1 0 0 0 0 0</tspan>
+      <tspan x="744" y="260">0 0 0 1 1 1</tspan>
+      <tspan x="744" y="282">0 0 1 1 0 0</tspan>
+      <tspan x="744" y="304">0 0 1 1 1 0</tspan>
+      <tspan x="744" y="326">1 0 1 1 1 1</tspan>
+      <tspan x="744" y="348">1 0 0 1 0 1</tspan>
+  </text>
+</svg>

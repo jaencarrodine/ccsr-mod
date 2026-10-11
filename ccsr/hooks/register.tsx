@@ -1,9 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, ModelCompleteResult, RenderElement, RenderInput, Register } from 'claude-code'
 
-import type { ApiAccount, ApiChatItem, ApiInstall, ApiLobbyItem, ApiMatchSummary, ApiPlayer, ApiQueueState, ApiRankedRow, ApiRecentMatch, ApiRoom, ApiScoreReply, ApiSeason, BacktestRun, RankedMatch, RankedShared, ChatLine, FeedItem, LinkState, Match, ModSettings, OutboxItem, PastSession, Record3, ScanStatus, SavedAccount, ScoredCommit, ServerConfig, Keyring, Surfaces, Tab, WeekTotals } from '../types'
-import { DEFAULT_SERVER, backoffMs, errorOf, handleProblem, mergeEvents, retryable, scoreBody } from './api'
-import { UPDATE_ARGV, UPDATE_COMMAND, VERSION, standing } from './version'
+import type { ApiAccount, ApiChatItem, ApiCoder, ApiInstall, ApiLane, ApiLobbyItem, ApiMatchSummary, ApiPlayer, ApiQueueState, ApiRankedRow, ApiRecentMatch, ApiRoom, ApiScoreReply, ApiSeason, BacktestRun, ConfigState, RankedMatch, RankedShared, ChatLine, FeedItem, LinkState, Match, ModSettings, OutboxItem, PastSession, Record3, ScanStatus, SavedAccount, ScoredCommit, ServerConfig, Keyring, Surfaces, Tab, WeekTotals } from '../types'
+import { DEFAULT_SERVER, backoffMs, errorOf, handleProblem, hungExpiryMs, loopWaitMs, mergeEvents, retryAfterMs, retryable, scoreBody, sha256hex, watchdogMs, withoutCoder } from './api'
+import { CONFIG0, REREAD_JITTER_MS, configPath, headerReread, jitterMs, parseConfig } from './config'
+import type { ModConfig, Surface } from './config'
+import { CLAUDE_FLOOR, UPDATE_ARGV, UPDATE_COMMAND, VERSION, standing } from './version'
 import {
   DEFAULT_MODEL,
   FALLBACK_MODEL,
@@ -12,7 +14,9 @@ import {
   RUBRIC,
   START_RATING,
   STORE_VERSION,
+  WARN_MS,
   botPlan,
+  catalogOf,
   clean,
   digestText,
   elo,
@@ -20,24 +24,119 @@ import {
   idKey,
   isNoise,
   isStashTitle,
+  labelFor,
+  lanesOf,
+  lengthLabel,
+  lengthsFromStore,
+  minutesOf,
   myPace,
   oppAt,
   parseVerdict,
   periodStart,
+  pickedLengths,
   recentOnSameFiles,
   rng,
   rollCutoff,
   rollUp,
   stepCraft,
   tierOf,
+  toggledLengths,
   totals,
+  warnMs,
 } from './pure'
 import type { RecentCommit } from './pure'
+// W3b: config's buckets, the checklist's install link, and the words the mod draws around them.
+import { installAppUrlOk } from './actions'
+import type { Provider } from './actions'
+import { OPEN, bucketIdOf, bucketRowShown, bucketsOf, lengthsFor, pickBucket, standingFor } from './buckets'
+import type { Bucket } from './buckets'
+import { BUCKET } from './copy'
+import { REREAD_SPACING_MS } from './config'
+import type { BucketBoard } from '../types'
+// W6b: challenges (config's `challenges`, the inbox, a challenge read, its code and link, the message rules) and their words.
+import { CODE, challengeCfg, challengeCode, challengeHref, messageOut, readChallenge, readInbox } from './challenges'
+import type { Challenge, ChallengeCfg, ChallengeRead } from './challenges'
+import { CHALLENGE, challengeResultText } from './copy'
+import type { ApiOffer, ChallengeUi } from '../types'
+// W4b: the server's notices. notices.ts decides what shows where, when and how often; this file draws, fires, counts and posts.
+import { NOTICE } from './copy'
+import {
+  FEED_HOLD_MS,
+  FLASH_MS,
+  LEASE_MS,
+  SESSION0,
+  armFor,
+  bumpStats,
+  buttonsFor,
+  claimFire,
+  dayKey,
+  eligible,
+  feedAlert,
+  feedKey,
+  feedLine,
+  feedNotices,
+  firedOf,
+  flashText,
+  formFor,
+  ledgerOf,
+  matchEndEvents,
+  matchTabPlaces,
+  noteClick,
+  noteDismiss,
+  noteAlerted,
+  noteDrawn,
+  noteShown,
+  noteSnooze,
+  noticeText,
+  noticesOf,
+  openNotice,
+  pickFlash,
+  pickFor,
+  pickToast,
+  plainText,
+  pruneFired,
+  pruneLedger,
+  releaseArming,
+  statsAfterSend,
+  statsBatch,
+  statsDue,
+  statsOf,
+  takeLease,
+  toastText,
+} from './notices'
+import type { CapLedger, Notice, NoticeEvent, NoticeForm, NoticePick, NoticeStats, NoticeView, Place, ReleaseArming, SessionLedger } from './notices'
+import type { Action } from './actions'
 import { sessionBars } from './svg'
 import { banner, bandStrip, chatLog, chatRooms, commitBadge, commitList, feed as feedSvg, grind, ladder, numberOne, queue as queueSvg, queueBar, raceClimb, ratingCard, readyCheck, recentMatches, result, scorecard, setupHero, tabsBase, tabsTop, tierFrieze } from './olympia'
 import type { Race, TierKey } from './olympia'
-import { ACCOUNT, FULL, LINES, MOD, QUIET, ROASTS, SURFACE_ROWS, SURFACE_WHAT, presetOf, resultText, surfacesFrom } from './copy'
+import { ACCOUNT, EVAL, FULL, LINES, MOD, QUIET, ROASTS, SURFACE_ROWS, SURFACE_WHAT, cancelledLine, pickerLine, presetOf, privacyLines, resultText, surfacesFrom } from './copy'
 import type { SurfaceKey } from './copy'
+// W5b: sign-in with a provider's device flow (`type Provider` comes from W3b's import block, above).
+import { IDENTITY, PROVIDER_NAMES } from './copy'
+import { PROVIDERS, safeLink } from './actions'
+import { PROVIDER_HOSTS, cancelSignIn, choose, conflictChoices, dismissSignIn, flowIdOf, IDLE as SIGNIN0, join as joinFlow, linkedLogin, newInstallsVia, onJoin, onPoll, onResolve, onStart, onTick, pollDue, refLinked, signinMode, startSignIn as pressSignIn, tokenlessStart } from './identity'
+import type { Answer as FlowAnswer, EndWhy, FlowRef, Send as FlowSend, SignIn, SignInFrom, Step as SignInStep } from './identity'
+// W7-2: eval capture (the call records, the coder block, Model stats).
+import { CALL_KEEP_MS, CALL_SLOTS, CALL_SLOT_MAX, PENDING_MAX, bashCall, blockSince, captureOn, clientOf, coderBlocks, readSince, readSlot, sinceText, slotHolds, slotOf, slotText, stamped, stepCall, versionOf, windowsOf } from './coder'
+import type { Call, Client, CoderBlock, Effort } from './coder'
+// W7-3: the transcript fallback (dark, behind config's eval_backfill).
+import { BACKGROUND_MS, FILES_PER_SCAN, SESSIONS_MAX, TWINS_MAX, backfillOn, callsFromTranscript, isSubagentFile, mergeTranscripts, projectDirOf, readPlan, subfolderPrefixOf, transcriptsDirOf } from './transcripts'
+import type { TranscriptCall, TranscriptFile } from './transcripts'
+// W10b: finishers: the drawings (finishers.ts, a verbatim copy of mod-lab's), how the mod plays them (finisherplay.ts), and their words.
+import { accentOf, buildFinisher, finisherWords, freeze, withCounter } from './finishers'
+import type { FinisherDrawing, FinisherInput } from './finishers'
+import { TERM_BEATS, finisherInput, finisherMeOf, finisherOf, finishersOf, practiceFinisher, previewInput, seenOf, seenWith, sharePath, soundFor, termPhase, termRows } from './finisherplay'
+import { FINISHER } from './copy'
+import { cleanServer } from './config'
+import type { FinisherUi } from '../types'
+// W10e: custom finishers (dark): the shared validator (finisherart.ts, W10d's), the frame custom art plays in (finishers.ts's HUD and
+// strip), how the mod reads config's `finishers.custom`, art refs, your art and the gallery (finishers-custom.ts), and their words.
+import { ART_CEILINGS, checkArt, freezeArt } from './finisherart'
+import { KINDS, finisherHud, finisherStrip, kindOf } from './finishers'
+import type { FinisherKind } from './finishers'
+import { GALLERY_PAGE, REPORT_REASONS, TITLE_PROBLEM, artCode, artProblems, artRefOf, artShown, customMeOf, customOf, customTiming, drawsArt, galleryOf, localProblems, problemsOf, titleFor, titleRefused, wrongSlotOf } from './finishers-custom'
+import type { Art, ArtRef, CustomMe, Problem, ReportReason } from './finishers-custom'
+import { CUSTOM } from './copy'
 
 // Every function that is handed $ lives in this file: the engine follows $
 // into same-file, top-level functions only, and state reads and writes must
@@ -68,14 +167,35 @@ const expanded = atom({ plugin: 'ccsr', key: 'expanded' } as const, null)
 const btLimit = atom({ plugin: 'ccsr', key: 'btLimit' } as const, 15)
 const labNote = atom({ plugin: 'ccsr', key: 'labNote' } as const, '')
 const chatDraft = atom({ plugin: 'ccsr', key: 'chatDraft' } as const, '')
-const LINK0: LinkState = { online: null, note: '', me: null, season: null, grind: null, grindRank: null, outbox: 0, queue: null, ranked: null, ladder: null, myRank: null, grindOf: null, rooms: null, room: 'world', lobby: null, recent: null, release: null, updateNote: '', account: null, installs: null, linkCode: null, unknownToken: false, recoveryFresh: false, confirmRemove: false }
+const LINK0: LinkState = { online: null, note: '', me: null, season: null, grind: null, grindRank: null, outbox: 0, queue: null, lanes: null, ranked: null, ladder: null, myRank: null, grindOf: null, rooms: null, room: 'world', lobby: null, recent: null, release: null, updateNote: '', account: null, installs: null, linkCode: null, unknownToken: false, recoveryFresh: false, confirmRemove: false, meBuckets: null, boards: null, lanesBucket: null }
 const link = atom({ plugin: 'ccsr', key: 'link' } as const, LINK0)
 const badges = atom({ plugin: 'ccsr', key: 'badges' } as const, {})
 const turnMarks = atom({ plugin: 'ccsr', key: 'turnMarks' } as const, {})
 const dirty = atom({ plugin: 'ccsr', key: 'dirty' } as const, null)
 const forfeitAsk = atom({ plugin: 'ccsr', key: 'forfeitAsk' } as const, false)
+/** W3b: the bucket the Ranked and Grind tabs show, from their bucket rows; null is Open. The Match tab's is the store's `ranked.bucket`. */
+const boardPick = atom({ plugin: 'ccsr', key: 'boardPick' } as const, { ranked: null as string | null, grind: null as string | null })
+/** W6b: the challenge box (the inbox read, the form, a code looked up, the note). Never a challenge's message: see `challengeMessages`. */
+const CHALLENGE_UI0: ChallengeUi = { rev: 0, incoming: null, outgoing: null, form: null, code: null, note: '', muteAsk: null, reportAsk: null }
+const challengeUi = atom({ plugin: 'ccsr', key: 'challengeUi' } as const, CHALLENGE_UI0)
+/** W4b: moves whenever this session's notices change (module variables, in "notices" below), so the pane, the band and the status line draw again. */
+const noticeRev = atom({ plugin: 'ccsr', key: 'noticeRev' } as const, 0)
 /** Which way in the first-run card shows: a new handle, a link code, or a recovery key. */
 const joinMode = atom({ plugin: 'ccsr', key: 'joinMode' } as const, 'new' as 'new' | 'link' | 'recover')
+/** The server's config for this server and handle (GET /config): CONFIG0, 0.3.0's behaviour, until a read lands. Read it through configOf. */
+const CONFIG_HELD0: ConfigState = { ...CONFIG0, poll: { ...CONFIG0.poll }, chat: { ...CONFIG0.chat }, raw: {}, key: '', readAt: 0 }
+const config = atom({ plugin: 'ccsr', key: 'config' } as const, CONFIG_HELD0, { shape: 'config-1' })
+/** W5b: moves on every change of the sign-in card (a module variable, below), so the pane redraws. */
+const signinRev = atom({ plugin: 'ccsr', key: 'signinRev' } as const, 0)
+/** W5b: the Settings row's note (unlinked, or why not), whether the card's code was copied, and Unlink's first press. */
+const signinUi = atom({ plugin: 'ccsr', key: 'signinUi' } as const, { note: '', copied: false, unlinkAsk: false })
+/** W10b: moves when a finisher starts, replays or reaches a beat, so the result draws its next frame on time. */
+const finisherRev = atom({ plugin: 'ccsr', key: 'finisherRev' } as const, 0)
+/** W10b: the Finishers view: GET /me/finishers as last read, whether a request is out, and its note. */
+const FINISHER_UI0: FinisherUi = { key: '', me: null, busy: false, note: '' }
+const finisherUi = atom({ plugin: 'ccsr', key: 'finisherUi' } as const, FINISHER_UI0)
+/** W10e: moves on every change of the custom finishers' view and result state, which lives in module memory ("custom finishers", below), never here. */
+const customRev = atom({ plugin: 'ccsr', key: 'customRev' } as const, 0)
 
 // ================================================================== STORE
 
@@ -107,10 +227,35 @@ const K = {
   salt: 'salt',
   // Set when the player removed this install, so the keyring doesn't sign it straight back in.
   optOut: 'optOut',
+  // W4b, notices, shared by every session on this config dir: each notice's caps (showings, presses, dismissals, a snooze),
+  // the counts waiting to post (ids and counts only), who showed a toast or a flash or a feed alert (so one session does),
+  // the stats post's lease and when one last went, and whether the first scored commit has been seen.
+  noticeCaps: 'noticeCaps',
+  noticeStats: 'noticeStats',
+  noticeFired: 'noticeFired',
+  noticeLease: 'noticeLease',
+  noticeSentAt: 'noticeSentAt',
+  noticeFirst: 'noticeFirst',
   // Ranked: idle, queued, offered, live or done, and which match; every session follows it.
   ranked: 'ranked',
+  // W6b: the challenge inbox as the last read on this machine got it (messages included: the store is this plugin's own file, never $.state), by `<server url>|<handle>`, with when that read began and the incoming challenges already toasted.
+  challenges: 'challenges',
+  // W6b: a Challenges switch press here, by `<server url>|<handle>`, until the server confirms it (ChallengesPress).
+  challengesPress: 'challengesPress',
+  // W10b: the matches whose finisher drew on this machine and when it first did, the newest 20: each plays once.
+  finisherSeen: 'finisherSeen',
+  // W10e: your own art whose review result a toast already told (ids only, the newest 20), so every session tells each once.
+  finisherTold: 'finisherTold',
   // The newest release the update toast has shown, so it shows once per release.
   updateSeen: 'updateSeen',
+  // The server's config (GET /config), raw, by `<server url>|<handle>`, with when its read began: every session on this machine shares it, and a session offline uses it.
+  config: 'config',
+  // W5b: the new installs (signed in with a provider) the warning toast already showed, so every session shows each once.
+  newInstalls: 'newInstalls',
+  // W5b: tokens whose install should be gone (an old install after a switch, a token nobody took) but whose removal didn't go through; retried on the config tick.
+  orphans: 'orphans',
+  // W7-2: Model stats as GET /me last said it, `{ key: '<server url>|<handle>', on }`, so a session offline plays by it.
+  modelStats: 'modelStats',
 } as const
 
 type Verdict = Pick<ScoredCommit, 'points' | 'base' | 'craft' | 'category' | 'reason' | 'judge' | 'asked' | 'rubric' | 'scoredAt'>
@@ -137,6 +282,33 @@ let turnPoints = 0
 const lastFingerprint = new Map<string, string>()
 const lastFullList = new Map<string, number>()
 const skipShas = new Set<string>()
+// Eval capture (W7-2): the model calls turn.step saw, until they're written to this machine's
+// call records (~/.ccsr/calls), and what this session stamps on them. Module memory only, never
+// an atom, the ledger or the store: $.state is readable by every plugin.
+/** Capture is on here: config's eval_capture, signed in, Model stats not off. The only thing the turn.step hook reads. */
+let capturing = false
+/** This session knows whether capture is on (a config held for this account, or Model stats off): until then a waiting block is sent as it is. */
+let captureKnown = false
+/** Whether boot registered syncCapture on the config tick (once, as W3b's, W5b's and W6b's ticks are). */
+let captureTicking = false
+/** Model calls not yet written: when each answered on the wall clock, which the write turns into `$.clock` time. */
+const stepsPending: { wall: number; call: Call }[] = []
+/** Each loop's latest step (main is ''): the model and effort a Bash record of a call it asked for carries. */
+const lastStep = new Map<string, { model: string | null; effort: Effort | null }>()
+/** What this session stamps on its records, and the slot file it writes (picked by its id, which is never written). */
+let callSession: { client: Client | null; clientVersion: string | null; repo: string | null } = { client: null, clientVersion: null, repo: null }
+let callSlot = 0
+/** The session root the repo key was worked out for: the key is worked out again only when the root moves. */
+let callRoot = ''
+let callWrite: Promise<void> | null = null
+/** Records this session wrote lately: every write puts them in again, so one another session's crossing write lost comes back on the next. */
+const callsMine: Call[] = []
+/** A slot read that didn't parse once (maybe a write caught halfway): the next write waits; a second in a row overwrites it. */
+let slotTorn = false
+/** This session already cleared the records for the current off spell (Model stats off, the flag off, signed out). */
+let callsForgotten = false
+/** W7-3: the transcript fallback runs here: capture is on and config's eval_backfill is too. Set with `capturing`, in syncCapture. */
+let backfilling = false
 
 async function storeGet<T>($: $, key: string, fallback: T): Promise<T> {
   const v = (await $.store.get(key)) as T | undefined
@@ -336,6 +508,8 @@ export type RawCommit = RecentCommit & {
   email: string
   /** `noreply@github.com` for commits GitHub made: squash merges, web edits. */
   committer: string
+  /** Committer time, git's `%ct`, in whole seconds: when the commit was made (an amend or a rebase moves it, the author time stays). The coder block's window ends here (W7-2). */
+  ct?: number
 }
 
 async function git($: $, cwd: string, args: string[], timeoutMs = 60_000) {
@@ -397,14 +571,18 @@ async function reachable($: $, root: string, from: number) {
  * safe lower bound; author time is checked here.
  */
 async function listCommits($: $, root: string, emails: Set<string>, from: number, to: number) {
-  const r = await git($, root, ['log', ...REFS, '--no-merges', `--since=@${Math.floor(from / 1000)}`, `--format=${SEP}%H${SEP}%ae${SEP}%at${SEP}%ce${SEP}%s`, '--numstat'], 90_000)
+  // %ct (W7-2) goes after %s: the fields before it keep their places.
+  const r = await git($, root, ['log', ...REFS, '--no-merges', `--since=@${Math.floor(from / 1000)}`, `--format=${SEP}%H${SEP}%ae${SEP}%at${SEP}%ce${SEP}%s${SEP}%ct`, '--numstat'], 90_000)
   if (r.exitCode !== 0) throw new Error(clean(r.stderr.trim().slice(0, 200)) || 'git log failed')
   const out: RawCommit[] = []
   let cur: RawCommit | null = null
   for (const line of r.stdout.split('\n')) {
     if (line.startsWith(SEP)) {
-      const [, sha = '', email = '', at = '0', ce = '', title = ''] = line.split(SEP)
-      cur = { sha, email: email.toLowerCase(), committer: ce.toLowerCase(), authoredAt: Number(at) * 1000, title: clean(title), added: 0, deleted: 0, files: [] }
+      const [, sha = '', email = '', at = '0', ce = '', ...rest] = line.split(SEP)
+      // The committer time is the last field; a subject that held the separator keeps the rest.
+      const ct = rest.length > 1 && /^\d+$/.test(rest.at(-1) ?? '') ? Number(rest.pop()) : undefined
+      const title = rest.join(SEP)
+      cur = { sha, email: email.toLowerCase(), committer: ce.toLowerCase(), authoredAt: Number(at) * 1000, ct, title: clean(title), added: 0, deleted: 0, files: [] }
       out.push(cur)
     } else if (cur && line.trim()) {
       const [a = '0', d = '0', ...rest] = line.split('\t')
@@ -740,7 +918,7 @@ export type ScanResult = {
  *   ref leave (local squash, reset), except branch commits a squash stands for.
  * Rows older than the roll-up cutoff are never listed or scored again.
  */
-async function scanGrind($: $, force: boolean, notify?: (c: ScoredCommit) => Promise<void>): Promise<ScanResult> {
+async function scanGrind($: $, force: boolean, notify?: (c: ScoredCommit, coder: CoderBlock | null) => Promise<void>): Promise<ScanResult> {
   const result: ScanResult = { added: [], replaced: 0, removed: 0, errors: [], squashes: 0, pruned: 0, skippedRepos: 0, claimed: [] }
   const s = await read($, settings)
   const stored = await storeGet<Match | null>($, K.match, null)
@@ -756,6 +934,10 @@ async function scanGrind($: $, force: boolean, notify?: (c: ScoredCommit) => Pro
   const sends = s.tracking || rankedOn
   await update($, scan, cur => ({ ...SCAN0, ...cur, busy: true, note: 'Looking for new commits' }))
   try {
+    // W7-2: this machine's call records for the coder blocks, read once per scan, on its first new score while capture is on.
+    let evalCalls: { calls: Call[]; since: number } | null | undefined
+    // W7-3: the transcript fallback's reads, on the scan's first new score with no live record while eval_backfill is on.
+    let tx: TxScan | undefined
     const since = await storeGet($, K.since, await read($, trackingSince))
     const t = await $.clock.now()
     const cutoff = rollCutoff(t)
@@ -799,6 +981,10 @@ async function scanGrind($: $, force: boolean, notify?: (c: ScoredCommit) => Pro
           })
         }
         await withPoints($, listed)
+        // Each listed commit's coder block (W7-2), worked out on this repo's first new score: its window runs from the commit before it here (by committer time) to it.
+        let blocks: Map<string, CoderBlock | null> | null | undefined
+        // The commits this machine made here (the reflog), read with the blocks; the transcript fallback (W7-3) uses the same.
+        let made: Set<string> | undefined
         const scoreFrom = s.tracking ? floor : Math.max(floor, matchWindow!.startAt)
         const scoreTo = s.tracking ? t + 60_000 : matchWindow!.deadline
         let incomplete = false
@@ -854,7 +1040,18 @@ async function scanGrind($: $, force: boolean, notify?: (c: ScoredCommit) => Pro
           })
           if (isNew) {
             result.added.push(scored)
-            if (notify) await notify(scored)
+            // Another install of this account scored it first: that one sent its block, from its own machine's records.
+            const mine = scored.reason !== ACCOUNT.scoredElsewhere
+            if (capturing && mine && blocks === undefined) {
+              if (evalCalls === undefined) evalCalls = await callsForScan($)
+              if (evalCalls) made = await madeHere($, root)
+              blocks = evalCalls && made ? await scanBlocks($, root, listed, evalCalls, 'live', made) : null
+            }
+            let coder = mine ? (blocks?.get(raw.sha) ?? null) : null
+            // W7-3, dark: no live record for it (a none block, or none at all), so Claude Code's own transcripts here may name it. A failure there never holds the score back.
+            if (backfilling && mine && evalCalls && made && (coder === null || coder.source === 'none'))
+              coder = (await transcriptBlock($, root, raw.sha, listed, evalCalls.since, made, (tx ??= txScan())).catch(err => void $.ui.log(`CCSR transcripts: ${clean((err as Error).message)}`))) ?? coder
+            if (notify) await notify(scored, coder)
           }
         }
         // Commits no longer reachable from any ref (a local squash, a reset) leave the ledger.
@@ -1569,8 +1766,16 @@ async function serverCfg($: $) {
   return { ...SERVER0, ...(await storeGet<Partial<ServerConfig>>($, K.server, {})) }
 }
 
-/** One request: `{ status, json }`, status 0 when the server couldn't be reached. */
-async function api($: $, method: string, path: string, body?: unknown, as: { url?: string; token?: string | null } = {}): Promise<{ status: number; json: unknown }> {
+/** An error message without any sign-in flow's id (W5b: the id is a credential, and it rides in the path). */
+function unflowed(msg: string) {
+  return msg.replace(/\/identities\/flows\/[^\s/?#]+/g, '/identities/flows/')
+}
+
+/**
+ * One request: `{ status, json, retryAfterMs }`, status 0 when the server
+ * couldn't be reached, `retryAfterMs` what a 429 or 503 asked us to wait.
+ */
+async function api($: $, method: string, path: string, body?: unknown, as: { url?: string; token?: string | null; keepNote?: boolean } = {}): Promise<{ status: number; json: unknown; retryAfterMs: number | null }> {
   const cfg = { ...(await serverCfg($)), ...as }
   // Which mod and Claude Code this is: below the server's floor, ranked play is refused (docs/api.md, "Versions").
   const headers: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json', 'x-ccsr-mod': VERSION }
@@ -1581,8 +1786,9 @@ async function api($: $, method: string, path: string, body?: unknown, as: { url
   try {
     res = await $.http.fetch(`${cfg.url}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) })
   } catch (err) {
-    await update($, link, l => ({ ...l, online: false, note: `Can't reach ${cfg.url}: ${clean((err as Error).message).slice(0, 100)}` }))
-    return { status: 0, json: null }
+    // A sign-in flow's id never goes in the note (W5b): it rides in the path, it can mint a token, and `link` is in $.state.
+    await update($, link, l => ({ ...l, online: false, note: `Can't reach ${cfg.url}: ${unflowed(clean((err as Error).message)).slice(0, 100)}` }))
+    return { status: 0, json: null, retryAfterMs: null }
   }
   let json: unknown = null
   try {
@@ -1590,13 +1796,205 @@ async function api($: $, method: string, path: string, body?: unknown, as: { url
   } catch {
     json = null
   }
-  // A proxy's error page means the server itself isn't answering.
-  const reached = res.status < 502 || res.status > 504
-  await update($, link, l => (reached ? (l.online === true && !l.note ? l : { ...l, online: true, note: '' }) : { ...l, online: false, note: `The server answered ${res.status}` }))
+  // A proxy's error page means the server itself isn't answering. The server's own 503 (no_season,
+  // try_again) comes with its error JSON: it was reached, so the mod stays online and its loop backs off.
+  const reached = res.status < 502 || res.status > 504 || errorOf(json) !== null
+  // W4b: reached after being offline fires the notices' back_online trigger.
+  const wasOffline = (await read($, link)).online === false
+  // A background read (`keepNote`: the lanes between matches) leaves a press's note alone; coming back online still clears the offline one.
+  await update($, link, l => (reached ? ((l.online === true && !l.note) || (as.keepNote && l.online === true) ? l : { ...l, online: true, note: '' }) : { ...l, online: false, note: `The server answered ${res.status}` }))
+  if (reached && wasOffline) void noticeEvent($, { on: 'back_online' }).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
   const latest = res.headers?.['x-ccsr-latest']
   const min = res.headers?.['x-ccsr-min']
   if (latest && min) await noteRelease($, latest, min)
-  return { status: res.status, json }
+  // The config's version rides on every answer: a new one means read GET /config again (after a jitter, never inline).
+  const version = res.headers?.['x-ccsr-config']
+  if (version && !as.url) void noteConfigHeader($, version).catch(() => null)
+  const retryAfter = res.status === 429 || res.status === 503 ? retryAfterMs(json, res.headers?.['retry-after']) : null
+  return { status: res.status, json, retryAfterMs: retryAfter }
+}
+
+// ------------------------------------------------------------------ config
+// The server holds the policy (docs/api.md, "Config"): poll intervals, the kill
+// switches and, as later items land, lengths, buckets, notices, sign-in,
+// challenges and finishers. The mod reads GET /config at start, every
+// `poll_ms.config`, after a sign-in, a sign-out or a server switch, and when an
+// answer's `x-ccsr-config` names another version. The raw body is kept in the
+// store by server and handle, so every session on this machine shares one read
+// and a session offline keeps the last one. Until a read lands, CONFIG0: 0.3.0's
+// behaviour. Config text is server text: it never reaches commandText,
+// $.prompt or $.session.append, and draws as Text, never Markdown.
+
+/** Why the config is read. `bucket` (W3b): the server refused or dropped a bucket the held config lists, so what config says about buckets is stale. */
+type ConfigWhy = 'boot' | 'timer' | 'header' | 'signin' | 'signout' | 'server' | 'bucket'
+type ConfigCache = Record<string, { body: unknown; at: number }>
+
+/** How many servers and handles the store keeps a config for. */
+const CONFIG_KEEP = 4
+
+let configFlight: Promise<ModConfig> | null = null
+/** When the config this session holds was read (its read began), by this session or another: header re-reads and the timer count from it. */
+let configReadAt = 0
+let configReread: { cancel: () => void } | null = null
+/** The version this session holds, for the header check every answer makes (no state read while it's the same). */
+let configVersion = ''
+let configSkew = 0
+/** The surface the pane last drew on, sent as ?surface= (nothing before the first draw). */
+let paneSurface: Surface | null = null
+const configTicks = new Set<(cfg: ModConfig, why: string) => void | Promise<void>>()
+
+/** Whose config this is: the server and the handle signed in there. */
+function keyOf(server: Pick<ServerConfig, 'url' | 'handle'>) {
+  return `${server.url}|${server.handle ?? ''}`
+}
+
+async function configKey($: $) {
+  return keyOf(await serverCfg($))
+}
+
+/**
+ * The config this session plays by. Never throws: anything wrong reads as
+ * CONFIG0. A copy held for another server or handle is never used: until the
+ * read that follows a sign-in, a sign-out or a server switch lands (or takes
+ * that key's cached copy), it's CONFIG0. A caller that already read the
+ * server entry passes it, so a draw costs one state read.
+ */
+export async function configOf($: $, server?: Pick<ServerConfig, 'url' | 'handle'>): Promise<ModConfig> {
+  try {
+    const held = await read($, config)
+    return held.key === (server ? keyOf(server) : await configKey($)) ? held : CONFIG0
+  } catch {
+    return CONFIG0
+  }
+}
+
+/** The local clock's offset from the server's, from the last config read: server time is local time plus this. */
+export function configSkewMs() {
+  return configSkew
+}
+
+/**
+ * Runs `fn` after every config read or adoption, changed or not (W4's stats
+ * flush rides this cadence). Returns the way to stop. Register from boot: a
+ * reload starts the module, and this list, over.
+ */
+export function onConfigTick(fn: (cfg: ModConfig, why: string) => void | Promise<void>) {
+  configTicks.add(fn)
+  return () => void configTicks.delete(fn)
+}
+
+/**
+ * Reads the config again, single-flight per session: a timer, header or boot
+ * call made while a read runs gets that read; a sign-in, sign-out or server
+ * switch gets a fresh one after it, since the key may have changed under it,
+ * and so does a bucket refusal (W3b), since the read in flight may have begun
+ * before the change the server just refused on.
+ * `want` is the version a header named: a cached copy at that version is
+ * taken without asking.
+ */
+export function refreshConfig($: $, why: ConfigWhy, want?: string): Promise<ModConfig> {
+  if (configFlight) return why === 'signin' || why === 'signout' || why === 'server' || why === 'bucket' ? configFlight.then(() => refreshConfig($, why, want)) : configFlight
+  const flight = readConfig($, why, want).finally(() => {
+    if (configFlight === flight) configFlight = null
+  })
+  configFlight = flight
+  return flight
+}
+
+async function readConfig($: $, why: ConfigWhy, want?: string): Promise<ModConfig> {
+  const key = await configKey($)
+  const t0 = await $.clock.now()
+  const held = await read($, config)
+  const mine = held.key === key ? configReadAt : 0
+  // A copy in the store newer than ours (another session's read, or this key's from before a
+  // sign-in or a server switch) is taken at once; offline it's what we play by. Fresh enough, on
+  // a timer, header or boot read, and that's the whole read. A sign-in, sign-out or switch asks anyway.
+  const c = (await storeGet<ConfigCache>($, K.config, {}))[key]
+  const parsed = c ? parseConfig(c.body) : CONFIG0
+  if (c && parsed !== CONFIG0 && c.at > mine) {
+    await holdConfig($, parsed, key, c.at)
+    const fresh = t0 - c.at < parsed.poll.config && (want === undefined || parsed.version === want)
+    if (fresh && (why === 'boot' || why === 'timer' || why === 'header')) return tickConfig($, parsed, why)
+  }
+  configReadAt = t0
+  // W3b: a `bucket` read follows a refusal or a drop, whose note must stay beside the checklist it brings, so it's a background
+  // read. Any other read clears a press's note, as W1b's did, so a stale line never outlives what it said (coming back online
+  // still clears the offline line either way).
+  const r = await api($, 'GET', configPath(paneSurface), undefined, { keepNote: why === 'bucket' })
+  // Signed in or out while it was asked: the read that follows the change is the one that counts.
+  if ((await configKey($)) !== key) return configOf($)
+  if (r.status === 200) {
+    const parsed = parseConfig(r.json)
+    if (parsed !== CONFIG0) {
+      const t1 = await $.clock.now()
+      const serverAt = Date.parse(String((r.json as { server_time?: unknown }).server_time ?? ''))
+      if (Number.isFinite(serverAt)) configSkew = Math.round(serverAt - (t0 + t1) / 2)
+      const cache = await storeGet<ConfigCache>($, K.config, {})
+      const keep = Object.entries({ ...cache, [key]: { body: r.json, at: t0 } })
+        .sort((x, y) => y[1].at - x[1].at)
+        .slice(0, CONFIG_KEEP)
+      await save($, K.config, Object.fromEntries(keep))
+      await holdConfig($, parsed, key, t0)
+      return tickConfig($, parsed, why)
+    }
+  } else if (r.status === 404 && errorOf(r.json)?.code === 'not_found') {
+    // A server from before the switchboard: 0.3.0's behaviour, and nothing kept for it.
+    const cache = await storeGet<ConfigCache>($, K.config, {})
+    if (cache[key]) {
+      const { [key]: _gone, ...rest } = cache
+      await save($, K.config, rest)
+    }
+    await holdConfig($, CONFIG0, key, t0)
+    return tickConfig($, CONFIG0, why)
+  }
+  // Offline, limited or broken: keep playing by the copy we have.
+  return tickConfig($, await configOf($), why)
+}
+
+/**
+ * Config bodies equal but for the server's clock. W3b: the version alone can't say a read
+ * brought nothing new, since it doesn't move when a player's own checklist does (W3a's
+ * buckets part hashes the requirement labels, not who meets them), nor when a notice's
+ * per-player variables fill differently.
+ */
+function sameConfig(a: Readonly<Record<string, unknown>>, b: Readonly<Record<string, unknown>>) {
+  const { server_time: _a, ...x } = a
+  const { server_time: _b, ...y } = b
+  return JSON.stringify(x) === JSON.stringify(y)
+}
+
+/** Puts a config in this session's atom, and applies what changed at once. */
+async function holdConfig($: $, next: ModConfig, key: string, at: number) {
+  configReadAt = Math.max(configReadAt, at)
+  configVersion = next.version
+  const held = await read($, config)
+  if (held.key === key && held.version === next.version && held.readAt && sameConfig(held.raw, next.raw)) return
+  await update($, config, () => ({ ...next, poll: { ...next.poll }, chat: { ...next.chat }, raw: { ...next.raw }, key, readAt: at }))
+  // A room switched off: its lines and cursor go now, so a raid's lines never show again.
+  await update($, link, l => (l.lobby && roomOff(next, l.rooms, l.lobby.room) ? { ...l, lobby: null } : l))
+  await refreshStatus($)
+}
+
+async function tickConfig($: $, cfg: ModConfig, why: string) {
+  for (const fn of [...configTicks]) {
+    try {
+      await fn(cfg, why)
+    } catch (err) {
+      $.ui.log(`CCSR config: ${(err as Error).message}`)
+    }
+  }
+  return cfg
+}
+
+/** An answer named a config version: re-read after a jitter, at most once per 30 s, never inline. */
+async function noteConfigHeader($: $, version: string) {
+  if (version === configVersion || configReread || configFlight) return
+  const t = await $.clock.now()
+  if (!headerReread(version, await configOf($), configReadAt, t)) return
+  configReread = $.clock.after(jitterMs(REREAD_JITTER_MS), () => {
+    configReread = null
+    void refreshConfig($, 'header', version).catch(err => $.ui.log(`CCSR config: ${(err as Error).message}`))
+  })
 }
 
 /** This session's Claude Code version for x-ccsr-claude, or null where the API doesn't say. */
@@ -1614,10 +2012,16 @@ async function noteRelease($: $, latest: string, min: string) {
   const l = await read($, link)
   if (l.release?.latest !== latest || l.release?.min !== min) await update($, link, x => ({ ...x, release: { latest, min } }))
   if (standing({ latest, min }) === 'current') return
+  // W4b: the notices' update_available trigger, kept armed while the mod sees an update (noticeEvent keeps it to one a
+  // minute), one arming per newer release however far apart the answers naming it come (releaseArming). The clock is read
+  // before releaseArmed, so two answers landing together never both begin an arming.
+  const at = await $.clock.now()
+  releaseArmed = releaseArming(releaseArmed, latest, at)
+  void noticeEvent($, { on: 'update_available' }, releaseArmed.start).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
   if ((await rankedShared($)).phase !== 'idle') return
   if ((await storeGet<string>($, K.updateSeen, '')) === latest) return
   await save($, K.updateSeen, latest)
-  await ambient($, MOD.updateOut(latest))
+  await ambient($, `${MOD.updateOut(latest)} ${MOD.autoUpdate}`)
 }
 
 /**
@@ -1723,11 +2127,25 @@ async function refreshAccount($: $) {
     await linkFromKeyring($)
     return
   }
+  const askedAt = await $.clock.now()
   const me = await api($, 'GET', '/me')
   if (me.status === 200) {
-    const j = me.json as { player: ApiPlayer; account?: ApiAccount }
+    // W3b: where you stand in each bucket on for you (W3a), read through standingFor; a server before W3a sends none.
+    const kept = (me.json as { buckets?: unknown } | null)?.buckets
+    await update($, link, l => ({ ...l, meBuckets: Array.isArray(kept) ? kept.slice(0, 8) : null }))
+    const j = me.json as { player: ApiPlayer; account?: ApiAccount; settings?: { model_stats?: unknown } }
     await update($, link, l => ({ ...l, me: j.player, account: j.account ?? null, unknownToken: false }))
+    // W6b: the account's Challenges switch is the one this install shows.
+    await heardChallenges($, j.player, askedAt)
+    // W5b: this read serves the sign-in rows and the new-install warning too, while sign-in is on.
+    if (providersOn(await configOf($, cfg)).length > 0) {
+      identityReadAt = await $.clock.now()
+      await warnNewInstalls($, j.account ?? null)
+    }
     if (j.account) await adoptSalt($, j.account.salt)
+    // W7-2: Model stats is held on the server (on by default); a server before W7-1 doesn't say.
+    if (typeof j.settings?.model_stats === 'boolean') await holdModelStats($, j.settings.model_stats)
+    await syncCapture($)
     // Accounts from before the keyring: put this one in it, so the machine's other config dirs find it.
     const k = await readKeyring($)
     if (!k.servers[cfg.url]) await writeKeyring($, cfg.url, { handle: j.player.handle, token: cfg.token, recovery_key: cfg.recoveryKey ?? null })
@@ -1763,20 +2181,28 @@ async function linkFromKeyring($: $) {
 
 type SignInReply = { token: string; player: ApiPlayer; salt: string | null; has_recovery_key: boolean; recovery_key?: string }
 
-/** Every way in ends here: keep the token, take the account's salt, write the keyring, send this week's scores. */
-async function signedIn($: $, j: SignInReply, knownKey: string | null = null) {
+/**
+ * Every way in ends here: keep the token, take the account's salt, write the keyring, send this
+ * week's scores. `carryWeek` false (a sign-in switch to another handle, W5b) sends none: what
+ * this install scored stays with the handle it scored for.
+ */
+async function signedIn($: $, j: SignInReply, knownKey: string | null = null, carryWeek = true) {
   const cfg = await serverCfg($)
   const handle = j.player.handle
   const recoveryKey = j.recovery_key ?? knownKey ?? (cfg.handle === handle ? (cfg.recoveryKey ?? null) : null)
   await save($, K.server, { ...cfg, token: j.token, handle, recoveryKey })
   await $.store.delete(K.optOut)
   await saveSettings($, { handle })
-  await update($, link, l => ({ ...l, me: j.player, note: '', unknownToken: false, confirmRemove: false, recoveryFresh: !!j.recovery_key, linkCode: null }))
+  // W3b: another handle's bucket standings and boards go with its sign-in; GET /me below reads this one's.
+  await update($, link, l => ({ ...l, me: j.player, note: '', unknownToken: false, confirmRemove: false, recoveryFresh: !!j.recovery_key, linkCode: null, ...(l.me?.handle === handle ? {} : { meBuckets: null, boards: null }) }))
   await adoptSalt($, j.salt)
   await writeKeyring($, cfg.url, { handle, token: j.token, recovery_key: recoveryKey })
+  // What this handle gets from the switchboard can differ from what an anonymous install got.
+  void refreshConfig($, 'signin').catch(() => null)
   await refreshAccount($)
   // This week's scored commits go up with the account, so the Grind starts where the player already is.
   // Last, so what the outbox says (a refused score) is the note left on screen.
+  if (!carryWeek) return
   const list = await storeGet<ScoredCommit[]>($, K.ledger, [])
   const since = periodStart('week', await $.clock.now())
   await enqueue(
@@ -1806,8 +2232,10 @@ async function adoptSalt($: $, serverSalt: string | null) {
   if (box.length === 0) return
   const pids = new Set(box.map(b => b.pid))
   const rows = (await storeGet<ScoredCommit[]>($, K.ledger, [])).filter(c => pids.has(c.pid))
+  // Their coder blocks (W7-2) come along from the old bodies: the ledger never held them.
+  const coders = new Map(box.flatMap(b => (b.body.coder ? [[b.pid, b.body.coder] as const] : [])))
   await save($, K.outbox, [])
-  await enqueue($, rows)
+  await enqueue($, rows, coders)
 }
 
 function signInProblem(r: { status: number; json: unknown }) {
@@ -1922,6 +2350,612 @@ async function forgetHere($: $, note: string) {
   await save($, K.server, { ...cfg, token: null, handle: null })
   await save($, K.outbox, [])
   await update($, link, () => ({ ...LINK0, online: null, note }))
+  void refreshConfig($, 'signout').catch(() => null)
+}
+
+// ------------------------------------------------------------------ sign-in with a provider (W5b)
+// A fourth way in beside a handle, a link code and a recovery key: the provider's device flow,
+// which the server runs (W5a, docs/api.md "Identities"), driven here through identity.ts's
+// machine. Drawn only while config's `signin` says dark or optional for the provider; a missing
+// or unknown value is off. The band never shows sign-in.
+//
+// What stays in this module: the flow id (it can mint a token) lives only in identity.ts's
+// WeakMap behind `flowRef`, and the card itself (the code the player types on the provider's
+// page, the login) is a module variable. `$.state` gets only a counter: every plugin can read
+// it, and a code read there could be approved with someone else's account, which would link
+// that account to this handle. Nothing here reaches commandText, `$.prompt` or `$.session.append`.
+
+/** The card (identity.ts SignIn). It resets with the module on a reload, as the flow it follows does. */
+let signInCard: SignIn = SIGNIN0
+/** The flow the card follows; identity.ts keeps its id. */
+let flowRef: FlowRef | null = null
+/** The card's clock while a flow is open: identity.ts onTick, then a poll when one falls due. */
+let signInTimer: { cancel: () => void } | null = null
+/**
+ * When each poll still out was sent. `$.http.fetch` has no timeout, so a poll that never answers
+ * must not stop this flow's next poll, or every later flow's: past SIGNIN_POLL_HUNG_MS the next
+ * one may go beside it, at most two out at once (W1b's rule for its loop), and one out past
+ * SIGNIN_POLL_GONE_MS stops counting. A late answer still goes to onPoll, which knows its attempt.
+ */
+let signInPollsOut: number[] = []
+const SIGNIN_POLL_HUNG_MS = 60_000
+const SIGNIN_POLL_GONE_MS = 10 * 60_000
+/** Whether the done on the card signed this install in with a token (else it linked the handle it holds). */
+let signInMinted = false
+/** The token this install held when the card's flow started: a done that brings a token after the install signed in another way meanwhile is revoked, never kept. */
+let signInHeldAtStart: string | null = null
+/** The token this install held when Switch was pressed: the only one whose install the switch removes, and only while the store still holds it. */
+let switchFromToken: string | null = null
+/** When this session last read GET /me for the sign-in rows and the new-install warning. */
+let identityReadAt = 0
+let identityTicking = false
+/** The config tick reads GET /me for the new-install warning at most this often; a Settings visit at most every 15 s. */
+const IDENTITY_TICK_MS = 10 * 60_000
+const IDENTITY_VISIT_MS = 15_000
+/** Not an answer: a request with no flow to send it for (the module reloaded under it). */
+const NO_ANSWER = { status: 0, json: null, retryAfterMs: null }
+
+/** A provider's name as the mod writes it (PROVIDER_NAMES). */
+function providerName(p: string) {
+  return PROVIDER_NAMES[p] ?? p
+}
+
+/** The providers config turns on for this player (dark or optional); none while config says nothing. */
+function providersOn(cfg: ModConfig): Provider[] {
+  return PROVIDERS.filter(p => signinMode(cfg.raw, p) !== 'off')
+}
+
+/** Whether the card follows a flow or is asking for one: its clock runs, and it draws whatever config says by now. */
+function signInLive(s: SignIn) {
+  return s.phase === 'starting' || s.phase === 'waiting' || s.phase === 'unlinked' || s.phase === 'conflict'
+}
+
+/** An answer as identity.ts reads it: api()'s, with a 409's `retry_after_ms` (signin_unavailable) as `retryAfterMs` too. */
+function flowAnswer(r: { status: number; json: unknown; retryAfterMs: number | null }): FlowAnswer {
+  return { status: r.status, json: r.json, retryAfterMs: r.retryAfterMs ?? (r.status === 409 ? retryAfterMs(r.json, null) : null) }
+}
+
+/** The player's time zone for a new handle, as signup sends it. */
+function localZone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+  } catch {
+    return 'UTC'
+  }
+}
+
+/**
+ * Sign in with a provider (the contract's handler): the first-run card, Settings, a bucket's
+ * checklist (W3b) or an action (W4b's runAction, `case 'signin':`). Nothing while config has the
+ * provider off. A flow already open stays open, and the press only shows it. From an action or
+ * a bucket it opens the pane on the Match tab, where the card draws. The start goes without a
+ * token whenever this install isn't signed in or the server no longer knows its token.
+ */
+export async function startSignIn($: $, provider: unknown, from: SignInFrom) {
+  if (typeof provider !== 'string' || !(PROVIDERS as readonly string[]).includes(provider)) return
+  const cfg = await serverCfg($)
+  if (signinMode((await configOf($, cfg)).raw, provider as Provider) === 'off') return
+  if (from === 'action' || from === 'bucket') await openPane($, 'match')
+  if (signInLive(signInCard)) return
+  await update($, signinUi, () => ({ note: '', copied: false, unlinkAsk: false }))
+  signInHeldAtStart = cfg.token ?? null
+  switchFromToken = null
+  await applySignIn($, pressSignIn(signInCard, provider, from, tokenlessStart(cfg.token, (await read($, link)).unknownToken)))
+}
+
+/**
+ * One step of the machine: the card, the flow it holds, then what the step asks for. A request
+ * goes out with the flow it was made for, even when the same step forgets it (the resolve a
+ * Cancel or the clock sends), so the server always hears it.
+ */
+async function applySignIn($: $, step: SignInStep) {
+  const was = signInCard
+  const held = flowRef
+  signInCard = step.state
+  if (step.flow) flowRef = step.flow
+  const ref = step.flow ?? held
+  if (step.forget) flowRef = null
+  if (step.state.phase === 'done' && was.phase !== 'done') signInMinted = !!step.reply
+  armSignInClock($)
+  await update($, signinRev, n => n + 1)
+  if (step.drop) await dropFlow($, step.drop)
+  if (step.revoke) await revokeMinted($, step.revoke)
+  if (step.reply) await signedInWith($, step)
+  // A link on this install: the Settings row reads the linked account from GET /me, and config is read again (W3b's
+  // hand-off): a bucket's checklist row for the provider is met now, which moves no config version. Never awaited.
+  else if (step.state.phase === 'done' && was.phase !== 'done') {
+    void refreshConfig($, 'bucket').catch(() => null)
+    await refreshIdentity($, 0)
+  }
+  if (step.send) await sendSignIn($, step.send, ref)
+}
+
+/** Runs the card's clock while it follows a flow, and stops it after. */
+function armSignInClock($: $) {
+  const live = signInLive(signInCard)
+  if (live && !signInTimer) signInTimer = $.clock.every(1000, () => void signInTick($).catch(err => $.ui.log(`CCSR sign-in: ${(err as Error).message}`)))
+  else if (!live && signInTimer) {
+    signInTimer.cancel()
+    signInTimer = null
+  }
+}
+
+/** The card's clock, once a second: identity.ts onTick (the expiry), then a poll when one is due. */
+async function signInTick($: $) {
+  const t = await $.clock.now()
+  const step = onTick(signInCard, t)
+  if (step.state !== signInCard) await applySignIn($, step)
+  signInPollsOut = signInPollsOut.filter(at => t - at < SIGNIN_POLL_GONE_MS)
+  const free = signInPollsOut.length === 0 || (signInPollsOut.length < 2 && signInPollsOut.every(at => t - at >= SIGNIN_POLL_HUNG_MS))
+  if (free && flowRef && pollDue(signInCard, t)) await pollSignIn($, t)
+}
+
+/**
+ * One poll of the flow. Its answer goes to onPoll whatever the card shows by then: a done that
+ * lands after the clock or a Cancel ended the card is the sign-in after all, and one nobody takes
+ * any more comes back as a token to revoke.
+ */
+async function pollSignIn($: $, sentAt: number) {
+  const id = flowRef ? flowIdOf(flowRef) : null
+  if (!id) return
+  const attempt = signInCard.attempt
+  // Counted before the first await, so a tick that lands meanwhile sees it.
+  signInPollsOut.push(sentAt)
+  let r: Awaited<ReturnType<typeof api>>
+  try {
+    // The flow id is the credential: no token goes with it.
+    r = await api($, 'GET', `/identities/flows/${id}`, undefined, { token: null })
+  } finally {
+    const i = signInPollsOut.indexOf(sentAt)
+    if (i >= 0) signInPollsOut.splice(i, 1)
+  }
+  await applySignIn($, onPoll(signInCard, attempt, flowAnswer(r), await $.clock.now()))
+}
+
+/** The request a step asks for, and its answer back into the machine with the attempt it was sent for. A poll waits for the clock. */
+async function sendSignIn($: $, send: FlowSend, ref: FlowRef | null) {
+  if (send.do === 'poll') return
+  if (send.do === 'start') {
+    // A fresh install names itself, as signup does; with a token the server uses the install's own label.
+    const r = send.tokenless ? await api($, 'POST', `/identities/${send.provider}/start`, { install: await installLabel($) }, { token: null }) : await api($, 'POST', `/identities/${send.provider}/start`, {})
+    await applySignIn($, onStart(signInCard, send.attempt, flowAnswer(r), await $.clock.now()))
+    return
+  }
+  const id = ref ? flowIdOf(ref) : null
+  if (send.do === 'resolve') {
+    if (send.choice === 'cancel') {
+      // A cancel's answer is never read: on a flow already done it says done with no token, which
+      // onResolve would draw as a switch that never reached this install.
+      if (id) await api($, 'POST', `/identities/flows/${id}/resolve`, { choice: 'cancel' }, { token: null })
+      return
+    }
+    const r = id ? await api($, 'POST', `/identities/flows/${id}/resolve`, { choice: send.choice }, { token: null }) : NO_ANSWER
+    await applySignIn($, onResolve(signInCard, send.attempt, flowAnswer(r), await $.clock.now()))
+    return
+  }
+  // join: the handle for an unlinked flow, made with the account linked, in one write (POST /accounts with identity_flow).
+  const s = await read($, settings)
+  const body = { handle: send.handle, identity_flow: id, grind_tracking: s.tracking, share_titles: s.share, time_zone: localZone(), salt: await saltOf($), install: await installLabel($) }
+  const r = id ? await api($, 'POST', '/accounts', body, { token: null }) : NO_ANSWER
+  await applySignIn($, onJoin(signInCard, send.attempt, flowAnswer(r), await $.clock.now()))
+}
+
+/** A flow the server made for a start nobody waits for any more: cancel it, answer unread. */
+async function dropFlow($: $, ref: FlowRef) {
+  const id = flowIdOf(ref)
+  if (id) await api($, 'POST', `/identities/flows/${id}/resolve`, { choice: 'cancel' }, { token: null })
+}
+
+/** A token the server minted for an answer nobody takes: remove that install with it, unless it is the token this install holds. */
+async function revokeMinted($: $, token: string) {
+  if (token === (await serverCfg($)).token) return
+  await removeOrKeep($, token)
+}
+
+/**
+ * Removes the install a token belongs to, with that token (an install may always remove itself,
+ * and one minted through GitHub is never install_too_new): GET /me/installs' `this`, then DELETE.
+ * True once it's gone (or the server no longer knows the token), false to try again later.
+ */
+async function removeInstallWith($: $, token: string): Promise<boolean> {
+  const r = await api($, 'GET', '/me/installs', undefined, { token })
+  if (r.status === 401) return true
+  if (r.status !== 200) return false
+  const target = (r.json as { installs?: ApiInstall[] }).installs?.find(i => i.this)?.id ?? null
+  if (target === null) return true
+  const d = await api($, 'DELETE', `/me/installs/${target}`, undefined, { token })
+  return (d.status >= 200 && d.status < 300) || d.status === 401 || d.status === 404
+}
+
+/** Removes a token's install now, or keeps the token (in the store, never an atom) for the config tick to try again. */
+async function removeOrKeep($: $, token: string) {
+  if (await removeInstallWith($, token)) return
+  const kept = await storeGet<string[]>($, K.orphans, [])
+  if (!kept.includes(token)) await save($, K.orphans, [...kept, token].slice(-5))
+}
+
+/** The config tick: tries each kept token's removal again, never the token this install holds. */
+async function retryOrphans($: $) {
+  const kept = await storeGet<string[]>($, K.orphans, [])
+  if (kept.length === 0) return
+  const mine = (await serverCfg($)).token
+  const left: string[] = []
+  for (const token of kept) if (token !== mine && !(await removeInstallWith($, token))) left.push(token)
+  // Kept tokens another session added meanwhile stay.
+  const now = await storeGet<string[]>($, K.orphans, [])
+  await save($, K.orphans, now.filter(t => left.includes(t) || !kept.includes(t)))
+}
+
+/**
+ * A done that brought a token: signedIn, as every way in does. A switch to another handle sends
+ * no week (`carryWeek` false), and once the new token is kept removes this install's old install
+ * with the old token: the server leaves it alone, so a switch whose answer was lost keeps the
+ * install signed in where it was (W5a's hand-off).
+ */
+async function signedInWith($: $, step: SignInStep) {
+  const reply = step.reply!
+  const before = await serverCfg($)
+  const switched = step.state.phase === 'done' && step.state.switched
+  if (!switched && (before.token ?? null) !== signInHeldAtStart) {
+    // Signed in another way while this flow ran (a handle, a link code, another session): that
+    // sign-in stands, and the install this done made is removed with its own token.
+    signInCard = { phase: 'ended', provider: step.state.phase === 'done' ? step.state.provider : 'github', from: step.state.phase === 'done' ? step.state.from : 'settings', attempt: step.state.attempt, why: 'closed', message: null, retryAt: null }
+    await update($, signinRev, n => n + 1)
+    if (reply.token !== before.token) await removeOrKeep($, reply.token)
+    return
+  }
+  // A switch removes only the install whose token was held when Switch was pressed, and only while it still is.
+  const from = switched && switchFromToken !== null && before.token === switchFromToken ? switchFromToken : null
+  if (switched) {
+    switchFromToken = null
+    // Scored for the old handle: sent with its token now, and whatever still can't go stays in the
+    // ledger, never sent under the other handle.
+    // Only while the store still holds the old handle's token: another session's sign-in meanwhile sends nothing here.
+    if (from) {
+      await flushOutbox($)
+      await save($, K.outbox, [])
+    }
+    // Another handle's install from here: nothing of the old handle's shows until GET /me and the boards read again.
+    await update($, link, l => ({ ...l, account: null, installs: null, recent: null, myRank: null, grind: null, grindRank: null }))
+    if ((await rankedShared($)).phase === 'done') await clearRanked($)
+  }
+  await signedIn($, reply as unknown as SignInReply, null, step.carryWeek !== false)
+  if (from && from !== reply.token) await removeOrKeep($, from)
+}
+
+/**
+ * GET /me for the sign-in rows (the linked account) and the new-install warning, while sign-in is
+ * on for this player: after a link, on a Settings visit (at most every 15 s) and from the config
+ * tick (at most every 10 minutes). Older reads are fine: GET /me allows 2 a second per player.
+ */
+async function refreshIdentity($: $, minAgeMs: number) {
+  const cfg = await serverCfg($)
+  if (!cfg.token || providersOn(await configOf($, cfg)).length === 0) return
+  const t = await $.clock.now()
+  if (t - identityReadAt < minAgeMs) return
+  identityReadAt = t
+  const r = await api($, 'GET', '/me')
+  // Signed in or out while it was asked: that answer is another install's.
+  if (r.status !== 200 || (await serverCfg($)).token !== cfg.token) return
+  const j = r.json as { player: ApiPlayer; account?: ApiAccount }
+  await update($, link, l => ({ ...l, me: j.player, account: j.account ?? l.account }))
+  await warnNewInstalls($, j.account ?? null)
+}
+
+/**
+ * The account's other installs that signed in with a provider in the last day: a toast once each
+ * (every session on this machine shares the list), behind the toasts switch (Match only keeps
+ * it), and a line in Settings while GET /me lists the install.
+ */
+async function warnNewInstalls($: $, account: unknown) {
+  const fresh = providersOn(await configOf($)).flatMap(p => newInstallsVia(account, p).map(x => ({ ...x, name: providerName(p) })))
+  if (fresh.length === 0) return
+  const seen = await storeGet<string[]>($, K.newInstalls, [])
+  const unseen = fresh.filter(x => !seen.includes(x.key))
+  if (unseen.length === 0) return
+  await save($, K.newInstalls, [...seen, ...unseen.map(x => x.key)].slice(-50))
+  for (const x of unseen) await ambient($, IDENTITY.newInstall(x.name, x.label || IDENTITY.unnamed), 'match', 10_000)
+}
+
+/** Cancel on the card: over here at once, and the server hears it while a flow is held. */
+async function cancelSignInCard($: $) {
+  await applySignIn($, cancelSignIn(signInCard))
+}
+
+/** Done or Close on the card. */
+async function dismissSignInCard($: $) {
+  await update($, signinUi, u => ({ ...u, copied: false }))
+  await applySignIn($, dismissSignIn(signInCard))
+}
+
+/** Start again on an ended card, from where the first one started. */
+async function againSignIn($: $) {
+  const s = signInCard
+  if (s.phase === 'ended') await startSignIn($, s.provider, s.from)
+}
+
+/** A handle typed on the unlinked card. */
+async function joinSignIn($: $, raw: string) {
+  await applySignIn($, joinFlow(signInCard, raw))
+}
+
+/**
+ * Sign in to the other handle (a github_taken conflict). The outbox goes first, and the switch is
+ * refused while anything is left in it: what this handle scored stays this handle's. Queued for
+ * this handle, it leaves the queue; in a match the server refuses the switch (in_match).
+ */
+async function switchSignIn($: $) {
+  if (signInCard.phase !== 'conflict' || signInCard.busy || !conflictChoices(signInCard).includes('switch')) return
+  await flushOutbox($)
+  const left = (await storeGet<OutboxItem[]>($, K.outbox, [])).length
+  if (left === 0 && (await rankedShared($)).phase === 'queued') await leaveQueue($)
+  if (left === 0) switchFromToken = (await serverCfg($)).token ?? null
+  await applySignIn($, choose(signInCard, 'switch', left))
+}
+
+/** Copy code: the code to the clipboard (never anywhere Claude reads). */
+async function copySignInCode($: $, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') {
+  if (signInCard.phase !== 'waiting') return
+  const c = await $.ui.copy({ text: signInCard.code, surface }).catch(() => ({ isCopied: false }))
+  await update($, signinUi, u => ({ ...u, copied: c.isCopied }))
+}
+
+/** Unlink in Settings: the first press asks, the second unlinks (DELETE /me/identities/:provider). */
+async function unlinkProvider($: $, provider: Provider) {
+  const ui = await read($, signinUi)
+  if (!ui.unlinkAsk) {
+    await update($, signinUi, u => ({ ...u, note: '', unlinkAsk: true }))
+    return
+  }
+  const r = await api($, 'DELETE', `/me/identities/${provider}`)
+  if (r.status === 200) {
+    const identities = (r.json as { identities?: ApiAccount['identities'] }).identities ?? []
+    await update($, link, l => (l.account ? { ...l, account: { ...l.account, identities } } : l))
+    // W3b's hand-off: a bucket's checklist row for the provider is unmet again, which moves no config version. Never awaited.
+    void refreshConfig($, 'bucket').catch(() => null)
+  }
+  await update($, signinUi, u => ({ ...u, unlinkAsk: false, note: r.status === 200 ? IDENTITY.unlinked(providerName(provider)) : signInProblem(r) }))
+}
+
+/** Why an unlinked or conflict card still stands after a press, as its line. */
+function signInNote(s: SignIn) {
+  if (s.phase !== 'unlinked' && s.phase !== 'conflict') return null
+  switch (s.note) {
+    case 'outbox':
+      return IDENTITY.outbox
+    case 'in_match':
+      return s.message ?? IDENTITY.inMatch
+    case 'handle_taken':
+      return s.message ?? IDENTITY.handleTaken
+    case 'bad_handle':
+      return IDENTITY.badHandle
+    case 'offline':
+      return IDENTITY.offline
+    case 'refused':
+      return s.message ?? IDENTITY.refused
+    default:
+      return null
+  }
+}
+
+/** An ended card's line: the server's words when it sent some (one clean line, as Text), else the mod's for why. */
+function signInEnded(why: EndWhy, message: string | null, name: string) {
+  return message ?? IDENTITY.ended[why](name)
+}
+
+/**
+ * The sign-in card, at rest null. `match` draws one not started from Settings (the Match tab once
+ * signed in), `any` every one (the first-run card, Settings). A card that ended draws only while
+ * config still has its provider on; one following a flow draws regardless, so it can finish.
+ * Every server string is Text, never Markdown; the Link is the provider's page, checked with
+ * safeLink against its hosts.
+ */
+async function signInCardView($: $, e: RenderInput<'Pane'>, els: El, a: Actions, where: 'match' | 'any'): Promise<RenderElement | null> {
+  await read($, signinRev)
+  const s = signInCard
+  if (s.phase === 'idle' || (where === 'match' && s.from === 'settings')) return null
+  if (!signInLive(s) && signinMode((await configOf($)).raw, s.provider) === 'off') return null
+  const { Box, Text, Button, Link, Input } = els
+  const ui = await read($, signinUi)
+  const name = providerName(s.provider)
+  const note = signInNote(s)
+  const cancel = <Button key="signin-cancel" label={IDENTITY.cancel} onPress={() => a.cancelSignIn()} />
+  const rows: (RenderElement | null | false | '')[] = []
+  if (s.phase === 'starting') rows.push(<Text dimColor>{IDENTITY.starting(name)}</Text>, <Box gap={1}>{cancel}</Box>)
+  else if (s.phase === 'waiting') {
+    const url = s.url !== null && safeLink(s.url, PROVIDER_HOSTS[s.provider]) ? s.url : null
+    rows.push(
+      <Text bold color={ORANGE}>
+        {s.code}
+      </Text>,
+      <Text wrap="wrap">{url ? IDENTITY.enterCode(name) : IDENTITY.noLink(name)}</Text>,
+      <Box gap={1} alignItems="center" flexWrap="wrap">
+        <Button key="signin-copy" label={IDENTITY.copyCode} variant="primary" onPress={x => a.copySignInCode(x.surface)} />
+        {url && <Link key="signin-page" href={url} label={IDENTITY.openPage(name)} />}
+        {cancel}
+      </Box>,
+      ui.copied && <Text dimColor>{IDENTITY.copied}</Text>,
+      <Text dimColor wrap="wrap">
+        {IDENTITY.privacy(name)}
+      </Text>,
+    )
+  } else if (s.phase === 'unlinked') {
+    rows.push(
+      <Text wrap="wrap">{s.login ? IDENTITY.pickHandle(name, s.login) : IDENTITY.pickHandleNoLogin(name)}</Text>,
+      s.busy ? (
+        <Text dimColor>{IDENTITY.busy}</Text>
+      ) : e.surface === 'mobile' ? (
+        <Text dimColor wrap="wrap">
+          {IDENTITY.typeElsewhere}
+        </Text>
+      ) : (
+        <Input key="signin-handle" label="Handle" placeholder="2 to 20 of a-z, 0-9 and _" submitLabel="Join" onSubmit={v => a.joinSignIn(v)} />
+      ),
+      note && (
+        <Text color={ORANGE} wrap="wrap">
+          {note}
+        </Text>
+      ),
+      !s.busy && <Box gap={1}>{cancel}</Box>,
+    )
+  } else if (s.phase === 'conflict') {
+    const canSwitch = conflictChoices(s).includes('switch') && s.handle !== null
+    const cfg = await serverCfg($)
+    const line =
+      s.conflict === 'github_taken'
+        ? s.handle
+          ? s.login
+            ? IDENTITY.taken(name, s.login, s.handle)
+            : IDENTITY.takenNoLogin(name, s.handle)
+          : IDENTITY.takenElsewhere(name)
+        : s.conflict === 'handle_linked'
+          ? IDENTITY.handleLinked(name)
+          : IDENTITY.cantLink(name)
+    rows.push(
+      <Text wrap="wrap">{line}</Text>,
+      canSwitch && cfg.handle && (
+        <Text dimColor wrap="wrap">
+          {IDENTITY.switchWarn(cfg.handle)}
+        </Text>
+      ),
+      s.busy && <Text dimColor>{IDENTITY.busy}</Text>,
+      note && (
+        <Text color={ORANGE} wrap="wrap">
+          {note}
+        </Text>
+      ),
+      !s.busy && (
+        <Box gap={1} flexWrap="wrap">
+          {canSwitch && <Button key="signin-switch" label={IDENTITY.switchTo(s.handle as string)} variant="primary" onPress={() => a.switchSignIn()} />}
+          {canSwitch && cfg.recoveryKey && <Button key="signin-recovery-copy" label={ACCOUNT.copyKey} onPress={x => a.copyRecoveryKey(x.surface)} />}
+          {cancel}
+        </Box>
+      ),
+    )
+  } else if (s.phase === 'done') {
+    const line = signInMinted
+      ? s.handle && s.login
+        ? IDENTITY.signedInAs(s.handle, name, s.login)
+        : s.handle
+          ? IDENTITY.signedInAsNoLogin(s.handle, name)
+          : IDENTITY.linkedNoLogin(name)
+      : s.login
+        ? IDENTITY.linked(name, s.login)
+        : IDENTITY.linkedNoLogin(name)
+    rows.push(
+      <Text color={ORANGE} wrap="wrap">
+        {line}
+      </Text>,
+      <Box gap={1}>
+        <Button key="signin-dismiss" label={IDENTITY.done} onPress={() => a.dismissSignIn()} />
+      </Box>,
+    )
+  } else {
+    const again = signinMode((await configOf($)).raw, s.provider) !== 'off'
+    rows.push(
+      <Text wrap="wrap">{signInEnded(s.why, s.message, name)}</Text>,
+      <Box gap={1}>
+        {again && <Button key="signin-again" label={IDENTITY.startAgain} onPress={() => a.againSignIn()} />}
+        <Button key="signin-dismiss" label={IDENTITY.close} onPress={() => a.dismissSignIn()} />
+      </Box>,
+    )
+  }
+  return (
+    <Box key="signin-card" flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+      <Text bold color={STONE}>
+        {IDENTITY.signIn(name).toUpperCase()}
+      </Text>
+      {rows.filter(Boolean)}
+    </Box>
+  )
+}
+
+/**
+ * Sign in with a provider beside the handle box (the first-run card, Settings signed out): a
+ * button for each provider config turns on, or the card while one shows. On every surface: mobile
+ * has no handle box, but it has buttons.
+ */
+async function signInEntry($: $, e: RenderInput<'Pane'>, els: El, a: Actions, from: SignInFrom): Promise<RenderElement | null> {
+  const card = await signInCardView($, e, els, a, 'any')
+  if (card) return card
+  const on = providersOn(await configOf($))
+  if (on.length === 0) return null
+  const { Box, Button } = els
+  return (
+    <Box gap={1} flexWrap="wrap">
+      {on.map(p => (
+        <Button key={`signin-${p}`} label={IDENTITY.signIn(providerName(p))} onPress={() => a.startSignIn(p, from)} />
+      ))}
+    </Box>
+  )
+}
+
+/** The Match tab, signed in: a card started there (the first-run card, an action, a bucket) until it's closed. The first-run card draws its own. */
+async function signInMatchCard($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promise<RenderElement | null> {
+  const cfg = await serverCfg($)
+  if (!cfg.token || (await read($, link)).unknownToken) return null
+  return signInCardView($, e, els, a, 'match')
+}
+
+/**
+ * Settings, under the account: signed out, the entry; signed in, each provider config turns on,
+ * linked (Unlink, two presses) or not (Link), the installs that signed in with it in the last
+ * day, and the card. No provider link here at rest: the card's is the only one.
+ */
+async function signInSettings($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promise<RenderElement | null> {
+  const cfg = await serverCfg($)
+  const l = await read($, link)
+  if (!cfg.token || l.unknownToken) return signInEntry($, e, els, a, 'settings')
+  const card = await signInCardView($, e, els, a, 'any')
+  const on = l.me ? providersOn(await configOf($, cfg)) : []
+  if (on.length === 0) return card
+  const { Box, Text, Button } = els
+  const ui = await read($, signinUi)
+  return (
+    <Box flexDirection="column" gap={1}>
+      {on.map(p => {
+        const name = providerName(p)
+        const linked = linkedLogin(l.account, p)
+        return (
+          <Box key={`identity-${p}`} flexDirection="column">
+            <Text bold color={STONE}>
+              {name.toUpperCase()}
+            </Text>
+            <Text dimColor wrap="wrap">
+              {linked ? (linked.login ? IDENTITY.linked(name, linked.login) : IDENTITY.linkedNoLogin(name)) : IDENTITY.notLinked(name)}
+            </Text>
+            {newInstallsVia(l.account, p).map(x => (
+              <Text key={`new-install-${x.key}`} color={ORANGE} wrap="wrap">
+                {IDENTITY.newInstall(name, x.label || IDENTITY.unnamed)}
+              </Text>
+            ))}
+            {linked ? (
+              <Box gap={1}>
+                <Button key={`unlink-${p}`} label={IDENTITY.unlink(name)} variant={ui.unlinkAsk ? 'primary' : 'secondary'} onPress={() => a.unlinkProvider(p)} />
+              </Box>
+            ) : (
+              !signInLive(signInCard) && (
+                <Box gap={1}>
+                  <Button key={`link-${p}`} label={IDENTITY.link(name)} onPress={() => a.startSignIn(p, 'settings')} />
+                </Box>
+              )
+            )}
+            {ui.unlinkAsk && linked && (
+              <Text color={ORANGE} wrap="wrap">
+                {IDENTITY.unlinkWarn(name)}
+              </Text>
+            )}
+            {ui.note && (
+              <Text dimColor wrap="wrap">
+                {ui.note}
+              </Text>
+            )}
+          </Box>
+        )
+      })}
+      {card}
+    </Box>
+  )
 }
 
 /**
@@ -1942,11 +2976,16 @@ async function setServerUrl($: $, url: string) {
   delete saved[u]
   await save($, K.server, { url: u, token: next?.token ?? null, handle: next?.handle ?? null, recoveryKey: next?.recoveryKey ?? null, saved })
   await update($, link, () => ({ ...LINK0 }))
+  void refreshConfig($, 'server').catch(() => null)
   await refreshAccount($)
 }
 
-/** Puts scored commits in the outbox, once each, while there's an account to send them for. */
-async function enqueue($: $, rows: ScoredCommit[]) {
+/**
+ * Puts scored commits in the outbox, once each, while there's an account to send them for.
+ * `coders` (W7-2): each commit's coder block by pid, built by the scan while eval capture was
+ * on; it goes into the body here and nowhere else.
+ */
+async function enqueue($: $, rows: ScoredCommit[], coders?: Map<string, ApiCoder>) {
   const cfg = await serverCfg($)
   if (!cfg.token || rows.length === 0) return
   const s = await read($, settings)
@@ -1954,7 +2993,7 @@ async function enqueue($: $, rows: ScoredCommit[]) {
   const sent = new Set(await storeGet<string[]>($, K.sent, []))
   const t = await $.clock.now()
   const fresh: OutboxItem[] = []
-  for (const c of rows) if (!sent.has(c.pid)) fresh.push({ pid: c.pid, body: await scoreBody(c, salt, s.share), tries: 0, nextAt: t })
+  for (const c of rows) if (!sent.has(c.pid)) fresh.push({ pid: c.pid, body: await scoreBody(c, salt, s.share, coders?.get(c.pid)), tries: 0, nextAt: t })
   if (fresh.length === 0) return
   const box = await storeGet<OutboxItem[]>($, K.outbox, [])
   const have = new Set(box.map(b => b.pid))
@@ -1983,7 +3022,8 @@ async function flushOnce($: $) {
   const refused: string[] = []
   let reply: ApiScoreReply | null = null
   for (const item of due) {
-    const r = await api($, 'POST', '/scores', item.body)
+    // A coder block goes only while capture is on (W7-2); once this session knows it's off, the score goes without it.
+    const r = await api($, 'POST', '/scores', captureKnown && !capturing ? withoutCoder(item.body) : item.body)
     if (r.status >= 200 && r.status < 300) {
       done.add(item.pid)
       reply = r.json as ApiScoreReply
@@ -1999,7 +3039,12 @@ async function flushOnce($: $) {
     refused.push(`${errorOf(r.json)?.code ?? r.status} on ${item.body.authored_at.slice(0, 10)}`)
   }
   // Re-read before writing: another session may have added to the outbox meanwhile.
-  const box = (await storeGet<OutboxItem[]>($, K.outbox, [])).filter(b => !done.has(b.pid)).map(b => retry.get(b.pid) ?? b)
+  // A retry takes only its count and times: the body stays the re-read one, so a coder block
+  // taken off meanwhile (Model stats off, W7-2) never comes back.
+  const box = (await storeGet<OutboxItem[]>($, K.outbox, [])).filter(b => !done.has(b.pid)).map(b => {
+    const r = retry.get(b.pid)
+    return r ? { ...b, tries: r.tries, nextAt: r.nextAt, lastError: r.lastError } : b
+  })
   await save($, K.outbox, box)
   if (done.size) {
     const sent = await storeGet<string[]>($, K.sent, [])
@@ -2014,18 +3059,792 @@ async function flushOnce($: $) {
   }))
 }
 
+// ------------------------------------------------------------------ eval capture (W7-2)
+// Which model, effort, agent and client made each scored commit, and the tokens it took,
+// from call records this machine keeps (docs/api.md, "The coder block"). turn.step notes each
+// model call in module memory; classic.PostToolUse adds a record for a Bash call that made a
+// commit (Claude Code's own gitOperation sha) and writes them all to this session's slot file
+// under ~/.ccsr/calls; session.end, every scan and slowSync write what's waiting. The scan
+// reads every slot and builds each new score's block with coder.ts, and the block rides the
+// outbox with its score (notify, onScore, enqueue, adoptSalt), never the ledger, an atom or
+// the store's ledger keys. All of it only while config's eval_capture is on for this player
+// and their Model stats (held on the server, GET /me) is not off: otherwise nothing is
+// noted, nothing is written under ~/.ccsr/calls and no block is sent. A record holds a time,
+// the model, effort, agent, client and version, four token counts, the commit shas a Bash
+// call made and a key for the session's repo (a hash of its path): never a session id, a
+// path, a command, a tool_use id or a repo name.
+
+/** Model stats as the server last said it, for this server and handle. */
+async function holdModelStats($: $, isOn: boolean) {
+  const key = keyOf(await serverCfg($))
+  const held = await storeGet<{ key: string; on: boolean } | null>($, K.modelStats, null)
+  if (held?.key !== key || held.on !== isOn) await save($, K.modelStats, { key, on: isOn })
+  if (!isOn) await dropCoders($)
+}
+
+/** This account's Model stats, or null when the server never said (on, by default). */
+async function modelStatsOf($: $, server?: Pick<ServerConfig, 'url' | 'handle'>): Promise<boolean | null> {
+  const held = await storeGet<{ key: string; on: boolean } | null>($, K.modelStats, null)
+  return held && held.key === keyOf(server ?? (await serverCfg($))) && typeof held.on === 'boolean' ? held.on : null
+}
+
+/** Model stats off: the blocks still waiting in the outbox go too. */
+async function dropCoders($: $) {
+  const box = await storeGet<OutboxItem[]>($, K.outbox, [])
+  if (!box.some(b => b.body.coder)) return
+  await save($, K.outbox, box.map(b => (b.body.coder ? { ...b, body: withoutCoder(b.body) } : b)))
+}
+
+/** The Model stats switch in Settings: PATCH /me, then capture follows what the server answered. */
+async function setModelStats($: $, isOn: boolean) {
+  const r = await api($, 'PATCH', '/me', { model_stats: isOn })
+  if (r.status !== 200) return update($, link, l => ({ ...l, note: signInProblem(r) }))
+  const got = (r.json as { settings?: { model_stats?: unknown } } | null)?.settings?.model_stats
+  await holdModelStats($, typeof got === 'boolean' ? got : isOn)
+  await syncCapture($)
+  await update($, link, l => ({ ...l, note: '' }))
+}
+
+/** Capture on or off, from the config held for this account and Model stats; run on every config tick and /me read. */
+async function syncCapture($: $) {
+  const cfg = await serverCfg($)
+  const held = await read($, config)
+  const known = held.readAt > 0 && held.key === keyOf(cfg)
+  const stats = await modelStatsOf($, cfg)
+  const on = !!cfg.token && known && captureOn(held.raw) && stats !== false
+  captureKnown = known || stats === false
+  // W7-3: the transcript fallback rides capture, and follows config's eval_backfill on every read.
+  backfilling = on && backfillOn(held.raw)
+  if (on === capturing) {
+    if (!on && captureKnown && !callsForgotten) await forgetCalls($)
+    return
+  }
+  capturing = on
+  if (!on) {
+    stepsPending.length = 0
+    callsMine.length = 0
+    lastStep.clear()
+    if (captureKnown) await forgetCalls($)
+    return
+  }
+  callsForgotten = false
+  await startCapture($)
+}
+
+/**
+ * Capture is off for this player: this machine's records go too, and since.json is unset, so
+ * capture that comes back starts its records afresh and never reads a window across the gap.
+ * `$.fs` has no delete, so each file that holds something is written empty. A machine that
+ * never captured has nothing to clear and gets no write.
+ */
+async function forgetCalls($: $) {
+  callsForgotten = true
+  const dir = await callsDir($)
+  if (!dir) return
+  try {
+    if (readSince(String(await $.fs.read(`${dir}/since.json`))) !== null) await $.fs.write(`${dir}/since.json`, JSON.stringify({ v: 1, since: null }))
+  } catch {
+    // Missing: capture never began here.
+  }
+  for (let i = 0; i < CALL_SLOTS; i++) {
+    try {
+      if (readSlot(String(await $.fs.read(`${dir}/${i}.json`))).length > 0) await $.fs.write(`${dir}/${i}.json`, slotText([], [], 0))
+    } catch {
+      // A slot no session wrote.
+    }
+  }
+}
+
+/** Capture just turned on: what this session stamps on its records, and since.json when this machine has none. */
+async function startCapture($: $) {
+  callSlot = slotOf(owner)
+  let entry: string | undefined
+  try {
+    entry = await $.env.get('CLAUDE_CODE_ENTRYPOINT')
+  } catch {
+    entry = undefined
+  }
+  // Claude Code reads an unset entrypoint as cli; so does the record.
+  callSession = { ...callSession, client: clientOf(entry || 'cli'), clientVersion: versionOf(await claudeVersion($)) }
+  await refreshCallRepo($)
+  const dir = await callsDir($)
+  if (!dir) return
+  try {
+    if (readSince(String(await $.fs.read(`${dir}/since.json`))) !== null) return
+  } catch {
+    // Missing: capture starts on this machine now.
+  }
+  try {
+    await $.fs.write(`${dir}/since.json`, sinceText(await $.clock.now()))
+  } catch {
+    // No fs here, or the home directory isn't writable: no records, so no blocks.
+  }
+}
+
+/** ~/.ccsr/calls, beside the keyring; null where there's no home directory. */
+async function callsDir($: $) {
+  const path = await keyringPath($)
+  return path ? path.replace(/\/keyring\.json$/, '/calls') : null
+}
+
+/** A repo's key in the records: a hash of its main working tree's path, so a scan in any config dir finds the same one. */
+async function repoKey(root: string) {
+  return (await sha256hex(`ccsr-calls|${root}`)).slice(0, 16)
+}
+
+/** The session's repo key, worked out again only when the session's root moves (a /cd). */
+async function refreshCallRepo($: $) {
+  try {
+    const at = await $.session.root()
+    if (at === callRoot) return
+    callRoot = at
+    const root = await repoRoot($, at)
+    callSession = { ...callSession, repo: root ? await repoKey(root) : null }
+  } catch {
+    // No root or no git here: the records carry no repo, and count for any.
+  }
+}
+
+/** turn.step's one job, with no `$` call and nothing awaited: note the model call for the records. */
+function noteStep(e: unknown, r: unknown) {
+  try {
+    const wall = Date.now()
+    const step = e as { model?: unknown; effort?: unknown; agentId?: unknown }
+    const call = stepCall(step, r as { stopReason?: unknown; usage?: unknown }, wall)
+    lastStep.set(typeof step.agentId === 'string' ? step.agentId : '', { model: call.model, effort: call.effort })
+    stepsPending.push({ wall, call })
+    if (stepsPending.length > PENDING_MAX) stepsPending.splice(0, stepsPending.length - PENDING_MAX)
+  } catch {
+    // Never a reason for the model's response to fail.
+  }
+}
+
+/** A Bash call finished: when it made a commit, note its record (no `$` call); true when there's one to write. */
+function noteBash(e: { tool_response?: unknown; agent_id?: unknown; effort?: unknown }) {
+  try {
+    const wall = Date.now()
+    const call = bashCall(e, lastStep.get(typeof e.agent_id === 'string' ? e.agent_id : ''), wall)
+    if (!call) return false
+    stepsPending.push({ wall, call })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Writes what's waiting (and `extra`) to this session's slot. One write at a time per session. */
+function writeCalls($: $, extra: Call[] = []): Promise<void> {
+  const before = callWrite
+  const job = (async () => {
+    if (before) await before
+    await writeCallsOnce($, extra)
+  })().catch(err => $.ui.log(`CCSR calls: ${clean((err as Error).message)}`))
+  callWrite = job
+  void job.then(() => {
+    if (callWrite === job) callWrite = null
+  })
+  return job
+}
+
+async function writeCallsOnce($: $, extra: Call[]) {
+  if (!capturing) {
+    stepsPending.length = 0
+    return
+  }
+  const dir = await callsDir($)
+  if (!dir) return
+  await refreshCallRepo($)
+  const t = await $.clock.now()
+  // The steps were noted on the wall clock; each keeps how long ago it answered, on $.clock.
+  const wall = Date.now()
+  const fresh = [...stepsPending.splice(0).map(x => ({ ...x.call, at: t - Math.max(0, wall - x.wall) })), ...extra].map(c => stamped(c, callSession))
+  if (fresh.length === 0 && callsMine.length === 0) return
+  // This session's recent records go in again with the fresh ones (a slot keeps each once).
+  const keep = t - CALL_KEEP_MS
+  const mine = [...callsMine.filter(c => c.at >= keep), ...fresh].slice(-CALL_SLOT_MAX)
+  const path = `${dir}/${callSlot}.json`
+  try {
+    // Another session whose id picks the same slot may write between our read and write: read back, and merge once more if it did.
+    for (let i = 0; i < 2; i++) {
+      let held: Call[] = []
+      let text: string | null = null
+      try {
+        text = String(await $.fs.read(path))
+      } catch {
+        // Missing is empty; there but unreadable is left alone, and the records wait for the next write.
+        if (await $.fs.exists(path).catch(() => true)) throw new Error('slot unreadable')
+      }
+      if (text !== null) {
+        held = readSlot(text)
+        if (held.length === 0 && !slotEmpty(text)) {
+          if (!slotTorn) {
+            slotTorn = true
+            throw new Error('slot torn')
+          }
+        }
+      }
+      slotTorn = false
+      // Capture went off while this write waited: forgetCalls has cleared the slots, and nothing goes back.
+      if (!capturing) return
+      await $.fs.write(path, slotText(held, mine, t))
+      if (slotHolds(String(await $.fs.read(path).catch(() => '')), mine)) break
+    }
+    if (capturing) callsMine.splice(0, callsMine.length, ...mine)
+  } catch (err) {
+    // Nothing is lost: what wasn't written waits in memory for the next write.
+    if (capturing) callsMine.splice(0, callsMine.length, ...mine)
+    if ((err as Error).message !== 'slot torn') throw err
+  }
+}
+
+/** A slot file's text that holds no records on purpose (an empty list), as against one that doesn't parse. */
+function slotEmpty(text: string) {
+  try {
+    const raw = JSON.parse(text) as { v?: unknown; calls?: unknown }
+    return raw?.v === 1 && Array.isArray(raw.calls)
+  } catch {
+    return false
+  }
+}
+
+/** Every session's records on this machine and when capture began, after this session's own are written; null without since.json. */
+async function callsForScan($: $): Promise<{ calls: Call[]; since: number } | null> {
+  await writeCalls($)
+  const dir = await callsDir($)
+  if (!dir) return null
+  let since: number | null = null
+  try {
+    since = readSince(String(await $.fs.read(`${dir}/since.json`)))
+  } catch {
+    since = null
+  }
+  if (since === null) {
+    // Capture is on here but since.json is unset (another session's off spell cleared it): it begins again now, and this scan has no blocks.
+    if (capturing) await $.fs.write(`${dir}/since.json`, sinceText(await $.clock.now())).catch(() => undefined)
+    return null
+  }
+  const calls: Call[] = []
+  for (let i = 0; i < CALL_SLOTS; i++) {
+    try {
+      calls.push(...readSlot(String(await $.fs.read(`${dir}/${i}.json`))))
+    } catch {
+      // A slot no session has written yet.
+    }
+  }
+  return { calls, since: blockSince(since, await $.clock.now()) }
+}
+
+/**
+ * The coder block of each listed commit in one repo, by sha: windows between its commits by
+ * committer time. Only a commit this machine made (its reflog says commit or revert) can take
+ * a window's vote; any other (a GitHub merge, a cloud session's, another machine's pulled in)
+ * gets a block only from a sha record. A call with no repo key votes but its tokens aren't
+ * counted here: each repo's scan runs on its own, and two would both count them.
+ * `source`: live for the call records, transcript for the fallback's calls (W7-3); `local`,
+ * the repo's reflog commits when the caller has read them already.
+ */
+async function scanBlocks($: $, root: string, listed: RawCommit[], evalCalls: { calls: Call[]; since: number }, source: 'live' | 'transcript' = 'live', local?: Set<string>) {
+  const commits = scanCommits(listed, await repoKey(root))
+  return coderBlocks(commits, evalCalls.calls, { since: evalCalls.since, source, local: local ?? (await madeHere($, root)), bareTokens: false })
+}
+
+/** A repo's listed commits as the attribution takes them: sha, committer time, the repo's key. */
+function scanCommits(listed: RawCommit[], repo: string) {
+  return listed.flatMap(c => (typeof c.ct === 'number' && Number.isFinite(c.ct) ? [{ sha: c.sha, ct: c.ct, repo }] : []))
+}
+
+/** The commits this machine made in a repo, from every ref's reflog: an empty set when git can't say. */
+async function madeHere($: $, root: string): Promise<Set<string>> {
+  const out = new Set<string>()
+  try {
+    const r = await git($, root, ['reflog', 'show', '--all', '-n', '20000', `--format=%H${SEP}%gs`], 30_000)
+    if (r.exitCode !== 0) return out
+    for (const line of r.stdout.split('\n')) {
+      const [sha = '', subject = ''] = line.split(SEP)
+      if (/^(commit|revert)\b/.test(subject) && /^[0-9a-f]{40}$/.test(sha)) out.add(sha)
+    }
+  } catch {
+    // No git here: nothing counts as made here, and only sha records speak.
+  }
+  return out
+}
+
+// ------------------------------------------------------------------ the transcript fallback (W7-3)
+// Dark: only while config's eval_backfill is on and capture is (`backfilling`, set in
+// syncCapture). A new score whose live block is none, or that has no block, looks for its
+// coder in Claude Code's own transcripts on this machine: the projects folder of this config
+// dir (CLAUDE_CONFIG_DIR, else ~/.claude), in the folders of the sessions started in the repo
+// or one of its worktrees: each session's file, and its subagents' and workflow agents' files.
+// Each file is read for keys and numbers only (transcripts.ts), at most 5 a commit and 20 a
+// scan, none over 4 MiB, and the calls are attributed over the same windows, `since` and
+// reflog rule as the live records (scanBlocks with `transcript`). A window's vote counts only
+// when every file that could hold one of its calls was read: none skipped, every folder listed
+// whole, and no session started in a subfolder of the repo (a folder never read) written in the
+// window. A sha match counts whenever it is found. Only a block that names something replaces
+// the live one. The calls stay in the scan's memory: never in the slots under ~/.ccsr/calls.
+
+/** A folder as the fallback lists it: its `.jsonl` files (size and time come with the listing), its folders' names, and the names of anything else in it (a link). */
+type TxFolder = { files: TranscriptFile[]; dirs: string[]; other: string[] }
+
+/** A repo's project folders: `own`, read; `twins`, the folders of sessions started in its subfolders, only looked at; whether both are known whole. */
+type TxDirs = { own: string[]; twins: string[]; complete: boolean }
+
+/** One scan's transcript reads: what's left of its budget, each folder listed and file read (null: couldn't), each repo's folders. */
+type TxScan = { budget: number; lists: Map<string, TxFolder | null>; calls: Map<string, TranscriptCall[] | null>; dirs: Map<string, TxDirs> }
+
+function txScan(): TxScan {
+  return { budget: FILES_PER_SCAN, lists: new Map(), calls: new Map(), dirs: new Map() }
+}
+
+/**
+ * The transcript block for one new score with no live record, or null: a block that names a
+ * model or a match (sha, window or ambiguous), from the files that could hold a call in its
+ * window. Over a window it couldn't read whole, only a sha match.
+ */
+async function transcriptBlock($: $, root: string, sha: string, listed: RawCommit[], since: number, local: Set<string>, tx: TxScan): Promise<CoderBlock | null> {
+  const repo = await repoKey(root)
+  const commits = scanCommits(listed, repo)
+  const commit = commits.find(c => c.sha === sha)
+  const w = windowsOf(commits).get(sha)
+  // A commit before `since` gets no block at all, from the records or from here.
+  if (!commit || !w || !(commit.ct * 1000 >= since)) return null
+  const found = await transcriptFiles($, root, w.from, tx)
+  const plan = readPlan(found.files, { from: w.from, read: new Set(tx.calls.keys()), budget: tx.budget })
+  for (const path of plan.fresh) {
+    tx.budget--
+    try {
+      tx.calls.set(path, callsFromTranscript(String(await $.fs.read(path)), { subagent: isSubagentFile(path) }))
+    } catch {
+      tx.calls.set(path, null)
+    }
+  }
+  // Not `read`: the engine reads that name statically, as the atom reader imported above.
+  const got = plan.use.map(p => tx.calls.get(p) ?? null)
+  const whole = found.complete && plan.complete && got.every(r => r !== null)
+  // The files were picked by the repo's folders, so their calls are the repo's: each counts in one window here.
+  const calls = mergeTranscripts(got.filter((r): r is TranscriptCall[] => r !== null)).map(c => ({ ...c, repo }))
+  const block = (await scanBlocks($, root, listed, { calls, since }, 'transcript', local)).get(sha) ?? null
+  if (!block || block.match === null) return null
+  return whole || block.match === 'sha' ? block : null
+}
+
+/**
+ * The transcripts of this repo's sessions that could hold a call made at or after `from`, as
+ * `folderFiles` finds them in each of its own folders. `complete` is false when one of those
+ * couldn't be listed whole, or when a session started in a subfolder of the repo (its folder
+ * is never read) has a transcript written since `from`: a call could sit where the read can't
+ * see it.
+ */
+async function transcriptFiles($: $, root: string, from: number, tx: TxScan): Promise<{ files: TranscriptFile[]; complete: boolean }> {
+  const dirs = await transcriptDirs($, root, tx)
+  const files: TranscriptFile[] = []
+  let complete = dirs.complete
+  for (const dir of dirs.own) {
+    const here = await folderFiles($, dir, from, tx)
+    if (!here.complete) complete = false
+    files.push(...here.files)
+  }
+  for (const dir of complete ? dirs.twins : []) {
+    // Only names and times: nothing in these folders is read.
+    const there = await folderFiles($, dir, from, tx)
+    if (!there.complete || there.files.some(f => !(f.mtimeMs < from))) {
+      complete = false
+      break
+    }
+  }
+  return { files, complete }
+}
+
+/**
+ * One project folder's transcripts that could hold a call made at or after `from`: every
+ * session file in it, and the subagent files of each session written since BACKGROUND_MS
+ * before then (a subagent or a workflow run writes in the background while its session's own
+ * file sits still), newest first, at most SESSIONS_MAX sessions. `complete` is false when the
+ * folder or one of those subagent folders couldn't be listed whole, past SESSIONS_MAX, or when
+ * a session's transcript isn't a plain file (a link has no size or time in the listing).
+ */
+async function folderFiles($: $, dir: string, from: number, tx: TxScan): Promise<{ files: TranscriptFile[]; complete: boolean }> {
+  const here = await listFolder($, dir, tx)
+  if (here === null) return { files: [], complete: false }
+  const files = [...here.files]
+  let complete = !here.other.some(n => /\.jsonl$/.test(n))
+  const writtenAt = (f: TranscriptFile) => (Number.isFinite(f.mtimeMs) ? f.mtimeMs : Infinity)
+  const sessions = here.files.filter(f => writtenAt(f) >= from - BACKGROUND_MS).sort((a, b) => writtenAt(b) - writtenAt(a))
+  if (sessions.length > SESSIONS_MAX) complete = false
+  for (const f of sessions.slice(0, SESSIONS_MAX)) {
+    const subs = await subagentFiles($, `${f.path.slice(0, -'.jsonl'.length)}/subagents`, tx)
+    if (!subs.complete) complete = false
+    files.push(...subs.files)
+  }
+  return { files, complete }
+}
+
+/**
+ * A session's subagent transcripts: `subagents/*.jsonl`, and each workflow run's
+ * `subagents/workflows/<run>/*.jsonl` but its `journal.jsonl` (the run's own log, no model
+ * call). The other files there (`.meta.json`, `.prefix.json`) are never read. `complete` is
+ * false when one of those folders is there but can't be listed, or holds a folder or a link
+ * of a shape Claude Code didn't write (2.1.293): a call could sit in it unseen.
+ */
+async function subagentFiles($: $, dir: string, tx: TxScan): Promise<{ files: TranscriptFile[]; complete: boolean }> {
+  const top = await listFolder($, dir, tx)
+  if (top === null) return { files: [], complete: false }
+  const files = [...top.files]
+  let complete = top.other.length === 0 && top.dirs.every(d => d === 'workflows')
+  if (!top.dirs.includes('workflows')) return { files, complete }
+  const runs = await listFolder($, `${dir}/workflows`, tx)
+  if (runs === null) return { files, complete: false }
+  if (runs.other.length > 0) complete = false
+  files.push(...runs.files)
+  for (const run of runs.dirs) {
+    const inRun = await listFolder($, `${dir}/workflows/${run}`, tx)
+    if (inRun === null || inRun.other.length > 0 || inRun.dirs.length > 0) complete = false
+    if (inRun) files.push(...inRun.files.filter(f => !/[\\/]journal\.jsonl$/.test(f.path)))
+  }
+  return { files, complete }
+}
+
+/** One folder, listed once a scan: empty when it isn't there, null when it is but can't be listed. */
+async function listFolder($: $, dir: string, tx: TxScan): Promise<TxFolder | null> {
+  const held = tx.lists.get(dir)
+  if (held !== undefined) return held
+  let out: TxFolder | null
+  try {
+    const entries = await $.fs.list(dir)
+    out = {
+      files: entries.filter(e => e.kind === 'file' && /\.jsonl$/.test(e.name)).map(e => ({ path: `${dir}/${e.name}`, size: e.size, mtimeMs: e.mtimeMs })),
+      dirs: entries.filter(e => e.kind === 'dir').map(e => e.name),
+      other: entries.filter(e => e.kind !== 'file' && e.kind !== 'dir').map(e => e.name),
+    }
+  } catch {
+    out = (await $.fs.exists(dir).catch(() => true)) ? null : { files: [], dirs: [], other: [] }
+  }
+  tx.lists.set(dir, out)
+  return out
+}
+
+/**
+ * The folders under this config dir's projects folder for the repo's sessions. `own`: the one
+ * for its main working tree and one for each worktree (`git worktree list`), named as Claude
+ * Code names them; these are read. `twins`: the folders of sessions started in a subfolder of
+ * one of those trees, or of another folder whose name starts the same (the two can't be told
+ * apart by name); these are never read, only their transcripts' times looked at. `complete` is
+ * false when the worktrees or the projects folder couldn't be listed, or past TWINS_MAX twins.
+ * None without a home directory or an absolute CLAUDE_CONFIG_DIR.
+ */
+async function transcriptDirs($: $, root: string, tx: TxScan): Promise<TxDirs> {
+  const held = tx.dirs.get(root)
+  if (held) return held
+  const home = (await $.env.get('HOME').catch(() => undefined)) || (await $.env.get('USERPROFILE').catch(() => undefined)) || ''
+  const configDir = await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)
+  const base = home || /^(\/|[A-Za-z]:[\\/])/.test((configDir ?? '').trim()) ? transcriptsDirOf({ CLAUDE_CONFIG_DIR: configDir }, home) : null
+  let out: TxDirs = { own: [], twins: [], complete: true }
+  if (base) {
+    const trees = new Set([root])
+    let complete = true
+    try {
+      const r = await git($, root, ['worktree', 'list', '--porcelain'], 15_000)
+      if (r.exitCode !== 0) complete = false
+      else for (const line of r.stdout.split('\n')) if (line.startsWith('worktree ') && line.length > 9) trees.add(line.slice(9))
+    } catch {
+      // No git here: the main working tree's folder only, and a worktree's sessions would go unseen.
+      complete = false
+    }
+    const own = [...trees].map(t => projectDirOf(t))
+    const all = await listFolder($, base, tx)
+    if (all === null) complete = false
+    const prefixes = [...trees].map(t => subfolderPrefixOf(t))
+    const twins = (all?.dirs ?? []).filter(n => !own.includes(n) && prefixes.some(p => n.startsWith(p)))
+    if (twins.length > TWINS_MAX) complete = false
+    out = { own: own.map(n => `${base}/${n}`), twins: twins.length > TWINS_MAX ? [] : twins.map(n => `${base}/${n}`), complete }
+  }
+  tx.dirs.set(root, out)
+  return out
+}
+
+// ------------------------------------------------------------------ poll loops
+// Every poll runs on loop(): one tick at a time, each scheduled after the last
+// one settles, at the interval config gives it, read again every tick. When the
+// server can't be reached, is limiting us (408, 429) or is failing (5xx), the
+// wait doubles from the interval up to max(60 s, Retry-After), with full
+// jitter so a recovery doesn't bring every mod back at once, and the first 2xx
+// puts it back to the interval. $.http.fetch has no timeout, so a watchdog
+// gives up on a tick whose request hangs past max(60 s, 3 x the interval) and
+// moves on; a newer generation means the abandoned tick's late answer changes
+// nothing. A loop never has more than two requests out: with one given up on
+// and still out, the watchdog waits on the next instead of leaving it behind,
+// and a tick doesn't start while two are out. A request given up on stops
+// counting once it has been out for hungExpiryMs, so a socket that never
+// answers can't stop a poll for good. A press that should show at once (Queue,
+// Accept, a room) runs the loop's next tick now with kickLoop, never a request
+// of its own beside the loop.
+
+/** What one tick of a loop got back: the status of its main request, and any Retry-After. */
+type Answer = { status: number; retryAfterMs?: number | null }
+
+/** One run of a loop's `fn`: abandoned once its watchdog (or a stop) gives up on it while its request is out. */
+type LoopTick = {
+  gen: number
+  settled: boolean
+  abandoned: boolean
+  /** When the tick began, and the interval then: a request given up on counts until startedAt + hungExpiryMs(every). */
+  startedAt: number
+  every: number
+  /** Ends the wait on this tick when it's given up on, so a press waiting on it moves on. */
+  gaveUp: () => void
+}
+
+type LoopState = {
+  name: string
+  /** Bumped when the loop stops and when the watchdog gives up on a tick: an older tick schedules nothing when it settles. */
+  gen: number
+  timer: { cancel: () => void } | null
+  watchdog: { cancel: () => void } | null
+  /** A tick is running, its request maybe in flight. */
+  busy: boolean
+  tick: LoopTick | null
+  /** A kick came while a tick ran: the next tick follows it at once. */
+  soon: boolean
+  /**
+   * The presses that kicked while a tick ran, waiting on the tick that follows
+   * it: each is let go when that tick answers or is given up on, or at once when
+   * none follows now (the loop stopped, gave up on a tick or backs off).
+   */
+  waiters: (() => void)[]
+  failures: number
+  retryAfter: number | null
+  /** When a tick last began or was scheduled, and the wait set then: slowSync restarts a loop that went quiet past both. */
+  lastTickAt: number
+  waitMs: number
+  every: () => Promise<number>
+  fn: (isCurrent: () => boolean) => Promise<Answer | void>
+}
+
+const loops = new Map<string, LoopState>()
+/** Requests a watchdog or a stop gave up on that haven't answered yet, by loop name, across restarts. */
+const hung = new Map<string, Set<LoopTick>>()
+
+/**
+ * Starts (or restarts) the loop called `name`: `fn` runs once per tick, the
+ * first after one interval (kickLoop runs one now). `every` is read every
+ * tick, so a config change applies on the next one. Returns the way to stop it.
+ */
+function loop($: $, name: string, every: () => Promise<number>, fn: (isCurrent: () => boolean) => Promise<Answer | void>) {
+  stopLoop(name)
+  const st: LoopState = { name, gen: 0, timer: null, watchdog: null, busy: false, tick: null, soon: false, waiters: [], failures: 0, retryAfter: null, lastTickAt: 0, waitMs: 0, every, fn }
+  loops.set(name, st)
+  void armLoop($, st, st.gen, null).catch(err => $.ui.log(`CCSR ${name}: ${(err as Error).message}`))
+  return () => stopLoop(name)
+}
+
+function stopLoop(name: string) {
+  const st = loops.get(name)
+  if (!st) return
+  // A request still out counts against the two a hung server may hold, until it answers.
+  if (st.tick && !st.tick.settled && !st.tick.abandoned) abandon(st.name, st.tick)
+  st.gen++
+  st.timer?.cancel()
+  st.watchdog?.cancel()
+  st.timer = null
+  st.watchdog = null
+  loops.delete(name)
+  letGo(st)
+}
+
+/** No tick follows now: every press waiting on the loop's next one moves on with what the last left. */
+function letGo(st: LoopState) {
+  for (const r of st.waiters.splice(0)) r()
+}
+
+/**
+ * Runs the loop's next tick now instead of at its timer, through the same
+ * single flight and watchdog: it resolves once that tick answers or is given
+ * up on. With a tick already running, the next one follows it at once, and
+ * the kick resolves once that one answers (or at once when none follows: the
+ * loop stopped or backs off), so a press never reads what a tick still in
+ * flight hasn't written.
+ */
+async function kickLoop($: $, name: string) {
+  const st = loops.get(name)
+  if (!st) return
+  if (st.busy) {
+    st.soon = true
+    return new Promise<void>(r => st.waiters.push(r))
+  }
+  await runTick($, st, st.gen)
+}
+
+/** The interval a loop's `every` gives now, held to the config clamps (1 s to 10 min). */
+async function loopEvery(st: LoopState) {
+  try {
+    const ms = Math.round(await st.every())
+    return Number.isFinite(ms) ? Math.min(600_000, Math.max(1000, ms)) : 2000
+  } catch {
+    return 2000
+  }
+}
+
+/** Schedules the loop's next tick: after `ms`, or after one interval when null. A tick running now schedules its own when it settles. */
+async function armLoop($: $, st: LoopState, gen: number, ms: number | null) {
+  if (st.gen !== gen || loops.get(st.name) !== st) return
+  const wait = ms ?? (await loopEvery(st))
+  if (st.gen !== gen || loops.get(st.name) !== st) return
+  const t = await $.clock.now()
+  // A tick running now arms its own next one; so did any that ran since the loop began.
+  if (st.gen !== gen || loops.get(st.name) !== st || st.busy || (ms === null && st.tick)) return
+  st.waitMs = wait
+  st.lastTickAt = t
+  st.timer?.cancel()
+  st.timer = $.clock.after(wait, () => void runTick($, st, gen).catch(err => $.ui.log(`CCSR ${st.name}: ${(err as Error).message}`)))
+}
+
+/** How many of `name`'s requests given up on still count at `t`: one out past hungExpiryMs is taken for dead. */
+function hungCount(name: string, t: number) {
+  const out = hung.get(name)
+  if (!out) return 0
+  for (const tick of [...out]) if (t - tick.startedAt >= hungExpiryMs(tick.every)) out.delete(tick)
+  return out.size
+}
+
+function abandon(name: string, tick: LoopTick) {
+  tick.abandoned = true
+  const out = hung.get(name) ?? new Set<LoopTick>()
+  out.add(tick)
+  hung.set(name, out)
+  tick.gaveUp()
+}
+
+const GAVE_UP = Symbol('gave up')
+
+async function runTick($: $, st: LoopState, gen: number) {
+  if (st.gen !== gen || loops.get(st.name) !== st || st.busy) return
+  st.timer?.cancel()
+  st.timer = null
+  st.busy = true
+  const t = await $.clock.now()
+  const every = await loopEvery(st)
+  if (st.gen !== gen || loops.get(st.name) !== st) {
+    st.busy = false
+    return
+  }
+  // Two of ours already hang there: no third, until one answers or is taken for dead.
+  if (hungCount(st.name, t) >= 2) {
+    st.busy = false
+    letGo(st)
+    return armLoop($, st, gen, every)
+  }
+  // The presses waiting on the next tick wait on this one.
+  const waiting = st.waiters.splice(0)
+  st.lastTickAt = t
+  let gaveUp = () => {}
+  const given = new Promise<typeof GAVE_UP>(r => (gaveUp = () => r(GAVE_UP)))
+  const tick: LoopTick = { gen, settled: false, abandoned: false, startedAt: t, every, gaveUp }
+  st.tick = tick
+  const isCurrent = () => !tick.abandoned && st.gen === tick.gen && loops.get(st.name) === st
+  armWatchdog($, st, tick, every)
+  const ran = (async (): Promise<Answer | void> => {
+    try {
+      return await st.fn(isCurrent)
+    } catch (err) {
+      $.ui.log(`CCSR ${st.name}: ${(err as Error).message}`)
+      return { status: 0 }
+    } finally {
+      tick.settled = true
+      // Given up on and now answered: it no longer counts against the two.
+      hung.get(st.name)?.delete(tick)
+    }
+  })()
+  const answer = await Promise.race([ran, given])
+  // Answered or given up on: the presses waiting on this tick move on.
+  for (const r of waiting) r()
+  if (answer === GAVE_UP || tick.abandoned) return
+  st.busy = false
+  st.watchdog?.cancel()
+  st.watchdog = null
+  if (!isCurrent()) return
+  if (answer && retryable(answer.status)) {
+    st.failures++
+    st.retryAfter = answer.retryAfterMs ?? null
+  } else if (answer && answer.status >= 200 && answer.status < 300) {
+    st.failures = 0
+    st.retryAfter = null
+  }
+  // A kick that came while this tick ran: the next one now, unless the server asked us to back off.
+  const soon = st.soon && !(answer && retryable(answer.status))
+  st.soon = false
+  if (!soon) letGo(st)
+  await armLoop($, st, gen, soon ? 0 : loopWaitMs(await loopEvery(st), st.failures, st.retryAfter))
+}
+
+/**
+ * The watchdog for one tick. Past max(60 s, 3 x the interval) with no answer,
+ * the loop gives up on it, as on a request that never reached the server, and
+ * schedules the next tick. With another request already given up on and still
+ * out, it waits on this one instead, so a hung server holds at most two of ours.
+ */
+function armWatchdog($: $, st: LoopState, tick: LoopTick, every: number) {
+  st.watchdog?.cancel()
+  st.watchdog = $.clock.after(watchdogMs(every), () => void watchdogFired($, st, tick, every).catch(err => $.ui.log(`CCSR ${st.name}: ${(err as Error).message}`)))
+}
+
+async function watchdogFired($: $, st: LoopState, tick: LoopTick, every: number) {
+  const out = () => !tick.settled && !tick.abandoned && st.gen === tick.gen && loops.get(st.name) === st
+  if (!out()) return
+  const t = await $.clock.now()
+  if (!out()) return
+  if (hungCount(st.name, t) >= 1) return armWatchdog($, st, tick, every)
+  abandon(st.name, tick)
+  st.gen++
+  st.busy = false
+  st.watchdog = null
+  st.failures++
+  st.retryAfter = null
+  // The next tick waits out the backoff: a press that kicked during this one moves on now.
+  letGo(st)
+  await armLoop($, st, st.gen, loopWaitMs(every, st.failures, null))
+}
+
+/** From slowSync: a loop with no tick running and none due for a while lost its timer; start it again. */
+async function reviveLoops($: $) {
+  const t = await $.clock.now()
+  for (const st of [...loops.values()]) if (!st.busy && t - st.lastTickAt > st.waitMs + 30_000) loop($, st.name, st.every, st.fn)
+}
+
 // ------------------------------------------------------------------ ranked
 // The queue, the ready check and the live match, by polling (mods can't hold a
-// socket): GET /queue every 2 s while queued or offered, the match's events
-// every 2 s while it runs. Every session that sees an active phase polls; the
-// server is the source of truth, so two sessions polling agree.
+// socket): GET /queue while queued or offered, the match's events while it
+// runs, each at its config interval (2 s by default) on loop(). Every session
+// that sees an active phase polls; the server is the source of truth, so two
+// sessions polling agree. Between matches the same loop reads GET /queue for
+// its lanes, the lengths offered (W2b), at poll_ms.idle while the Match tab is
+// on screen, and stops off it.
 
-const RANKED0: RankedShared = { phase: 'idle', matchId: null, lengths: [1, 3], since: 0 }
+const RANKED0: RankedShared = { phase: 'idle', matchId: null, lengthsMin: null, queuedMin: [], since: 0, bucket: null }
 let stopRankedPoll: (() => void) | null = null
 const rankedWarned = new Set<string>()
+/** A Queue press found no lanes cached: the ranked loop's next tick reads them once, whatever tab is on screen. */
+let lanesOnce = false
+/** Why the last lanes read got none, for a Queue press that still finds none cached: null after a read that answered. */
+let lanesMiss: string | null = null
 
-async function rankedShared($: $) {
-  return { ...RANKED0, ...(await storeGet<Partial<RankedShared>>($, K.ranked, {})) }
+const PHASES: readonly RankedShared['phase'][] = ['idle', 'queued', 'offered', 'live', 'done']
+
+/**
+ * Where this player is in ranked, from the store. Lengths are minutes: an old
+ * stored `lengths` in hours is read once by lengthsFromStore, and since this
+ * object never carries it, setRanked never writes it back.
+ */
+async function rankedShared($: $): Promise<RankedShared> {
+  const raw = await storeGet<unknown>($, K.ranked, {})
+  const o = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  return {
+    phase: PHASES.includes(o.phase as RankedShared['phase']) ? (o.phase as RankedShared['phase']) : RANKED0.phase,
+    matchId: typeof o.matchId === 'string' ? o.matchId : null,
+    lengthsMin: lengthsFromStore(o),
+    queuedMin: minutesOf(o.queuedMin),
+    since: typeof o.since === 'number' && Number.isFinite(o.since) ? o.since : 0,
+    bucket: bucketIdOf(o.bucket),
+  }
 }
 
 async function setRanked($: $, patch: Partial<RankedShared>) {
@@ -2034,10 +3853,62 @@ async function setRanked($: $, patch: Partial<RankedShared>) {
   return next
 }
 
+/**
+ * The bucket the Match tab shows between matches (W3b): the pick while config still lists it,
+ * else Open, else config's first (`pickBucket`). Normalized only here, while idle: the store
+ * keeps the pick, so a bucket that comes back is picked again, and while queued or offered the
+ * mod follows the server's bucket instead. null when config lists no buckets (a server before
+ * W3a, or none read yet): the mod then queues and reads lanes exactly as before buckets.
+ */
+async function bucketOnScreen($: $, sh: RankedShared): Promise<string | null> {
+  return pickBucket(bucketsOf(await configOf($)), sh.bucket)?.id ?? null
+}
+
+/**
+ * The cached lanes when they are bucket `id`'s (W3b), else null, as if none were read. Another
+ * bucket's can be cached: a read in flight when the row moved, a queue poll's answer after a
+ * drop, or a lanes read the server answered as Open because the bucket asked for isn't on for
+ * you. So the Match tab draws, toggles and queues only with the lanes of the bucket in question.
+ * A null `id` (config lists no buckets) and lanes no bucket was named for (a server before W3a)
+ * always fit.
+ */
+function lanesIn(l: Pick<LinkState, 'lanes' | 'lanesBucket'>, id: string | null): ApiLane[] | null {
+  const of = l.lanesBucket ?? null
+  return id === null || of === null || of === id ? l.lanes : null
+}
+
+/** When a lanes read last found config stale on buckets (W3b), for `staleBuckets`' spacing. */
+let staleBucketsAt = 0
+
+/**
+ * A lanes read asked for a bucket config lists and the server answered as another (W3b): the
+ * bucket isn't on for this player any more, though config's version may not have moved (a
+ * group membership, say). Config is read again (`bucket`), at most once per REREAD_SPACING_MS,
+ * so a server that stays out of step never costs a config read per lanes poll.
+ */
+async function staleBuckets($: $) {
+  const t = await $.clock.now()
+  if (t - staleBucketsAt < REREAD_SPACING_MS) return
+  staleBucketsAt = t
+  void refreshConfig($, 'bucket').catch(() => null)
+}
+
 function startRankedPoll($: $) {
-  if (stopRankedPoll) return
-  const timer = $.clock.every(2000, () => void pollRanked($).catch(err => $.ui.log(`CCSR ranked: ${(err as Error).message}`)))
-  stopRankedPoll = () => timer.cancel()
+  if (stopRankedPoll && loops.has('ranked')) return
+  stopRankedPoll = loop($, 'ranked', () => rankedEvery($), isCurrent => pollRanked($, isCurrent))
+}
+
+/** A ranked poll now (after a press): the ranked loop's next tick, started if it isn't running. Never a request beside it. */
+async function pollRankedNow($: $) {
+  startRankedPoll($)
+  await kickLoop($, 'ranked')
+}
+
+/** The ranked poll's interval for where the player is: queued, an offer out, a live match, or between matches (the lanes). */
+async function rankedEvery($: $) {
+  const c = await configOf($)
+  const phase = (await rankedShared($)).phase
+  return phase === 'offered' ? c.poll.offered : phase === 'live' ? c.poll.live : phase === 'queued' ? c.poll.queued : c.poll.idle
 }
 
 function stopPolling() {
@@ -2045,130 +3916,458 @@ function stopPolling() {
   stopRankedPoll = null
 }
 
-async function pollRanked($: $) {
+/** One tick of the ranked loop. Only the loop calls it: a press that wants a poll now goes through pollRankedNow. */
+async function pollRanked($: $, isCurrent: () => boolean): Promise<Answer | void> {
   const sh = await rankedShared($)
-  if (sh.phase === 'queued' || sh.phase === 'offered') return pollQueue($, sh)
-  if (sh.phase === 'live' && sh.matchId) return pollMatch($, sh.matchId)
+  if (sh.phase === 'queued' || sh.phase === 'offered') return pollQueue($, sh, isCurrent)
+  if (sh.phase === 'live' && sh.matchId) return pollMatch($, sh.matchId, isCurrent)
+  // Between matches: the lanes, while the Match tab is on screen, or once for a press. W3b: the lanes of the bucket on screen.
+  const once = lanesOnce
+  lanesOnce = false
+  if ((sh.phase === 'idle' || sh.phase === 'done') && (once || (await lanesWatched($)))) return pollLanes($, isCurrent, await bucketOnScreen($, sh))
+  // A press that came during this tick wants the lanes: its kick has the next tick follow at once, and that one reads them.
+  if (lanesOnce) return
   stopPolling()
 }
 
-async function pollQueue($: $, sh: RankedShared) {
-  const r = await api($, 'GET', '/queue')
-  if (r.status !== 200) return
+/**
+ * The Match tab is on screen: it's the tab, and the pane drew within max(15 s,
+ * 2.5 x the idle interval), the chat poll's heartbeat rule. A press that shows
+ * the tab (selectTab, openPane) counts as a draw. Signed in only.
+ */
+async function lanesWatched($: $) {
+  if (!(await serverCfg($)).token || (await read($, link)).unknownToken || (await read($, tab)) !== 'match') return false
+  const t = await $.clock.now()
+  return t - paneSeenAt <= Math.max(15_000, 2.5 * (await configOf($)).poll.idle)
+}
+
+/** Between matches with the Match tab on screen: the ranked loop goes on reading the lanes (no tick now; a press that wants one kicks it). */
+async function idlePoll($: $) {
+  const phase = (await rankedShared($)).phase
+  if ((phase === 'idle' || phase === 'done') && (await lanesWatched($))) startRankedPoll($)
+}
+
+/**
+ * GET /queue between matches (the lanes poll). `bucket` is W3b's: it reads the
+ * lanes of the bucket on screen. The lanes are kept apart from the queue state,
+ * so they last through a match for Queue again; any `cancelled` reason it
+ * carries is shown, as the queue poll does. The server is the source of truth:
+ * when it has you queued or offered (a Leave or a Queue whose answer was lost,
+ * or another machine on the account), the mod takes that up, so it polls as
+ * the queue does and shows the ready check, never keeping alive an entry it
+ * doesn't show.
+ */
+async function pollLanes($: $, isCurrent: () => boolean, bucket: string | null): Promise<Answer> {
+  const r = await api($, 'GET', bucket ? `/queue?bucket=${encodeURIComponent(bucket)}` : '/queue', undefined, { keepNote: true })
+  // A late answer to a request the loop gave up on changes nothing.
+  if (!isCurrent()) return r
+  lanesMiss = r.status === 200 ? null : failLine(r)
+  if (r.status !== 200) return r
   const q = r.json as ApiQueueState
-  await update($, link, l => ({ ...l, queue: q }))
-  const rel = (await read($, link)).release
-  if (q.cancelled?.reason === 'update_required') {
+  const lanes = lanesOf(q?.lanes)
+  // W3b: kept with the bucket they are (the answer says; else the one asked for), so another bucket's never draw under the row.
+  const of = bucketIdOf(q?.bucket) ?? bucket
+  await update($, link, l => ({ ...l, ...(lanes ? { lanes, lanesBucket: of } : {}) }))
+  if (q?.status === 'queued' || q?.status === 'offered') {
+    // What it queued you for isn't in this answer: the pick within the lanes is the best guess, and takeQueue holds it to the lanes.
+    const sh = await rankedShared($)
+    const pick = pickedLengths(sh.lengthsMin, lanes)
+    const was = await setRanked($, { phase: 'queued', matchId: null, since: await $.clock.now(), queuedMin: pick.length ? pick : sh.queuedMin })
+    return takeQueue($, was, q, r, isCurrent)
+  }
+  // W3b: asked for a bucket config lists and answered as another (Open): it isn't on for you now, so config is stale on buckets.
+  if (bucket && of !== bucket) await staleBuckets($)
+  await noteCancelled($, q)
+  return r
+}
+
+/** The server itself answered: not no answer at all, nor a proxy's 502 to 504 (the server's own 503 comes with its error JSON), as api() reads it. */
+function reachedOf(r: { status: number; json: unknown }) {
+  return r.status !== 0 && (r.status < 502 || r.status > 504 || errorOf(r.json) !== null)
+}
+
+/** A failed answer as a press's note: offline when the server wasn't reached, else its message or its status. */
+function failLine(r: { status: number; json: unknown }) {
+  return reachedOf(r) ? (errorOf(r.json)?.message ?? MOD.answered(r.status)) : MOD.noServer
+}
+
+/** The toast for why the last offer died or the server took you out of the queue (`cancelled`, on one read only). */
+async function noteCancelled($: $, q: ApiQueueState | null) {
+  if (!q?.cancelled) return
+  const reason = q.cancelled.reason
+  if (reason === 'update_required') {
+    const rel = (await read($, link)).release
     if (rel) await ambient($, MOD.updateNeeded(rel.min, VERSION), 'match')
-  } else if (q.cancelled) await ambient($, q.cancelled.reason === 'you_expired' ? "You didn't accept. Out of the queue." : `${q.cancelled.reason === 'opponent_declined' ? 'They declined' : "They didn't accept"}. Back in the queue.`, 'match')
+  } else await ambient($, cancelledLine(String(reason)), 'match')
+  // W3b: your bucket closed for you, or you stopped meeting its checklist: the neutral line (W1b's), and config says what's open now.
+  if (reason === 'bucket_closed' || reason === 'verification_required') void refreshConfig($, 'bucket').catch(() => null)
+}
+
+async function pollQueue($: $, sh: RankedShared, isCurrent: () => boolean): Promise<Answer> {
+  const r = await api($, 'GET', '/queue')
+  // A late answer to a request the loop gave up on changes nothing.
+  if (r.status !== 200 || !isCurrent()) return r
+  return takeQueue($, sh, r.json as ApiQueueState, r, isCurrent)
+}
+
+/**
+ * One GET /queue answer while queued or offered (`sh` is where the mod had you):
+ * an offer shows the ready check, queued keeps what the server still queues you
+ * for, idle means the offer went live or you're out.
+ */
+async function takeQueue($: $, sh: RankedShared, q: ApiQueueState, r: Answer, isCurrent: () => boolean): Promise<Answer> {
+  const lanes = lanesOf(q?.lanes)
+  // W6b: the offer the last answer held, before this one replaces it: a challenge's ready check that dies says so.
+  const before = (await read($, link)).queue?.offer ?? null
+  // W3b: while queued or offered the bucket is the server's (your entry's, or the match's): the mod adopts it as it comes. The
+  // answer's lanes are that bucket's (once out of the queue, the bucket the answer names: Open, as no ?bucket= is asked here).
+  const qb = bucketIdOf(q?.bucket) ?? bucketIdOf(q?.offer?.bucket)
+  await update($, link, l => ({ ...l, queue: q, ...(lanes ? { lanes, lanesBucket: qb ?? sh.bucket } : {}) }))
+  await noteCancelled($, q)
+  const adopt: Partial<RankedShared> = qb && qb !== sh.bucket ? { bucket: qb } : {}
   if (q.status === 'offered' && q.offer) {
     if (sh.phase !== 'offered' || sh.matchId !== q.offer.match_id) {
-      await setRanked($, { phase: 'offered', matchId: q.offer.match_id })
-      // Approved line (docs/copy.md): the match-found toast, which no setting turns off.
-      await ambient($, LINES.found, 'ready', 10_000)
+      await setRanked($, { phase: 'offered', matchId: q.offer.match_id, ...adopt })
+      // Approved line (docs/copy.md): the match-found toast, which no setting turns off. W6b: a challenge's says who took it.
+      await ambient($, q.offer.kind === 'challenge' ? CHALLENGE.readyTaken(q.offer.opponent.handle) : LINES.found, 'ready', 10_000)
       await ring($, 'chime')
-    }
+      // W4b: the notices' match_found trigger (nothing pops over the ready check: notices.ts holds toasts, flashes and the band till it's answered).
+      void noticeEvent($, { on: 'match_found' }).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+    } else if (adopt.bucket) await setRanked($, adopt)
     await refreshStatus($)
-    return
+    return r
   }
   if (q.status === 'queued') {
-    if (sh.phase !== 'queued') await setRanked($, { phase: 'queued', matchId: null })
+    const queuedMin = sh.queuedMin.length ? sh.queuedMin : pickedLengths(sh.lengthsMin, lanes)
+    // A length switched off while you wait leaves the server's entry (all of them off is length_off): the lanes are what it still offers.
+    const kept = lanes ? queuedMin.filter(m => lanes.some(x => x.length_min === m)) : queuedMin
+    const now = kept.length ? kept : queuedMin
+    if (sh.phase !== 'queued' || now.join() !== sh.queuedMin.join() || adopt.bucket) await setRanked($, { phase: 'queued', matchId: null, queuedMin: now, ...adopt })
     await refreshStatus($)
-    return
+    return r
   }
   // Idle: the offer went live (both accepted), or we left or were dropped.
   if (sh.matchId) {
     const m = await api($, 'GET', `/matches/${sh.matchId}`)
+    if (!isCurrent()) return r
     const summary = m.status === 200 ? (m.json as { match: ApiMatchSummary }).match : null
-    if (summary && (summary.status === 'live' || summary.status === 'grace')) return enterLive($, summary)
+    if (summary && (summary.status === 'live' || summary.status === 'grace')) {
+      await enterLive($, summary, isCurrent)
+      return r
+    }
+  }
+  // W6b: a challenge's ready check that ended without a match sets no `cancelled` reason (W6a), so it says so here, and the inbox shows where the challenge stands now.
+  if (sh.phase === 'offered' && before?.kind === 'challenge' && before.match_id === sh.matchId) {
+    await ambient($, CHALLENGE.noMatch, 'match')
+    if (await challengesLive($)) void pollInboxNow($).catch(() => null)
   }
   await setRanked($, { phase: 'idle', matchId: null })
   await update($, link, l => ({ ...l, queue: null }))
-  stopPolling()
+  // Out of the queue: the loop's next tick reads the lanes if the Match tab is on screen, else stops.
+  return r
 }
 
-async function enterLive($: $, summary: ApiMatchSummary) {
+/**
+ * The match went live: follow it. Inside a ranked tick (`isCurrent` given),
+ * its first page is that tick's next request; after a press, the ranked loop
+ * runs a tick now.
+ */
+async function enterLive($: $, sent: ApiMatchSummary, isCurrent?: () => boolean) {
+  // W10e: any custom art ref stays out of the link atom (a live match has none; the decided one comes through pollMatch).
+  const summary = await keepArtRef($, sent)
   await setRanked($, { phase: 'live', matchId: summary.id })
+  // W4b: the notices' match_start trigger.
+  void noticeEvent($, { on: 'match_start' }).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
   await update($, link, l => ({ ...l, queue: null, ranked: { id: summary.id, summary, events: l.ranked?.id === summary.id ? l.ranked.events : [], cursor: l.ranked?.id === summary.id ? l.ranked.cursor : 0, polledAt: 0 } }))
-  startRankedPoll($)
-  await pollMatch($, summary.id)
+  // W6b: a challenge's taker waits on the sender's ready check, maybe for minutes: when a poll (not their own press) finds it live, a toast says so.
+  if (isCurrent && summary.kind === 'challenge' && !rankedWarned.has(`${summary.id}:on`)) {
+    rankedWarned.add(`${summary.id}:on`)
+    const them = rankedSides(summary, (await serverCfg($)).handle ?? '').them
+    await ambient($, CHALLENGE.on(them.player.handle, lengthLabel(summary.length_min)), 'match', 8000)
+  }
+  if (isCurrent) await pollMatch($, summary.id, isCurrent)
+  else await pollRankedNow($)
 }
 
-async function pollMatch($: $, id: string) {
+async function pollMatch($: $, id: string, isCurrent: () => boolean): Promise<Answer> {
   const cur = (await read($, link)).ranked
   const cursor = cur && cur.id === id ? cur.cursor : 0
   const r = await api($, 'GET', `/matches/${id}/events?cursor=${cursor}`)
-  if (r.status !== 200) return
-  const page = r.json as { events: RankedMatch['events']; cursor: number; match: ApiMatchSummary }
+  if (r.status !== 200 || !isCurrent()) return r
+  const page = r.json as { events: RankedMatch['events']; cursor: number; match: ApiMatchSummary; notices?: unknown }
   const t = await $.clock.now()
+  // W10e: a decided win's custom art ref goes in module memory (and its art is fetched for this pane), never the link atom.
+  const summary = await keepArtRef($, page.match)
   await update($, link, l => {
     const have = l.ranked && l.ranked.id === id ? l.ranked.events : []
-    return { ...l, ranked: { id, summary: page.match, events: mergeEvents(have, page.events), cursor: page.cursor, polledAt: t } }
+    // W4b: the feed's notices ride every page (critical and warn, for a side of a live or grace match): the newest page's are kept as sent.
+    return { ...l, ranked: { id, summary, events: mergeEvents(have, page.events), cursor: page.cursor, polledAt: t, notices: page.notices } }
   })
-  const s = page.match
+  if (Array.isArray(page.notices) && page.notices.length > 0) void feedAlerts($, id).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+  const s = summary
   if (s.status === 'live' && s.deadline) {
     const left = Date.parse(s.deadline) - t
-    for (const [mark, text] of [
-      [10 * 60_000, MOD.warn10],
-      [60_000, MOD.warn1],
-    ] as const)
+    // The warnings follow the match's grace: 10 minutes before the bell at 1h, 3 at 15m; then 1 minute, with the bell.
+    const warn = warnMs(s)
+    const marks: [number, string][] = warn > 60_000 ? [[warn, MOD.warnAt(Math.round(warn / 60_000))], [60_000, MOD.warn1]] : [[60_000, MOD.warn1]]
+    for (const [mark, text] of marks)
       if (left <= mark && left > 0 && !rankedWarned.has(`${id}:${mark}`)) {
         rankedWarned.add(`${id}:${mark}`)
         await ambient($, text, 'match', 8000)
         if (mark === 60_000) await ring($, 'bell')
       }
-    if (left <= 10 * 60_000) await checkDirty($)
+    if (left <= warn) await checkDirty($)
   }
   if (s.status === 'finished' || s.status === 'void') {
     await setRanked($, { phase: 'done', matchId: id })
-    stopPolling()
+    // Decided: the loop's next tick reads the lanes (for Queue again) if the Match tab is on screen, else stops.
     if (!rankedWarned.has(`${id}:result`)) {
       rankedWarned.add(`${id}:result`)
       const me = (await serverCfg($)).handle ?? ''
       await ambient($, rankedResultLine(s, me), 'match', 10_000)
       const o = rankedOutcome(s, me)
       if (s.status !== 'void' && o !== 'draw') await ring($, o === 'won' ? 'win' : 'loss')
+      // W4b: the notices' result trigger, then placed, or tier up or down (before GET /me is read again below).
+      void noticeMatchEnd($, s, me).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
     }
     void refreshAccount($).then(() => refreshBoards($))
   }
   await refreshStatus($)
+  return r
 }
 
-/** The result in one line, from the approved results table (docs/copy.md). */
+/** The result in one line, from the approved results table (docs/copy.md). W6b: a challenge's says Unrated where the Elo change goes, never +0. */
 function rankedResultLine(s: ApiMatchSummary, me: string) {
   const mine = s.sides.find(x => x.player.handle === me) ?? s.sides[0]
   const delta = (mine.rating_after ?? mine.rating_before) - mine.rating_before
   if (s.status === 'void') return resultText('void', 'points', 0, 0)
   if (s.result === 'draw') return resultText('draw', 'points', 0, 0)
+  if (s.kind === 'challenge') return challengeResultText(s.winner === me ? 'won' : 'lost', s.result === 'forfeit' ? 'forfeit' : 'points', seedOf(s.id))
   return resultText(s.winner === me ? 'won' : 'lost', s.result === 'forfeit' ? 'forfeit' : 'points', delta, seedOf(s.id))
 }
 
+/** Queue, from the Queue buttons: the lengths the player picked (every one offered unless some were unticked). True once queued. */
 async function joinQueue($: $) {
-  const sh = await rankedShared($)
-  if (sh.lengths.length === 0) return
-  const r = await api($, 'POST', '/queue', { lengths: sh.lengths })
-  if (await refusedForUpdate($, r)) return
-  if (r.status !== 200) {
-    await update($, link, l => ({ ...l, note: errorOf(r.json)?.message ?? (r.status === 0 ? "Can't reach the server." : `The server answered ${r.status}.`) }))
-    return
-  }
-  await setRanked($, { phase: 'queued', matchId: null, since: await $.clock.now() })
-  startRankedPoll($)
-  await pollRanked($)
+  return queueWith($, { lengthsMin: (await rankedShared($)).lengthsMin })
 }
 
+/**
+ * Queue for `lengthsMin` (null is every length offered) within the lanes the
+ * server offers, posted in minutes in numeric order as `{ lengths_min }`: the
+ * Queue buttons, and the `queue` action (W4b's notices, `{ do: 'queue' }`).
+ * With no lanes cached the ranked loop reads them first, once, and the press
+ * waits for that read (and for one already in flight). The server keeps what it
+ * offers and answers what it queued; a refusal shows its message, and a press
+ * that queues nothing says why. With an offer out or a match on it does
+ * nothing; queued already, it posts the new lengths and keeps your place and
+ * your clock. The player's own length pick in the store is never changed here.
+ * Resolves true once queued.
+ *
+ * W3b, buckets: it queues in `bucket`, else the bucket the Match tab shows (or,
+ * queued already, the server's), and posts `{ lengths_min, bucket }`, the
+ * lengths held to that bucket's own too (`lengthsFor`). Between matches a
+ * bucket asked for that isn't on screen becomes the one on screen (the server
+ * answers with it anyway) and its lanes are read before the post; queued in
+ * another, the entry moves there with config's lengths for it, and its clock
+ * starts over, as the server's does. With no buckets in config (a server
+ * before W3a) it posts `{ lengths_min }` alone, as before. The server
+ * enforces a bucket's checklist: a 403 `verification_required` (or a 404
+ * `bucket_not_found`) shows the server's message and reads config again.
+ */
+export async function queueWith($: $, o: { lengthsMin: readonly number[] | null; bucket?: string | null }): Promise<boolean> {
+  // Ranked is paused for this player (queue.practice_only): the server would answer 403 ranked_paused.
+  const cf = await configOf($)
+  if (cf.practiceOnly) {
+    await update($, link, l => ({ ...l, note: MOD.rankedPaused }))
+    return false
+  }
+  // The ready check or the match is on screen: the server would answer 409 in_match.
+  const was = await rankedShared($)
+  const phase = was.phase
+  if (phase === 'offered' || phase === 'live') return false
+  const list = bucketsOf(cf)
+  const shown = pickBucket(list, was.bucket)?.id ?? null
+  // Queued already, the bucket is the server's (adopted from its answers).
+  const here = phase === 'queued' ? (was.bucket ?? shown) : shown
+  const target = bucketIdOf(o.bucket) ?? here
+  if (target !== here && phase !== 'queued') {
+    // Another bucket between matches: it's the one on screen now, and the lanes cached are the last one's.
+    await setRanked($, { bucket: target })
+    await update($, link, l => ({ ...l, lanes: null, lanesBucket: null }))
+  }
+  // The lanes cached are the bucket on screen's, or the queued one's: a queued entry moving to another bucket takes config's lengths for it alone.
+  // Lanes cached for any other bucket count as none read (lanesIn).
+  const lanesFit = target === here || phase !== 'queued'
+  if (lanesFit && !lanesIn(await read($, link), target)) {
+    // The ranked loop's next tick reads them; with a tick running, the one after it does, and the kick waits for it. No read at all is offline.
+    lanesMiss = MOD.noServer
+    lanesOnce = true
+    await pollRankedNow($)
+  }
+  const lanes = lanesFit ? lanesIn(await read($, link), target) : null
+  const laneMins = lanes ? lanes.map(x => x.length_min) : null
+  const def: Bucket | null = target ? (list.find(b => b.id === target) ?? null) : null
+  const lengths = def ? lengthsFor(def, o.lengthsMin, laneMins) : pickedLengths(o.lengthsMin, lanes)
+  if (lengths.length === 0) {
+    // Why nothing was queued: no lanes read (the read's own failure), none offered (in the bucket), none of the pick offered, or nothing ticked.
+    const offered = def ? lengthsFor(def, null, laneMins) : (laneMins ?? [])
+    const note = lanesFit && !lanes ? (lanesMiss ?? MOD.noLengths) : offered.length === 0 ? MOD.noLengths : o.lengthsMin?.length ? MOD.pickOff : MOD.tickOne
+    await update($, link, l => ({ ...l, note }))
+    return false
+  }
+  const r = await api($, 'POST', '/queue', target ? { lengths_min: lengths, bucket: target } : { lengths_min: lengths })
+  if (await refusedForUpdate($, r)) return false
+  if (r.status !== 200) {
+    // length_unavailable: what's offered moved since the lanes were read. Its `offered` trims the lanes now; the next lanes read fills them in.
+    const code = errorOf(r.json)?.code
+    const open = code === 'length_unavailable' ? minutesOf((r.json as { offered?: unknown }).offered) : null
+    await update($, link, l => ({ ...l, note: failLine(r), lanes: open && l.lanes ? l.lanes.filter(x => open.includes(x.length_min)) : l.lanes }))
+    // W3b: the held config said this bucket could be queued, and the server says no: its checklist changed, or it closed for you. Read config again.
+    if (code === 'verification_required' || code === 'bucket_not_found') void refreshConfig($, 'bucket').catch(() => null)
+    return false
+  }
+  const queued = minutesOf((r.json as { lengths_min?: unknown } | null)?.lengths_min)
+  const inBucket = bucketIdOf((r.json as { bucket?: unknown } | null)?.bucket) ?? target
+  await update($, link, l => ({ ...l, note: '' }))
+  // Queued already in this bucket (new lengths): the server keeps your place, so the clock keeps its start. Another bucket starts both over.
+  const sh = await rankedShared($)
+  const same = (sh.bucket ?? OPEN) === (inBucket ?? OPEN)
+  const since = sh.phase === 'queued' && sh.since > 0 && same ? sh.since : await $.clock.now()
+  await setRanked($, { phase: 'queued', matchId: null, since, queuedMin: queued.length ? queued : lengths, bucket: inBucket })
+  await pollRankedNow($)
+  return true
+}
+
+/**
+ * Leave the queue. A Leave the server didn't take (it wasn't reached, limited
+ * us or failed) keeps you in the queue with why (the queued view draws the
+ * note until the next queue poll answers): the queue poll goes on, so an offer
+ * still shows, and Leave can be pressed again.
+ */
 async function leaveQueue($: $) {
-  await api($, 'DELETE', '/queue')
+  const r = await api($, 'DELETE', '/queue')
+  if (retryable(r.status)) {
+    // Not reached: api() has set the offline line already.
+    if (reachedOf(r)) await update($, link, l => ({ ...l, note: failLine(r) }))
+    return
+  }
   await setRanked($, { phase: 'idle', matchId: null })
   await update($, link, l => ({ ...l, queue: null }))
   stopPolling()
+  await idlePoll($)
 }
 
-async function toggleLength($: $, h: 1 | 3) {
+/** A length's toggle under the queue bar: its minutes flip in the pick (every lane ticked is null, every length). */
+async function toggleLength($: $, min: number) {
   const sh = await rankedShared($)
-  const lengths = sh.lengths.includes(h) ? sh.lengths.filter(x => x !== h) : ([...sh.lengths, h].sort() as (1 | 3)[])
-  await setRanked($, { lengths })
+  // W3b: one pick serves every bucket, so with several a toggle counts every length any of them offers: unticking 1h in one never unticks 15m in another.
+  // The lanes are the bucket on screen's, the ones its toggles draw.
+  const list = bucketsOf(await configOf($))
+  const lanes = lanesIn(await read($, link), pickBucket(list, sh.bucket)?.id ?? null) ?? []
+  const others = bucketRowShown(list) ? list.flatMap(b => b.lengths.map(m => ({ length_min: m }))) : []
+  await setRanked($, { lengthsMin: toggledLengths(sh.lengthsMin, min, [...lanes, ...others]) })
   await update($, link, l => ({ ...l }))
+}
+
+/**
+ * A bucket row press on the Match tab (`bucket-<id>`, W3b), between matches: queue there from
+ * now on. Its lanes are read now (the last bucket's go at once, so none is drawn under the
+ * wrong row), and for a bucket besides Open, your rank and last matches there.
+ */
+async function chooseBucket($: $, id: string) {
+  const sh = await rankedShared($)
+  if (sh.phase !== 'idle' || !bucketIdOf(id)) return
+  // Already on screen (a pick config dropped reads as Open): the press is kept as the pick, with nothing to read again.
+  if ((await bucketOnScreen($, sh)) === id) {
+    if (sh.bucket !== id) await setRanked($, { bucket: id })
+    return
+  }
+  await setRanked($, { bucket: id })
+  await update($, link, l => ({ ...l, lanes: null, lanesBucket: null, note: '' }))
+  lanesOnce = true
+  await pollRankedNow($)
+  if (id !== OPEN) await refreshBucketBoards($, id, { profile: true })
+}
+
+/** A bucket row press on the Ranked or Grind tab (`board-<id>`, `board-grind-<id>`, W3b): that bucket's board, read now. Open's is read with the tab. */
+async function chooseBoard($: $, which: 'ranked' | 'grind', id: string) {
+  if (!bucketIdOf(id)) return
+  await update($, boardPick, p => (which === 'ranked' ? { ...p, ranked: id } : { ...p, grind: id }))
+  if (id !== OPEN) await refreshBucketBoards($, id, which === 'ranked' ? { profile: true, ladder: true } : { grind: true })
+}
+
+const BOARD0: BucketBoard = { ladder: null, rank: null, recent: null, grindRank: null, grindOf: null }
+
+/** When this session last read GET /me for a missing standing, and whether boot registered W3b's checks (standings, lanes) on the config tick. */
+let standingsReadAt = 0
+let bucketTicking = false
+
+/**
+ * After a config read (W3b), between matches with the Match tab on screen: config moved the
+ * bucket on screen (it dropped the one picked, so the pick reads as Open again), and the lanes
+ * cached are the old bucket's, which draw nothing now. The new one's are read at once rather
+ * than at the next lanes poll. Boot runs it from the config tick without awaiting it, since a
+ * read waits on the ranked loop.
+ */
+async function lanesTick($: $, cfg: ModConfig) {
+  const sh = await rankedShared($)
+  if (sh.phase !== 'idle' && sh.phase !== 'done') return
+  const l = await read($, link)
+  if (!l.lanes || lanesIn(l, pickBucket(bucketsOf(cfg), sh.bucket)?.id ?? null) || !(await lanesWatched($))) return
+  lanesOnce = true
+  await pollRankedNow($)
+}
+
+/**
+ * After a config read: config lists a bucket GET /me had no standing for (switched on for
+ * this player since the last read, say for the dark test, or opened to everyone after the
+ * freeze). Reads GET /me's standings again, at most once a minute, so the cards, the queued
+ * view and the ready check stand the player there without a restart. Boot runs it from the
+ * config tick without awaiting it, so a config read never waits on GET /me.
+ */
+async function standingsTick($: $, cfg: ModConfig) {
+  const list = bucketsOf(cfg)
+  if (!bucketRowShown(list) || !(await serverCfg($)).token) return
+  const l = await read($, link)
+  if (!l.me) return
+  const have = new Set((l.meBuckets ?? []).map(x => bucketIdOf((x as { bucket?: unknown } | null)?.bucket)))
+  if (list.every(b => have.has(b.id))) return
+  const t = await $.clock.now()
+  if (t - standingsReadAt < 60_000) return
+  standingsReadAt = t
+  const me = await api($, 'GET', '/me', undefined, { keepNote: true })
+  const kept = me.status === 200 ? (me.json as { buckets?: unknown } | null)?.buckets : undefined
+  if (Array.isArray(kept)) await update($, link, x => ({ ...x, meBuckets: kept.slice(0, 8) }))
+}
+
+/**
+ * A bucket's boards besides Open's (W3b), as the server sends them with `?bucket=`: your
+ * profile there (rank, last matches), its top 10, and its weekly Grind (your rank among the
+ * players who meet its requirements, and how many they are). Background reads, so a press's
+ * note stays. A 404 `bucket_not_found` means config is stale: it's read again.
+ */
+async function refreshBucketBoards($: $, id: string, what: { profile?: boolean; ladder?: boolean; grind?: boolean }) {
+  const cfg = await serverCfg($)
+  if (!cfg.token || id === OPEN || !bucketIdOf(id)) return
+  const q = `bucket=${encodeURIComponent(id)}`
+  const bg = { keepNote: true }
+  const prof = what.profile && cfg.handle ? await api($, 'GET', `/players/${encodeURIComponent(cfg.handle)}?${q}`, undefined, bg) : null
+  const board = what.ladder ? await api($, 'GET', `/boards/ranked?limit=10&${q}`, undefined, bg) : null
+  const week = what.grind ? await api($, 'GET', `/boards/grind?period=week&limit=100&${q}`, undefined, bg) : null
+  if ([prof, board, week].some(r => r?.status === 404 && errorOf(r.json)?.code === 'bucket_not_found')) void refreshConfig($, 'bucket').catch(() => null)
+  const pj = prof?.status === 200 ? (prof.json as { rank?: number | null; recent_matches?: ApiRecentMatch[] }) : null
+  const rows = week?.status === 200 ? (week.json as { items?: { rank: number; player?: { handle?: string } }[]; total?: number }) : null
+  await update($, link, l => {
+    const had = l.boards?.[id] ?? BOARD0
+    const next: BucketBoard = {
+      ladder: board?.status === 200 ? ((board.json as { items?: ApiRankedRow[] }).items ?? had.ladder) : had.ladder,
+      rank: pj ? (pj.rank ?? null) : had.rank,
+      recent: pj ? (pj.recent_matches ?? had.recent) : had.recent,
+      grindRank: rows ? ((rows.items ?? []).find(x => x.player?.handle === cfg.handle)?.rank ?? null) : had.grindRank,
+      grindOf: rows && typeof rows.total === 'number' ? rows.total : had.grindOf,
+    }
+    return { ...l, boards: { ...(l.boards ?? {}), [id]: next } }
+  })
 }
 
 async function acceptOffer($: $) {
@@ -2184,15 +4383,32 @@ async function acceptOffer($: $) {
     return
   }
   // The offer closed under us: the next poll says where we stand.
-  await pollRanked($)
+  await pollRankedNow($)
 }
 
+/**
+ * Decline the offer. A Decline the server didn't take (it wasn't reached,
+ * limited us or failed) keeps the ready check up with why, as Leave does: the
+ * offer is still out, so the lanes read would only bring it back, and Decline
+ * can be pressed again. The offer's own clock ends it either way.
+ */
 async function declineOffer($: $) {
   const sh = await rankedShared($)
-  if (sh.matchId) await api($, 'POST', `/matches/${sh.matchId}/decline`)
+  // W6b: a challenge's ready check declined cancels it (the sender's) or declines it (the taker's): the inbox is read again after.
+  const challenge = (await read($, link)).queue?.offer?.kind === 'challenge'
+  if (sh.matchId) {
+    const r = await api($, 'POST', `/matches/${sh.matchId}/decline`)
+    if (retryable(r.status)) {
+      // Not reached: api() has set the offline line already.
+      if (reachedOf(r)) await update($, link, l => ({ ...l, note: failLine(r) }))
+      return
+    }
+  }
   await setRanked($, { phase: 'idle', matchId: null })
   await update($, link, l => ({ ...l, queue: null }))
   stopPolling()
+  await idlePoll($)
+  if (challenge && (await challengesLive($))) await pollInboxNow($)
 }
 
 async function forfeitRanked($: $) {
@@ -2200,7 +4416,7 @@ async function forfeitRanked($: $) {
   const sh = await rankedShared($)
   if (!sh.matchId) return
   const r = await api($, 'POST', `/matches/${sh.matchId}/forfeit`)
-  if (r.status === 200) await pollMatch($, sh.matchId)
+  if (r.status === 200) await pollRankedNow($)
 }
 
 async function sendRankedChat($: $, text: string) {
@@ -2220,12 +4436,48 @@ async function sendRankedChat($: $, text: string) {
 async function clearRanked($: $) {
   await setRanked($, { phase: 'idle', matchId: null })
   await update($, link, l => ({ ...l, ranked: null }))
+  await idlePoll($)
 }
 
 // ------------------------------------------------------------------ boards and rooms
 
 let stopChatPoll: (() => void) | null = null
 let paneSeenAt = 0
+let roomsPolledAt = 0
+
+/** Every room there is: a room the server adds later is left out until a mod knows how to draw it. */
+const ROOMS: readonly ApiRoom[] = ['world', 'mud', 'iron', 'bronze', 'silver', 'gold', 'platinum', 'diamond', 'master']
+const TIERS: readonly string[] = ['Mud', 'Iron', 'Bronze', 'Silver', 'Gold', 'Platinum', 'Diamond', 'Master']
+
+/**
+ * A room switched off: by config (`chat.world` for World, `chat.tiers` for the
+ * tier rooms) or by the server's rooms list (`paused`). Nobody posts there, and
+ * the mod neither shows nor reads it.
+ */
+function roomOff(c: ModConfig, rooms: LinkState['rooms'], room: ApiRoom) {
+  return (room === 'world' ? !c.chat.world : !c.chat.tiers) || !!rooms?.some(x => x.room === room && x.paused === true)
+}
+
+/** The room the Chat tab shows: the one picked, else the first open one; null when every room you can post in is off. */
+function shownRoom(c: ModConfig, l: LinkState): ApiRoom | null {
+  const open = (r: ApiRoom) => !roomOff(c, l.rooms, r) && (l.rooms === null || l.rooms.some(x => x.room === r && x.can_post))
+  if (open(l.room)) return l.room
+  return (l.rooms ?? []).find(x => x.can_post && open(x.room))?.room ?? null
+}
+
+/** The rooms you can post in when nothing is paused: World, and your tier's room (Mud while placing). */
+function myRooms(l: LinkState): ApiRoom[] {
+  const tier = l.me ? (l.me.placement ? 'mud' : String(l.me.tier ?? '').toLowerCase()) : null
+  const room = ROOMS.find(r => r === tier)
+  return room ? ['world', room] : ['world']
+}
+
+/** A line the Chat tab can draw: a chat line with a player and a known tier, or a system line it has words for. Anything else is dropped. */
+function drawableLine(x: ApiLobbyItem) {
+  if (x.kind === 'chat') return !!x.player && typeof x.player.handle === 'string' && TIERS.includes(x.player.tier) && typeof x.text === 'string'
+  if (x.kind === 'system') return typeof x.event === 'string' && Object.hasOwn(SYSTEM_LINE, x.event) && typeof x.handle === 'string' && TIERS.includes(String(x.tier))
+  return false
+}
 
 /** The Ranked board's top 10, your rank, and the size of this week's Grind, for the Ranked and Grind tabs. */
 async function refreshBoards($: $) {
@@ -2242,6 +4494,19 @@ async function refreshBoards($: $) {
     grindOf: week.status === 200 ? (week.json as { total: number }).total : l.grindOf,
     recent: me.status === 200 ? ((me.json as { recent_matches?: ApiRecentMatch[] }).recent_matches ?? l.recent) : l.recent,
   }))
+  // W3b: the buckets besides Open on screen, read the same way: the Match tab's (your rank and last matches there; queued or after a match, the server's bucket), the Ranked tab's (and its top 10) and the Grind tab's.
+  const list = bucketsOf(await configOf($, cfg))
+  if (!bucketRowShown(list)) return
+  const sh = await rankedShared($)
+  const pick = await read($, boardPick)
+  const want = new Map<string, { profile?: boolean; ladder?: boolean; grind?: boolean }>()
+  const add = (id: string | null | undefined, w: { profile?: boolean; ladder?: boolean; grind?: boolean }) => {
+    if (id && id !== OPEN) want.set(id, { ...(want.get(id) ?? {}), ...w })
+  }
+  add(sh.phase === 'idle' ? pickBucket(list, sh.bucket)?.id : sh.bucket, { profile: true })
+  add(pickBucket(list, pick.ranked)?.id, { profile: true, ladder: true })
+  add(pickBucket(list, pick.grind)?.id, { grind: true })
+  for (const [id, w] of want) await refreshBucketBoards($, id, w)
 }
 
 /** Switches tabs, and starts or stops what the tab reads from the server. */
@@ -2249,22 +4514,43 @@ async function selectTab($: $, t: Tab) {
   if (t === 'ranked') roastIndex++
   await update($, tab, () => t)
   if (t === 'ranked' || t === 'grind') void refreshBoards($)
+  // W5b: the linked account and the new installs, while sign-in is on.
+  if (t === 'settings') void refreshIdentity($, IDENTITY_VISIT_MS).catch(() => null)
+  // Unlink's first press lasts only while Settings shows.
+  else if ((await read($, signinUi)).unlinkAsk) await update($, signinUi, u => ({ ...u, unlinkAsk: false }))
   if (t === 'chat') {
     paneSeenAt = await $.clock.now()
-    startChatPoll($)
-    await pollRooms($)
-    await pollRoom($)
+    // The rooms list and the room's lines now, on the chat loop's next tick.
+    roomsPolledAt = 0
+    await pollChatNow($)
   } else stopChatPolling()
+  if (t === 'match') await showLanes($)
+  // W10b: the Finishers view reads your picks and which colors you've unlocked (outside config's version) each time it opens.
+  if (t === 'finishers') void refreshFinishers($, false).catch(err => $.ui.log(`CCSR finishers: ${(err as Error).message}`))
+  // W10e: and the gallery's first page, while it is on for you.
+  if (t === 'finishers') void customOpened($).catch(err => $.ui.log(`CCSR finishers: ${(err as Error).message}`))
+}
+
+/**
+ * The Match tab came on screen. Between matches the ranked loop reads the lanes
+ * now, then every poll_ms.idle while the tab stays on screen; off it, the loop's
+ * next tick stops. In a match the loop is already polling.
+ */
+async function showLanes($: $) {
+  paneSeenAt = await $.clock.now()
+  const phase = (await rankedShared($)).phase
+  if ((phase === 'idle' || phase === 'done') && (await serverCfg($)).token) await pollRankedNow($)
 }
 
 function startChatPoll($: $) {
-  if (stopChatPoll) return
-  let n = 0
-  const timer = $.clock.every(2000, () => {
-    n++
-    void chatTick($, n % 5 === 0).catch(err => $.ui.log(`CCSR chat: ${(err as Error).message}`))
-  })
-  stopChatPoll = () => timer.cancel()
+  if (stopChatPoll && loops.has('chat')) return
+  stopChatPoll = loop($, 'chat', async () => (await configOf($)).poll.chat, isCurrent => chatTick($, isCurrent))
+}
+
+/** A chat poll now (after a press): the chat loop's next tick, started if it isn't running. Never a request beside it. */
+async function pollChatNow($: $) {
+  startChatPoll($)
+  await kickLoop($, 'chat')
 }
 
 function stopChatPolling() {
@@ -2272,62 +4558,1354 @@ function stopChatPolling() {
   stopChatPoll = null
 }
 
-/** Every 2 s while the Chat tab is on screen: the room's lines, and every 10 s the room list. Stops when the pane stops drawing. */
-async function chatTick($: $, rooms: boolean) {
+/**
+ * Each tick while the Chat tab is on screen: the room's lines, and the room
+ * list every max(10 s, the interval). Stops once the pane hasn't drawn for
+ * max(15 s, 2.5 x the interval), so a slow chat poll never outruns its own
+ * heartbeat.
+ */
+async function chatTick($: $, isCurrent: () => boolean): Promise<Answer | void> {
   const t = await $.clock.now()
-  if ((await read($, tab)) !== 'chat' || t - paneSeenAt > 15_000 || (await read($, settings)).surfaces.chat !== 'on') {
+  const every = (await configOf($)).poll.chat
+  if ((await read($, tab)) !== 'chat' || t - paneSeenAt > Math.max(15_000, 2.5 * every) || (await read($, settings)).surfaces.chat !== 'on') {
     stopChatPolling()
     return
   }
-  if (rooms) await pollRooms($)
-  await pollRoom($)
+  if (t - roomsPolledAt >= Math.max(10_000, every)) {
+    const rooms = await pollRooms($, isCurrent)
+    if (!isCurrent()) return rooms
+  }
+  return pollRoom($, isCurrent)
 }
 
-async function pollRooms($: $) {
+async function pollRooms($: $, isCurrent: () => boolean): Promise<Answer | void> {
   if (!(await serverCfg($)).token) return
+  roomsPolledAt = await $.clock.now()
   const r = await api($, 'GET', '/chat/rooms')
-  if (r.status !== 200) return
-  const rooms = (r.json as { rooms: NonNullable<LinkState['rooms']> }).rooms
+  // A late answer to a tick the loop gave up on: a newer list may be on screen already.
+  if (r.status !== 200 || !isCurrent()) return r
+  const all = (r.json as { rooms?: unknown } | null)?.rooms
+  const rooms = (Array.isArray(all) ? (all as NonNullable<LinkState['rooms']>) : []).filter(x => !!x && ROOMS.includes(x.room))
+  const c = await configOf($)
   await update($, link, l => {
-    // Your room follows your tier: if the room on screen closed to you, go back to World.
-    const room = rooms.some(x => x.room === l.room && x.can_post) ? l.room : 'world'
-    return { ...l, rooms, room }
+    // A room that paused (a raid, say): its lines and cursor go, so what was posted before the pause never shows again.
+    const lobby = l.lobby && rooms.some(x => x.room === l.lobby?.room && x.paused === true) ? null : l.lobby
+    const next = { ...l, rooms, lobby }
+    // Your room follows your tier: if the room on screen closed to you, go to one that's open.
+    return { ...next, room: shownRoom(c, next) ?? (rooms.some(x => x.room === l.room && x.can_post) ? l.room : 'world') }
   })
+  return r
 }
 
-async function pollRoom($: $) {
+/**
+ * The lines of the room on screen, from the cursor. A room switched off is
+ * never read. When the room's `epoch` changes, lines were removed (a raid
+ * cleaned up): what we hold is stale, so it's read again from 0. A server that
+ * sends no epoch reads as before.
+ */
+async function pollRoom($: $, isCurrent: () => boolean): Promise<Answer | void> {
   const cfg = await serverCfg($)
   if (!cfg.token) return
   const l = await read($, link)
-  const room = l.room
-  const cursor = l.lobby && l.lobby.room === room ? l.lobby.cursor : 0
-  const r = await api($, 'GET', `/chat/${room}/events?cursor=${cursor}`)
-  if (r.status !== 200) return
-  const page = r.json as { events: ApiLobbyItem[]; cursor: number }
+  const room = shownRoom(await configOf($, cfg), l)
+  if (!room) {
+    if (l.lobby) await update($, link, x => ({ ...x, lobby: null }))
+    return
+  }
+  if (room !== l.room) await update($, link, x => ({ ...x, room, lobby: x.lobby?.room === room ? x.lobby : null }))
+  const cur = l.lobby && l.lobby.room === room ? l.lobby : null
+  const r = await api($, 'GET', `/chat/${room}/events?cursor=${cur ? cur.cursor : 0}`)
+  if (r.status !== 200 || !isCurrent()) return r
+  const page = r.json as { events: ApiLobbyItem[]; cursor: number; epoch?: unknown }
+  const epoch = typeof page.epoch === 'number' && Number.isFinite(page.epoch) ? page.epoch : undefined
+  if (cur && cur.epoch !== undefined && epoch !== undefined && epoch !== cur.epoch) {
+    await update($, link, x => (x.lobby?.room === room ? { ...x, lobby: null } : x))
+    return pollRoom($, isCurrent)
+  }
   await update($, link, x => {
-    const have = x.lobby && x.lobby.room === room ? x.lobby.events : []
+    const was = x.lobby && x.lobby.room === room ? x.lobby : null
+    const have = was ? was.events : []
     const seen = new Set(have.map(e => e.seq))
-    return { ...x, lobby: { room, events: [...have, ...page.events.filter(e => !seen.has(e.seq))].slice(-200), cursor: page.cursor } }
+    const events = Array.isArray(page.events) ? page.events.filter(e => !!e && !seen.has(e.seq)) : []
+    return { ...x, lobby: { room, events: [...have, ...events].slice(-200), cursor: page.cursor, epoch: epoch ?? was?.epoch } }
   })
+  return r
 }
 
 async function setRoom($: $, room: ApiRoom) {
+  if (roomOff(await configOf($), (await read($, link)).rooms, room)) return
   await update($, link, l => ({ ...l, room, lobby: l.lobby?.room === room ? l.lobby : null }))
-  await pollRoom($)
+  await pollChatNow($)
 }
 
 async function postRoom($: $, text: string) {
   await update($, chatDraft, () => '')
   const msg = clean(text).trim().slice(0, 280)
-  const l = await read($, link)
-  if (!msg) return
-  const r = await api($, 'POST', `/chat/${l.room}`, { text: msg })
+  // The room on screen, after the switches: never one that's paused.
+  const room = shownRoom(await configOf($), await read($, link))
+  if (!msg || !room) return
+  const r = await api($, 'POST', `/chat/${room}`, { text: msg })
   if (r.status === 200) {
     const item = (r.json as { item: ApiLobbyItem }).item
     await update($, link, x => (x.lobby && x.lobby.room === item.room ? { ...x, lobby: { ...x.lobby, events: [...x.lobby.events.filter(e => e.seq !== item.seq), item] } } : x))
   } else {
     await update($, link, x => ({ ...x, note: errorOf(r.json)?.message ?? `The server answered ${r.status}.` }))
   }
+}
+
+// ------------------------------------------------------------------ challenges (W6b)
+// Challenge a handle, or anyone with the code (an open challenge), to a match on your own
+// projects at a length your bucket offers: played and scored like ranked, never rated, which the
+// server enforces (W6a, docs/api.md "Challenges"). Dark behind config's `challenges`, read only
+// through challengeCfg: while it reads off, nothing here draws, polls or asks the server anything,
+// and the same holds signed out and with the Challenges switch off.
+//
+// What lives where:
+//   - The inbox (GET /challenges?rev=) is read on loop() at poll_ms.inbox, once per machine per
+//     interval: the store's K.challenges keeps the last answer with when its read began
+//     (`polledAt`), keyed `<server url>|<handle>`, and a session whose turn it isn't takes that
+//     copy instead of asking (the build plan's "deduped across sessions through
+//     K.challenges.polledAt"). The incoming challenges already toasted ride in the same key, so
+//     each one toasts once per machine.
+//   - A challenge's message is player text: it is kept in `challengeMessages` (a module variable)
+//     and drawn as Text, through messageIn, only while the Chat switch is on. It never goes in
+//     $.state (`challengeUi` holds none), the ledger, a toast, the band or a command reply.
+//   - A taken challenge's ready check is a match offer, as a ranked one is. The taker's Accept is
+//     their ready: POST /challenges/:id/accept answers the offer, so their ready check shows at
+//     once. The sender learns of it from the inbox (one of theirs `accepted` with its match
+//     `offered`), and the ranked loop then reads GET /queue, which shows the ready check exactly
+//     as for ranked. Unrated wherever stakes would show.
+
+/** The inbox as the store keeps it: the last full answer (`body`, re-read on every take), its rev, when the read that brought it began, and the incoming challenges already toasted. */
+type ChallengeBox = { key: string; polledAt: number; rev: number | null; body: unknown; toasted: string[] }
+
+/**
+ * A session takes the store's copy only while that read began less than the interval ago, less
+ * this much: the session whose tick comes due reads, and a copy a moment short of due isn't
+ * held for a whole interval more.
+ */
+const INBOX_SLACK_MS = 2000
+/** How many challenges a side the box draws; the rest are counted. */
+const BOX_SHOWN = 5
+
+/** Each challenge's message as messageIn draws it, by code: never in $.state, which every plugin can read. */
+const challengeMessages = new Map<string, string>()
+/** The message typed in the form: the player's own words, kept out of $.state with the rest. */
+let challengeDraft = ''
+let stopInboxPoll: (() => void) | null = null
+/** The inbox loop's next tick asks the server whatever the store's copy says (a press just changed a challenge). */
+let inboxForce = false
+/** Whether boot registered challengesTick on the config tick. */
+let challengesTicking = false
+/**
+ * The `<server url>|<handle>` the box was filled for. Another one (W5b's sign-in switch, a link
+ * code, a recovery key, a server switch) empties the box before anything of the old account's
+ * draws or acts here: its cards' buttons would send with the new token.
+ */
+let challengeKey: string | null = null
+/** GET /me's `challenges_enabled` from this session's last read, and when it was asked, until adoptHeard can apply it (config must say challenges are on). */
+let challengesHeard: { key: string; on: boolean; at: number } | null = null
+/** The Challenges switch's last telling in this session: the next waits on it (tellChallenges). */
+let challengesTelling: Promise<unknown> = Promise.resolve()
+
+/**
+ * A Challenges switch press on this machine, by `<server url>|<handle>`: the value pressed, when,
+ * and when the server confirmed it (null while it hasn't: each config tick sends it again, and
+ * GET /me's value never overwrites it; nor does a GET /me asked before it was confirmed).
+ */
+type ChallengesPress = { key: string; on: boolean; at: number; told: number | null }
+
+/** The most times a paced challenge request goes: once, then again after each 429's wait. */
+const PACED_TRIES = 4
+
+/** What config's `challenges` turns on for this player (challengeCfg, W6a's rule); all off with no config. */
+function challengesOf(cf: Pick<ModConfig, 'raw'>): ChallengeCfg {
+  return challengeCfg(cf.raw.challenges)
+}
+
+/** Challenges are on here: config has them on for this player, this install is signed in with a token the server knows, and the Challenges switch is on. */
+async function challengesLive($: $): Promise<boolean> {
+  const cfg = await serverCfg($)
+  if (!cfg.token || (await read($, link)).unknownToken) return false
+  if (!challengesOf(await configOf($, cfg)).on) return false
+  return (await read($, settings)).surfaces.challenges !== 'off'
+}
+
+function startInboxPoll($: $) {
+  if (stopInboxPoll && loops.has('inbox')) return
+  stopInboxPoll = loop($, 'inbox', async () => (await configOf($)).poll.inbox, isCurrent => pollInbox($, isCurrent))
+}
+
+function stopInboxPolling() {
+  stopInboxPoll?.()
+  stopInboxPoll = null
+}
+
+/** An inbox read now, from the server (after a press that changed a challenge): the inbox loop's next tick. Never a request beside it. */
+async function pollInboxNow($: $) {
+  inboxForce = true
+  startInboxPoll($)
+  await kickLoop($, 'inbox')
+}
+
+/** How long a 429 asked a paced challenge request to wait: the server's word, held to 0.25 to 2 s (W6a's windows are a second). */
+function pacedWaitMs(r: { retryAfterMs: number | null }) {
+  return Math.min(2000, Math.max(250, r.retryAfterMs ?? 1000))
+}
+
+/**
+ * A challenge request W6a's per-player limits may refuse for a moment (the inbox 1 read a
+ * second; takes and declines 2 a second together): a 429 waits what the server asked and goes
+ * again, a few times at most, so a burst of declines (the switch going off withdraws up to five)
+ * or two presses close together all land.
+ */
+async function paced($: $, method: string, path: string, body?: unknown) {
+  let r = await api($, method, path, body)
+  for (let i = 1; i < PACED_TRIES && r.status === 429; i++) {
+    await waitMs($, pacedWaitMs(r))
+    r = await api($, method, path, body)
+  }
+  return r
+}
+
+/**
+ * One tick of the inbox loop. While a ready check or a match is on, nothing in the inbox can be
+ * taken, so it asks nothing. Otherwise: the store's copy when another session on this machine
+ * read it within the interval, else GET /challenges with the rev held (an unchanged answer keeps
+ * the copy). Only the loop calls it.
+ */
+async function pollInbox($: $, isCurrent: () => boolean): Promise<Answer | void> {
+  if (!(await challengesLive($))) {
+    stopInboxPolling()
+    await clearChallenges($)
+    return
+  }
+  const phase = (await rankedShared($)).phase
+  if (phase === 'offered' || phase === 'live') return
+  const key = await configKey($)
+  const t = await $.clock.now()
+  const every = (await configOf($)).poll.inbox
+  const stored = await storeGet<ChallengeBox | null>($, K.challenges, null)
+  const mine = stored && stored.key === key ? stored : null
+  if (!inboxForce && mine && mine.body !== null && t - mine.polledAt < every - INBOX_SLACK_MS) {
+    await takeInbox($, mine)
+    return { status: 200 }
+  }
+  const forced = inboxForce
+  inboxForce = false
+  // This session's turn: claimed before asking, so the machine's other sessions take the copy instead.
+  await save($, K.challenges, { key, rev: null, body: null, toasted: [], ...(mine ?? {}), polledAt: t })
+  const path = mine && mine.rev !== null && mine.body !== null ? `/challenges?rev=${mine.rev}` : '/challenges'
+  let r = await api($, 'GET', path, undefined, { keepNote: true })
+  // A press's read that W6a's limit refused (1 a second: two presses close together) goes again
+  // once the second is up, so a card just declined doesn't stay drawn for a backoff.
+  if (forced && r.status === 429 && isCurrent()) {
+    await waitMs($, pacedWaitMs(r))
+    if (isCurrent()) r = await api($, 'GET', path, undefined, { keepNote: true })
+  }
+  // A late answer to a request the loop gave up on changes nothing, and neither does one for the
+  // handle or server this install held when it asked (a switch since: that one's read follows).
+  if (!isCurrent() || (await configKey($)) !== key) return r
+  if (r.status === 403 && errorOf(r.json)?.code === 'challenges_off') {
+    // The held config says on and the server says off: config is stale.
+    void refreshConfig($, 'bucket').catch(() => null)
+    return r
+  }
+  if (r.status !== 200) return r
+  const inbox = readInbox(r.json)
+  if (!inbox) return r
+  const now2 = await storeGet<ChallengeBox | null>($, K.challenges, null)
+  const base: ChallengeBox = now2 && now2.key === key ? now2 : { key, polledAt: t, rev: null, body: null, toasted: [] }
+  const next: ChallengeBox = inbox.unchanged && base.body !== null ? { ...base, polledAt: t } : inbox.unchanged ? base : { ...base, polledAt: t, rev: inbox.rev, body: r.json }
+  await save($, K.challenges, next)
+  await takeInbox($, next)
+  return r
+}
+
+/**
+ * The inbox from a stored answer, into this session: the box (`challengeUi`, no messages), the
+ * messages (`challengeMessages`), the toasts for incoming challenges not yet toasted on this
+ * machine, and the sender's ready check for one of theirs that was just taken.
+ */
+async function takeInbox($: $, box: ChallengeBox) {
+  // Only the account this install holds now ever draws: a box filled for another empties first.
+  const key = await configKey($)
+  if (box.key !== key) return
+  if (challengeKey !== key) {
+    if (challengeKey !== null) await clearChallenges($)
+    challengeKey = key
+  }
+  const inbox = readInbox(box.body)
+  if (!inbox || inbox.unchanged) return
+  const incoming = inbox.incoming.map(x => x.challenge)
+  const outgoing = inbox.outgoing.map(x => x.challenge)
+  const code = (await read($, challengeUi)).code
+  const wordsMoved = keepMessages([...inbox.incoming, ...inbox.outgoing], code?.code ?? null)
+  const ui = await read($, challengeUi)
+  if (wordsMoved || JSON.stringify(ui.incoming) !== JSON.stringify(incoming) || JSON.stringify(ui.outgoing) !== JSON.stringify(outgoing)) {
+    await update($, challengeUi, u => ({ ...u, rev: u.rev + 1, incoming, outgoing, muteAsk: incoming.some(x => x.id === u.muteAsk) ? u.muteAsk : null, reportAsk: incoming.some(x => x.id === u.reportAsk) ? u.reportAsk : null }))
+  }
+  await toastIncoming($, box.key, incoming)
+  await followTaken($, outgoing)
+}
+
+/**
+ * The messages to draw, by code: the ones these reads carry (and the code box's, which a lookup
+ * keeps); every other is dropped. True when any changed, so the box redraws.
+ */
+function keepMessages(reads: readonly ChallengeRead[], codeId: string | null) {
+  const next = new Map<string, string>()
+  for (const x of reads) if (x.message !== null) next.set(x.challenge.id, x.message)
+  if (codeId !== null && challengeMessages.has(codeId) && !next.has(codeId)) next.set(codeId, challengeMessages.get(codeId)!)
+  const moved = next.size !== challengeMessages.size || [...next].some(([id, m]) => challengeMessages.get(id) !== m)
+  if (moved) {
+    challengeMessages.clear()
+    for (const [id, m] of next) challengeMessages.set(id, m)
+  }
+  return moved
+}
+
+/** One toast per incoming challenge, per machine: the store says which were toasted, read again right before it's written. Never a message in it. */
+async function toastIncoming($: $, key: string, incoming: readonly Challenge[]) {
+  const box = await storeGet<ChallengeBox | null>($, K.challenges, null)
+  if (!box || box.key !== key) return
+  const todo = incoming.filter(c => c.status === 'pending' && !box.toasted.includes(c.id))
+  if (todo.length === 0) return
+  await save($, K.challenges, { ...box, toasted: [...box.toasted, ...todo.map(c => c.id)].slice(-60) })
+  for (const c of todo.slice(0, 3)) await ambient($, CHALLENGE.toastIncoming(c.from.handle, c.label), 'match', 8000)
+}
+
+/**
+ * One of yours was just taken (`accepted`, its match `offered`) while you're between matches: the
+ * ranked loop reads GET /queue once, which brings the ready check, its toast and its chime as for
+ * ranked. Never awaited from the inbox's tick: the ranked loop has its own single flight.
+ */
+async function followTaken($: $, outgoing: readonly Challenge[]) {
+  if (!outgoing.some(c => c.status === 'accepted' && c.match?.status === 'offered')) return
+  const phase = (await rankedShared($)).phase
+  if (phase !== 'idle' && phase !== 'done') return
+  lanesOnce = true
+  void pollRankedNow($).catch(err => $.ui.log(`CCSR challenges: ${(err as Error).message}`))
+}
+
+/** The challenge the band offers between matches: the newest one to you still pending and in time, while challenges are on here. */
+async function bandChallenge($: $) {
+  if (!(await boxIsMine($))) return null
+  const t = (await read($, now)) || (await $.clock.now())
+  return ((await read($, challengeUi)).incoming ?? []).find(x => x.status === 'pending' && x.expiresAt > t) ?? null
+}
+
+/** Challenges are on here and the box holds nothing of another account's (a switch the config tick hasn't caught up with yet draws nothing). */
+async function boxIsMine($: $) {
+  if (!(await challengesLive($))) return false
+  return challengeKey === null || challengeKey === (await configKey($))
+}
+
+/**
+ * Challenges went off here (config, a sign-out, the switch), or the box was filled for another
+ * handle or server: the box empties and every message held goes, and so does the store's copy of
+ * an inbox this install can't read now (other players' words, which the server itself keeps a
+ * week at most after a challenge ends).
+ */
+async function clearChallenges($: $) {
+  challengeMessages.clear()
+  challengeDraft = ''
+  challengeKey = null
+  const ui = await read($, challengeUi)
+  if (ui.incoming !== null || ui.outgoing !== null || ui.form || ui.code || ui.note || ui.muteAsk || ui.reportAsk) await update($, challengeUi, u => ({ ...CHALLENGE_UI0, rev: u.rev + 1 }))
+  const kept = await storeGet<ChallengeBox | null>($, K.challenges, null)
+  if (kept && (kept.key !== (await configKey($)) || !(await challengesLive($)))) await $.store.delete(K.challenges)
+}
+
+/**
+ * After every config read (boot registers it, never awaited), a sign-in or sign-out, and the
+ * Challenges switch: the inbox loop runs while challenges are on here, read at once when it
+ * starts (a fresh copy another session kept counts as that read, unless `fresh`: the switch
+ * coming back on, when what the copy says may have changed meanwhile), and stops (the box
+ * emptied) when they go off. A box filled for another handle or server empties at once, and this
+ * one's inbox is read from the server. GET /me's switch waiting on config is adopted first.
+ */
+async function challengesTick($: $, fresh = false) {
+  await adoptHeard($)
+  if (await challengesLive($)) {
+    const key = await configKey($)
+    const moved = challengeKey !== null && challengeKey !== key
+    if (moved) {
+      await clearChallenges($)
+      // Redrawn even when it held nothing: the box was hidden while its key was another's.
+      await update($, challengeUi, u => ({ ...u, rev: u.rev + 1 }))
+    }
+    challengeKey = key
+    if (stopInboxPoll && loops.has('inbox') && !moved) return
+    if (fresh || moved) inboxForce = true
+    startInboxPoll($)
+    await kickLoop($, 'inbox')
+    return
+  }
+  stopInboxPolling()
+  await clearChallenges($)
+}
+
+/** The box's note: what a press did, or the server's line for why not. */
+async function challengeNote($: $, text: string) {
+  await update($, challengeUi, u => ({ ...u, note: text }))
+}
+
+/** A refused challenge request: the server's line in the box's note; config read again when it says config is stale. */
+async function challengeRefused($: $, r: { status: number; json: unknown }) {
+  if (r.status === 426) await refusedForUpdate($, r)
+  const code = errorOf(r.json)?.code
+  if (code === 'verification_required' || code === 'bucket_not_found' || code === 'challenges_off' || code === 'challenges_paused' || code === 'ranked_paused') void refreshConfig($, 'bucket').catch(() => null)
+  await challengeNote($, failLine(r))
+}
+
+/**
+ * The buckets a challenge can be sent in (the ones the player can queue: W3a's `can_queue`, so a
+ * bucket whose checklist isn't met isn't offered), the form's bucket (its pick, else the Match
+ * tab's, else Open), the lengths that bucket offers (W3b's `lengthsFor`: config's, less any the
+ * lanes say the server no longer offers this player, which POST /challenges would refuse with
+ * 422 length_unavailable), and the length picked: the form's when offered, else the one nearest
+ * it (1h when none was asked).
+ */
+function challengePick(cf: ModConfig, l: LinkState, sh: RankedShared, form: NonNullable<ChallengeUi['form']>) {
+  const usable = bucketsOf(cf).filter(b => b.canQueue)
+  const b = pickBucket(usable, form.bucket ?? sh.bucket)
+  const lanes = lanesIn(l, b?.id ?? null)
+  const lengths = lengthsFor(b, null, lanes ? lanes.map(x => x.length_min) : null)
+  const want = form.lengthMin ?? 60
+  const lengthMin = lengths.includes(want) ? want : lengths.reduce<number | null>((best, m) => (best === null || Math.abs(m - want) < Math.abs(best - want) ? m : best), null)
+  return { usable, bucket: b?.id ?? null, lengths, lanes, lengthMin }
+}
+
+/** The box sits between matches: while queued, in a ready check or in a match it isn't drawn, so nothing in it can open. */
+function boxHidden(sh: Pick<RankedShared, 'phase'>) {
+  return sh.phase === 'queued' || sh.phase === 'offered' || sh.phase === 'live'
+}
+
+/**
+ * Fills the challenge form, for `handle` (or one to type) at `lengthMin` (or the length offered
+ * nearest it). A finished match on screen is put away first, since the form sits between
+ * matches. False, and nothing changed, while challenges aren't on here, sending is paused for
+ * this player or ranked is (W6a refuses both), or the box isn't drawn (queued, a ready check, a
+ * match).
+ */
+async function fillChallengeForm($: $, handle?: string | null, lengthMin?: number | null) {
+  const cf = await configOf($)
+  const c = challengesOf(cf)
+  if (!c.send || cf.practiceOnly || !(await challengesLive($))) return false
+  const sh = await rankedShared($)
+  if (boxHidden(sh)) return false
+  const h = typeof handle === 'string' && /^[a-z0-9_]{2,20}$/.test(handle) ? handle : ''
+  const m = typeof lengthMin === 'number' && Number.isInteger(lengthMin) ? lengthMin : null
+  if (sh.phase === 'done') await clearRanked($)
+  challengeDraft = ''
+  const form: NonNullable<ChallengeUi['form']> = { kind: 'handle', handle: h, lengthMin: m, bucket: null }
+  await update($, challengeUi, u => ({ ...u, form, code: null, note: '' }))
+  return true
+}
+
+/**
+ * Opens the challenge form on the Match tab (fillChallengeForm, then the pane): the Rematch
+ * button, and W4b's `challenge` action (`{ do: 'challenge', handle?, length_min? }`). True once
+ * the form is on screen. False when nothing opened: challenges off here, sending or ranked paused,
+ * queued, in a ready check or in a match (the form waits for none of these), or a pane the engine
+ * keeps waiting (the form shows once it's placed).
+ */
+export async function openChallengeForm($: $, handle?: string | null, lengthMin?: number | null) {
+  if (!(await fillChallengeForm($, handle, lengthMin))) return false
+  return (await openPane($, 'match')).isPlaced
+}
+
+/** The form's Challenge a handle and Open challenge buttons: a fresh form of that kind. */
+async function startChallengeForm($: $, kind: 'handle' | 'open') {
+  challengeDraft = ''
+  await update($, challengeUi, u => ({ ...u, form: { kind, handle: '', lengthMin: null, bucket: null }, code: null, note: '' }))
+}
+
+/** A pick in the form (the handle typed, a length, a bucket), or null to close it. */
+async function pickChallenge($: $, patch: { handle?: string; lengthMin?: number; bucket?: string } | null) {
+  if (patch === null) challengeDraft = ''
+  await update($, challengeUi, u => (patch === null ? { ...u, form: null, note: '' } : u.form ? { ...u, form: { ...u.form, ...patch } } : u))
+}
+
+/**
+ * Sends the form's challenge: to its handle, or open, at its length and in its bucket, with the
+ * message typed (checked as the server will: refused, never cut). A refusal's line lands in the
+ * note; once sent the form closes and the inbox is read again.
+ */
+async function sendChallenge($: $) {
+  const ui = await read($, challengeUi)
+  const form = ui.form
+  if (!form || !(await challengesLive($))) return
+  const cf = await configOf($)
+  const c = challengesOf(cf)
+  if (!c.send || (form.kind === 'open' && !c.open)) return
+  const handle = form.kind === 'handle' ? form.handle.trim().toLowerCase() : null
+  if (handle !== null) {
+    if (!handle) return challengeNote($, CHALLENGE.pickHandle)
+    const bad = handleProblem(handle)
+    if (bad) return challengeNote($, bad)
+  }
+  const pick = challengePick(cf, await read($, link), await rankedShared($), form)
+  if (pick.lengthMin === null) return challengeNote($, CHALLENGE.noLength)
+  const msg = messageOut(challengeDraft, c)
+  if ('problem' in msg) return challengeNote($, msg.problem === 'off' ? CHALLENGE.messageOff : CHALLENGE.messageLong(c.message_max))
+  const body: Record<string, unknown> = { length_min: pick.lengthMin }
+  if (handle !== null) body.to = handle
+  if (pick.bucket !== null) body.bucket = pick.bucket
+  if (msg.message !== null) body.message = msg.message
+  const r = await api($, 'POST', '/challenges', body)
+  if (r.status !== 201) return challengeRefused($, r)
+  const made = readChallenge((r.json as { challenge?: unknown } | null)?.challenge)
+  challengeDraft = ''
+  await update($, challengeUi, u => ({ ...u, form: null, note: made && made.challenge.to === null ? CHALLENGE.openSent : CHALLENGE.sent(made?.challenge.to?.handle ?? handle ?? '') }))
+  await pollInboxNow($)
+}
+
+/**
+ * Takes a challenge: from its card, the band or the code box (`via`, for the server's numbers).
+ * The taker's Accept is their ready: the answer carries the offer, so the ready check (waiting on
+ * the sender) shows at once, and the ranked loop follows it to the match. A refusal's line lands
+ * in the note, and the inbox is read again, since the challenge may have closed. From the band,
+ * where the note isn't drawn, the line is also a toast (a press's reply, so it always shows).
+ */
+async function takeChallenge($: $, id: string, via: 'card' | 'band' | 'code') {
+  if (!CODE.test(id) || !(await challengesLive($))) return
+  const phase = (await rankedShared($)).phase
+  if (phase === 'offered' || phase === 'live') return
+  const r = await paced($, 'POST', `/challenges/${id}/accept`, { via })
+  const offer = r.status === 200 ? (r.json as { offer?: ApiOffer } | null)?.offer : undefined
+  if (!offer || typeof offer.match_id !== 'string') {
+    if (r.status === 200) await pollRankedNow($)
+    else {
+      await challengeRefused($, r)
+      if (via === 'band') $.ui.toast(failLine(r), { timeoutMs: 8000 })
+    }
+    return pollInboxNow($)
+  }
+  const bucket = bucketIdOf(offer.bucket)
+  await setRanked($, { phase: 'offered', matchId: offer.match_id, ...(bucket ? { bucket } : {}) })
+  const queue: ApiQueueState = { status: 'offered', offer, wait_ms: null, range: null, widening: null, cancelled: null, ...(bucket ? { bucket } : {}) }
+  await update($, link, l => ({ ...l, queue }))
+  await update($, challengeUi, u => ({ ...u, note: '', code: null, form: null, muteAsk: null, reportAsk: null }))
+  await refreshStatus($)
+  await pollRankedNow($)
+}
+
+/** Declines a challenge to you, or withdraws one of yours (the server tells them apart), then reads the inbox again. */
+async function dropChallenge($: $, id: string) {
+  if (!CODE.test(id) || !(await challengesLive($))) return
+  const r = await paced($, 'POST', `/challenges/${id}/decline`)
+  if (r.status >= 200 && r.status < 300) await update($, challengeUi, u => ({ ...u, note: '', muteAsk: null, reportAsk: null }))
+  else await challengeNote($, failLine(r))
+  await pollInboxNow($)
+}
+
+/** Report on a card: the first press asks why (Spam, Abuse, Other), null puts the question away. */
+async function askReport($: $, id: string | null) {
+  await update($, challengeUi, u => ({ ...u, reportAsk: id, muteAsk: null }))
+}
+
+/** Reports a challenge to you (which also declines it, on the server), then reads the inbox again. */
+async function reportOne($: $, id: string, reason: 'spam' | 'abuse' | 'other') {
+  if (!CODE.test(id) || !(await challengesLive($))) return
+  const r = await api($, 'POST', `/challenges/${id}/report`, { reason })
+  await update($, challengeUi, u => ({ ...u, reportAsk: null, note: r.status >= 200 && r.status < 300 ? CHALLENGE.reported : failLine(r) }))
+  await pollInboxNow($)
+}
+
+/** Mute on a card: the first press says what it does, the second mutes the sender (their challenges and chat stop showing), then the inbox is read again. */
+async function muteSender($: $, id: string) {
+  const ui = await read($, challengeUi)
+  const c = (ui.incoming ?? []).find(x => x.id === id)
+  if (!c || !(await challengesLive($))) return
+  if (ui.muteAsk !== id) return update($, challengeUi, u => ({ ...u, muteAsk: id, reportAsk: null, note: CHALLENGE.muteAsk(c.from.handle) }))
+  const r = await api($, 'POST', `/players/${encodeURIComponent(c.from.handle)}/mute`)
+  await update($, challengeUi, u => ({ ...u, muteAsk: null, note: r.status >= 200 && r.status < 300 ? CHALLENGE.muted(c.from.handle) : failLine(r) }))
+  await pollInboxNow($)
+}
+
+/**
+ * A code or its link typed into the code box, or given to `/ccsr challenge`: read as the server
+ * writes codes (challengeCode: a code in any case, or its ccsr.gg link, else nothing), then
+ * GET /challenges/:code, whose answer draws below the box with Accept when it can be taken.
+ */
+async function lookUpCode($: $, input: string) {
+  if (!(await challengesLive($))) return
+  const code = challengeCode(input)
+  if (!code) return update($, challengeUi, u => ({ ...u, code: null, note: CHALLENGE.notACode }))
+  await update($, challengeUi, u => ({ ...u, code: { code, challenge: null, problem: '' }, form: null, note: '' }))
+  const r = await api($, 'GET', `/challenges/${code}`)
+  const got = r.status === 200 ? readChallenge((r.json as { challenge?: unknown } | null)?.challenge) : null
+  if (got?.message) challengeMessages.set(code, got.message)
+  else challengeMessages.delete(code)
+  const problem = got ? '' : r.status === 200 ? CHALLENGE.notACode : failLine(r)
+  await update($, challengeUi, u => (u.code?.code === code ? { ...u, rev: u.rev + 1, code: { code, challenge: got?.challenge ?? null, problem } } : u))
+}
+
+/** Puts the code box's challenge away (its message too, unless the inbox holds the same challenge). */
+async function closeCode($: $) {
+  const ui = await read($, challengeUi)
+  const code = ui.code?.code
+  if (code && ![...(ui.incoming ?? []), ...(ui.outgoing ?? [])].some(x => x.id === code)) challengeMessages.delete(code)
+  await update($, challengeUi, u => ({ ...u, code: null, rev: u.rev + 1 }))
+}
+
+/** Copy link on one of yours: its ccsr.gg page, which installs the mod and takes it (W6c). */
+async function copyChallengeLink($: $, id: string, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') {
+  const href = challengeHref(id)
+  if (!href) return
+  const c = await $.ui.copy({ text: href, surface }).catch(() => ({ isCopied: false }))
+  await challengeNote($, c.isCopied ? CHALLENGE.copied : href)
+}
+
+/**
+ * The Challenges switch, to the server (`PATCH /me { challenges_enabled }`), only while config has
+ * challenges on, for a press on this machine the server hasn't confirmed (K.challengesPress). Off:
+ * the server declines what's waiting and turns new ones away, and the mod withdraws the player's
+ * own pending ones first, paced under W6a's limits. Until the server has the switch and none of
+ * theirs is left open, the press stays unconfirmed and each config tick sends it again; a press
+ * (`pressed`) that leaves any open says so in a toast. One at a time in a session, in order, so
+ * Off then On fast lands as On.
+ */
+async function tellChallenges($: $, pressed = false) {
+  const run = challengesTelling.then(() => Promise.race([tellChallengesOnce($, pressed), waitMs($, 60_000)]))
+  // A request that never answers ($.http.fetch has no timeout) holds the next press a minute at most.
+  challengesTelling = run.catch(() => undefined)
+  return run
+}
+
+async function tellChallengesOnce($: $, pressed: boolean) {
+  const cfg = await serverCfg($)
+  if (!cfg.token || !challengesOf(await configOf($, cfg)).on) return
+  const press = await storeGet<ChallengesPress | null>($, K.challengesPress, null)
+  if (!press || press.key !== keyOf(cfg) || press.told !== null) return
+  const left = press.on ? 0 : await withdrawOutgoing($)
+  const r = await api($, 'PATCH', '/me', { challenges_enabled: press.on })
+  // Not reached, or limited: the next config tick sends it again.
+  if (retryable(r.status)) return
+  if (r.status === 200) await update($, link, l => ({ ...l, me: (r.json as { player: ApiPlayer }).player }))
+  // Some of yours still open (the server already turns new ones away): withdrawn again on the next config tick.
+  if (r.status === 200 && left !== 0) {
+    if (pressed) $.ui.toast(CHALLENGE.withdrawLeft, { timeoutMs: 8000 })
+    return
+  }
+  // Told, or refused for good (GET /me's value then wins). A press made meanwhile stays to be told.
+  const cur = await storeGet<ChallengesPress | null>($, K.challengesPress, null)
+  if (cur && cur.key === press.key && cur.at === press.at) await save($, K.challengesPress, { ...cur, told: await $.clock.now() })
+}
+
+/**
+ * Every pending challenge of yours, withdrawn (the Challenges switch going off): at most the five
+ * the server lets you have out, each request paced under W6a's limits (one inbox read a second,
+ * two declines). How many are still out: 0 when every one went (one taken, withdrawn or ended
+ * meanwhile is closed, not out), null when the inbox couldn't be read.
+ */
+async function withdrawOutgoing($: $): Promise<number | null> {
+  const r = await paced($, 'GET', '/challenges')
+  const inbox = r.status === 200 ? readInbox(r.json) : null
+  if (!inbox || inbox.unchanged) return null
+  let left = 0
+  for (const x of inbox.outgoing) {
+    if (x.challenge.status !== 'pending') continue
+    const d = await paced($, 'POST', `/challenges/${x.challenge.id}/decline`)
+    if (!(d.status >= 200 && d.status < 300) && !(d.status === 409 && errorOf(d.json)?.code === 'challenge_closed')) left++
+  }
+  return left
+}
+
+/**
+ * GET /me answered (`askedAt`: when it was asked): its `challenges_enabled`, the account's own
+ * switch, becomes this install's (adoptHeard), so challenges turned off on one machine show off
+ * on the others too.
+ */
+async function heardChallenges($: $, player: unknown, askedAt: number) {
+  const on = (player as { challenges_enabled?: unknown } | null)?.challenges_enabled
+  if (typeof on !== 'boolean') return
+  challengesHeard = { key: await configKey($), on, at: askedAt }
+  await adoptHeard($)
+}
+
+/**
+ * The switch GET /me last said, into the local Challenges switch, once config has challenges on
+ * for this player (dark, nothing about challenges changes; until then it waits). Never over a
+ * press on this machine the server hasn't confirmed, nor from a read asked before the last press
+ * here was confirmed. The inbox then starts (read afresh) or stops with it.
+ */
+async function adoptHeard($: $) {
+  const heard = challengesHeard
+  if (!heard) return
+  const cfg = await serverCfg($)
+  if (heard.key !== keyOf(cfg)) {
+    challengesHeard = null
+    return
+  }
+  if (!cfg.token || !challengesOf(await configOf($, cfg)).on) return
+  challengesHeard = null
+  const press = await storeGet<ChallengesPress | null>($, K.challengesPress, null)
+  if (press && press.key === heard.key && (press.told === null || heard.at < press.told)) return
+  if (((await read($, settings)).surfaces.challenges !== 'off') === heard.on) return
+  await saveSettings($, { surfaces: { challenges: heard.on ? 'on' : 'off' } })
+  await challengesTick($, true)
+}
+
+// ------------------------------------------------------------------ notices (W4b)
+// The server's notices (config's `notices`, and a live match's feed), drawn by the fixed
+// vocabulary in mod/hooks/notices.ts, which makes every decision: what parses, where each may
+// draw under the player's switches and the Notices setting, caps, triggers, the critical
+// fallback to the Match tab, claims across sessions and the stats. This file draws the slots
+// (the top of each tab, the queue and result screens, the band, the World room, a live match's
+// feed), shows the toasts and status flashes, fires the 12 triggers, keeps the ledgers in the
+// store, runs each button (runAction) and posts the counts.
+//
+// Notice text is server text: it draws in the pane, the band, a toast or the status line, never
+// in a command reply, $.prompt or $.session.append, so it never reaches Claude. Titles and lines
+// draw as Text; only a card's body draws through Markdown, which notices.ts has held to bold,
+// italics, code and canonical https links on ccsr.gg and github.com.
+
+/** This session's ledger: showings, cards drawn, dismissals, snoozes, notices a button opened. */
+let noticeSession: SessionLedger = SESSION0
+/**
+ * The moments this session saw that fire triggers, with when, and when the arming each one
+ * stands for began (`start`: the moment itself, or for update_available its release's first
+ * naming, releaseArmed). Armed notices are worked out from these each time (armedNow), so a
+ * notice config brings after the moment is armed by it too. Kept an hour (the longest for_s).
+ */
+let noticeMoments: { e: NoticeEvent; at: number; start: number }[] = []
+/**
+ * update_available's arming in this session (notices.ts's releaseArming): the newest release
+ * named above this mod and when it was first named. However far apart the answers naming it
+ * come, it stays one arming; only a newer release begins another.
+ */
+let releaseArmed: ReleaseArming | null = null
+/** Each queue this session saw, by its `since`: when it was last seen queued and for which lengths (the queued trigger). */
+const queuedSeen = new Map<number, { at: number; lengthsMin: number[] }>()
+let noticeToastAt = 0
+/** A notice's status flash: its text on the full and the short line, until when. */
+let noticeFlash: { full: string; short: string; until: number } | null = null
+/** The notice a `{ do: 'notice' }` button opened last, and where: it takes that slot ahead of the rest until it's closed. */
+let noticeOpened: { id: string; place: Place } | null = null
+/** Where this session started drawing, for a toast's or a flash's surfaces before the pane draws. */
+let sessionSurface: string | null = null
+/** When the pane last drew, for pane_open (a draw after PANE_GAP_MS without one). */
+let paneDrawnAt = 0
+const PANE_GAP_MS = 60_000
+/** Config's notices, parsed once per config read: the list, and the read it came from. */
+let noticesMemo: { key: string; list: Notice[] } = { key: '', list: [] }
+/** Every store write the notices make runs in order, each on a fresh read (another session may have written meanwhile). */
+let noticeWrites: Promise<unknown> = Promise.resolve()
+let noticeAlerting = false
+let noticeAlertAgain = false
+let noticeStatsFlushing = false
+let noticeTicking = false
+/** Moments that stand for a state rather than an instant: one a minute is enough to keep them armed. */
+const STATE_MOMENTS: readonly NoticeEvent['on'][] = ['update_available']
+/** The Match tab's slots: a queue press made there needs no other screen. */
+const MATCH_PLACES: readonly Place[] = ['match', 'queue', 'result']
+
+/** Config's notices, parsed once per config read (a new read, a server or handle change, practice only moving). */
+async function noticesNow($: $): Promise<Notice[]> {
+  const cf = await configOf($)
+  const held = cf as Partial<ConfigState>
+  const key = `${held.key ?? ''}|${cf.version}|${held.readAt ?? 0}|${cf.practiceOnly}`
+  if (noticesMemo.key !== key) noticesMemo = { key, list: noticesOf(cf) }
+  return noticesMemo.list
+}
+
+/**
+ * The armed notices now: every moment this session saw, replayed over `list` (armFor never
+ * shortens an arming), and when each one's arming began (`armedAt`, for alertDue's once per
+ * arming): the moment, a state's start, or for the queued trigger the queue's crossing of its
+ * after_s (each read of the queue re-arms it; it stays one arming per queue).
+ */
+function armedNow(list: readonly Notice[]): { armed: Record<string, number>; armedAt: Record<string, number> } {
+  let armed: Record<string, number> = {}
+  const armedAt: Record<string, number> = {}
+  for (const m of noticeMoments) {
+    const r = armFor(list, m.e, armed, m.at)
+    armed = r.armed
+    for (const n of r.hit) armedAt[n.id] = Math.max(armedAt[n.id] ?? 0, m.start)
+  }
+  for (const [since, q] of queuedSeen) {
+    const r = armFor(list, { on: 'queued', queuedS: Math.max(0, Math.floor((q.at - since) / 1000)), lengthsMin: q.lengthsMin }, armed, q.at)
+    armed = r.armed
+    for (const n of r.hit) armedAt[n.id] = Math.max(armedAt[n.id] ?? 0, since + (n.trigger?.on === 'queued' ? n.trigger.afterS * 1000 : 0))
+  }
+  return { armed, armedAt }
+}
+
+/** The queue as seen now: how long it has waited, for which lengths. The four newest queues are kept. */
+function noteQueued(sh: RankedShared, at: number) {
+  queuedSeen.set(sh.since, { at, lengthsMin: [...sh.queuedMin] })
+  for (const since of [...queuedSeen.keys()].slice(0, Math.max(0, queuedSeen.size - 4))) queuedSeen.delete(since)
+}
+
+/** What the picker needs about this moment, this session and the player's switches, for a draw on `surface`. */
+async function noticeView($: $, surface: string | null): Promise<NoticeView> {
+  await read($, noticeRev)
+  const t = await $.clock.now()
+  const skewMs = configSkewMs()
+  const sw = (await read($, settings)).surfaces
+  const cf = await configOf($)
+  const sh = await rankedShared($)
+  if (sh.phase === 'queued' && sh.since > 0) noteQueued(sh, t)
+  const { armed, armedAt } = armedNow(await noticesNow($))
+  return {
+    now: t,
+    skewMs,
+    day: dayKey(t + skewMs),
+    surface,
+    setting: sw.notices,
+    switches: { toasts: sw.toasts, status: sw.status, band: sw.band, bandMatch: sw.bandMatch, chat: sw.chat },
+    chatWorld: cf.chat.world,
+    phase: sh.phase,
+    armed,
+    armedAt,
+    ledger: ledgerOf(await storeGet<unknown>($, K.noticeCaps, {})),
+    session: noticeSession,
+    lastToastAt: noticeToastAt,
+  }
+}
+
+/**
+ * Keeps a moment that fires notice triggers, with its time and when its arming began (`start`,
+ * the moment itself unless the caller names one): false for a state moment (STATE_MOMENTS) of
+ * the same arming kept in the last minute, which still arms what it armed. A module variable
+ * only, so a render may call it (renderPane's pane_open), and the slots drawn after it see it.
+ */
+function recordMoment(e: NoticeEvent, at: number, start = at) {
+  const same = STATE_MOMENTS.includes(e.on) ? noticeMoments.find(m => m.e.on === e.on) : undefined
+  if (same && same.start === start && at - same.at < 60_000) return false
+  noticeMoments = [...noticeMoments.filter(m => m !== same && at - m.at < 3_600_000), { e, at, start }].slice(-50)
+  return true
+}
+
+/**
+ * After a moment: what draws notices draws again (noticeRev), then the toast and flash check.
+ * Never from a render, where the write is refused (drawing is pure): renderPane runs it from a
+ * timer. A refused or failed write is logged and the check runs anyway.
+ */
+async function noticesMoved($: $) {
+  await update($, noticeRev, n => n + 1).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+  await noticeAlerts($)
+}
+
+/**
+ * A moment that fires notice triggers: session_start, match_found, match_start, result, tier,
+ * placed, first_score, score, update_available, back_online (pane_open is renderPane's, queued
+ * is read off the queue itself, in noticeView). It arms the notices whose trigger it hits, the
+ * slots draw again, and the toast and flash check runs now. `start`: when its arming began, for
+ * a moment that continues one (update_available's release); the moment itself otherwise.
+ */
+async function noticeEvent($: $, e: NoticeEvent, start?: number) {
+  const at = await $.clock.now()
+  if (recordMoment(e, at, start ?? at)) await noticesMoved($)
+}
+
+/**
+ * The toast and the status flash due now, if any: one toast at a time, at least 8 s apart (pickToast),
+ * and one flash, each claimed across the sessions on this store first, so open sessions show one.
+ * Each fires once per arming, or once a session with no trigger (alertDue): the pick is spent
+ * whether this session shows it or another session's claim says it just showed there.
+ * A call made while one runs runs again after it.
+ */
+async function noticeAlerts($: $): Promise<void> {
+  if (noticeAlerting) {
+    noticeAlertAgain = true
+    return
+  }
+  noticeAlerting = true
+  try {
+    do {
+      noticeAlertAgain = false
+      const list = await noticesNow($)
+      if (list.length === 0) break
+      const v = await noticeView($, paneSurface ?? sessionSurface)
+      const toast = pickToast(list, v)
+      const toastLine = toast ? toastText(toast, v.now, v.skewMs) : null
+      if (toast && toastLine) {
+        noticeSession = noteAlerted(noticeSession, toast, v)
+        if (await claimNotice($, `toast:${toast.id}`, v.now)) {
+          $.ui.toast(toastLine, { timeoutMs: FLASH_MS })
+          noticeToastAt = v.now
+          await countShown($, toast, v)
+        }
+      }
+      const flash = noticeFlash && v.now < noticeFlash.until ? null : pickFlash(list, v)
+      if (flash) {
+        noticeSession = noteAlerted(noticeSession, flash, v)
+        if (await claimNotice($, `status:${flash.id}`, v.now)) await startFlash($, flash, v)
+      }
+    } while (noticeAlertAgain)
+  } finally {
+    noticeAlerting = false
+  }
+}
+
+/** A status flash for FLASH_MS: the status line shows it (statusLine), then goes back. */
+async function startFlash($: $, n: Notice, v: NoticeView) {
+  const full = flashText(n, false, v.now, v.skewMs)
+  const short = flashText(n, true, v.now, v.skewMs)
+  if (full === null || short === null) return
+  noticeFlash = { full, short, until: v.now + FLASH_MS }
+  await countShown($, n, v)
+  await refreshStatus($)
+  $.clock.after(FLASH_MS + 50, () => void refreshStatus($))
+}
+
+/** A toast or a flash went up: one showing, here and in the store, and in the counts. */
+async function countShown($: $, n: Notice, v: NoticeView) {
+  noticeSession = noteShown({}, noticeSession, n, v).session
+  await noticeWrite($, () => storeNoticeShown($, n, v))
+}
+
+/** A card, banner or line drew: its first draw this session is its showing, counted in the store after the draw. */
+function noticeDrawn($: $, n: Notice, v: NoticeView) {
+  const r = noteDrawn({}, noticeSession, n, v)
+  if (!r.counted) return
+  noticeSession = r.session
+  void noticeWrite($, () => storeNoticeShown($, n, v)).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+}
+
+async function storeNoticeShown($: $, n: Notice, v: Pick<NoticeView, 'now' | 'day'>) {
+  if (n.preview) return
+  await changeLedger($, l => noteShown(l, SESSION0, n, v).ledger)
+  await changeStats($, s => bumpStats(s, n, 'shown'))
+}
+
+/** Runs `f` after every notice store write already queued in this session. */
+function noticeWrite<T>($: $, f: () => Promise<T>): Promise<T> {
+  const run = noticeWrites.then(f)
+  noticeWrites = run.catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+  return run
+}
+
+async function changeLedger($: $, f: (l: CapLedger) => CapLedger) {
+  const cur = ledgerOf(await storeGet<unknown>($, K.noticeCaps, {}))
+  const next = f(cur)
+  if (next !== cur) await save($, K.noticeCaps, next)
+}
+
+async function changeStats($: $, f: (s: NoticeStats) => NoticeStats) {
+  const cur = statsOf(await storeGet<unknown>($, K.noticeStats, {}))
+  const next = f(cur)
+  if (next !== cur) await save($, K.noticeStats, next)
+}
+
+/** Claims showing `key` once across the sessions on this store: true when this session won (claimFire). */
+function claimNotice($: $, key: string, at: number, holdMs?: number): Promise<boolean> {
+  return noticeWrite($, async () => {
+    const r = claimFire(firedOf(await storeGet<unknown>($, K.noticeFired, {})), key, owner, at, holdMs)
+    if (r.won) await save($, K.noticeFired, pruneFired(r.fired, at))
+    return r.won
+  })
+}
+
+/**
+ * A live match's feed notices, after each events page that carries some: a toast, else a status
+ * flash, by the Notices setting and the switches (feedAlert), once per match across the sessions
+ * on this store (claimed for a day). Never while an offer is out.
+ */
+async function feedAlerts($: $, matchId: string) {
+  const r = (await read($, link)).ranked
+  if (!r || r.id !== matchId) return
+  const list = feedNotices(r.notices, await configOf($))
+  if (list.length === 0) return
+  const v = await noticeView($, paneSurface ?? sessionSurface)
+  for (const n of list) {
+    const how = feedAlert(n, v)
+    if (!how) continue
+    const line = how === 'toast' ? toastText(n, v.now, v.skewMs) : null
+    if (how === 'toast' && line === null) continue
+    if (!(await claimNotice($, feedKey(matchId, n.id), v.now, FEED_HOLD_MS))) continue
+    if (how === 'toast' && line !== null) {
+      $.ui.toast(line, { timeoutMs: FLASH_MS })
+      noticeToastAt = v.now
+      await countShown($, n, v)
+    } else await startFlash($, n, v)
+  }
+}
+
+/** A finished match: the result moment, then placed, or tier up or down (matchEndEvents). Before GET /me is read again. */
+async function noticeMatchEnd($: $, s: ApiMatchSummary, me: string) {
+  const l = await read($, link)
+  const { mine } = rankedSides(s, me)
+  const outcome = s.status === 'void' ? 'void' : s.result === 'draw' ? 'draw' : s.winner === me ? 'win' : 'loss'
+  // Placing after: the summary's ref is the player now. Placing before: GET /me's standing in the match's bucket, read before
+  // the match ended; with none, a Mud tier before that isn't Mud after (placingOfSide's rule).
+  const before = meIn(l, bucketIdOf(s.bucket) ?? OPEN)
+  const placingAfter = !!mine.player.placement
+  const placingBefore = placingAfter || (before ? !!before.placement : mine.tier_before === 'Mud' && !!mine.tier_after && mine.tier_after !== 'Mud')
+  for (const e of matchEndEvents({ outcome, tierBefore: mine.tier_before, tierAfter: mine.tier_after, placingBefore, placingAfter })) await noticeEvent($, e)
+}
+
+/** A fresh commit scored: the score moment, and first_score when no other commit was ever scored on this config dir. */
+async function noticeScored($: $, c: ScoredCommit) {
+  if (!(await storeGet<boolean>($, K.noticeFirst, false))) {
+    await save($, K.noticeFirst, true)
+    const others = (await storeGet<ScoredCommit[]>($, K.ledger, [])).some(x => x.pid !== c.pid)
+    if (!others) await noticeEvent($, { on: 'first_score' })
+  }
+  await noticeEvent($, { on: 'score', points: c.points })
+}
+
+/**
+ * After every config read: the counts posted (when due, on the config timer and at boot only), the
+ * ledger kept small, and any toast or flash the new notices bring. Never on a header, sign-in or
+ * bucket re-read: a flag flip or a notice publish has every active mod re-read within 30 s, and a
+ * post riding those would add a write per player to that herd.
+ */
+async function noticeConfigTick($: $, cfg: ModConfig, why: string) {
+  if (why === 'timer' || why === 'boot') void flushNoticeStats($).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+  const ids = noticesOf(cfg).map(n => n.id)
+  const at = await $.clock.now()
+  await noticeWrite($, async () => {
+    await changeLedger($, l => (Object.keys(l).length === 0 ? l : pruneLedger(l, ids, at)))
+    const fired = firedOf(await storeGet<unknown>($, K.noticeFired, {}))
+    const kept = pruneFired(fired, at)
+    if (Object.keys(kept).length !== Object.keys(fired).length) await save($, K.noticeFired, kept)
+  })
+  await update($, noticeRev, n => n + 1)
+  await noticeAlerts($)
+}
+
+/**
+ * The counts, posted: one session per store at a time (a 30 s lease), at most one post per 90 s from
+ * the store (statsDue), ids and counts only (statsBatch). What the server took comes off; so does a
+ * batch it refuses for good (any 4xx but 429), which a frozen mod could never fix and which would
+ * otherwise block every later count. A 429, a 5xx or no answer keeps it for the next due tick, and
+ * so does a post still unanswered when its lease runs out: $.http.fetch has no timeout, and one
+ * that hangs (a half-open socket after a sleep) would otherwise hold this flush for the session.
+ * Its late answer, if one comes, is dropped: the batch went again or goes with the next.
+ */
+async function flushNoticeStats($: $) {
+  if (noticeStatsFlushing) return
+  noticeStatsFlushing = true
+  try {
+    if (!(await serverCfg($)).token) return
+    const t = await $.clock.now()
+    const lease = takeLease(await storeGet<unknown>($, K.noticeLease, null), owner, t)
+    if (!lease.won) return
+    await save($, K.noticeLease, lease.lease)
+    if (!statsDue(await storeGet<unknown>($, K.noticeSentAt, null), t)) return
+    const batch = statsBatch(statsOf(await storeGet<unknown>($, K.noticeStats, {})))
+    if (!batch) return
+    await save($, K.noticeSentAt, t)
+    const r = await Promise.race([api($, 'POST', '/notices/events', batch.body, { keepNote: true }), waitMs($, LEASE_MS).then(() => null)])
+    if (!r) return
+    const done = (r.status >= 200 && r.status < 300) || (r.status >= 400 && r.status < 500 && r.status !== 429)
+    if (done) await noticeWrite($, () => changeStats($, s => statsAfterSend(s, batch.sent)))
+  } finally {
+    noticeStatsFlushing = false
+  }
+}
+
+/**
+ * Where a notice's buttons are judged (buttonsFor): the ranked phase, whether this install is
+ * signed in, and whether W6b's challenge form can open (challenges live here, the Challenges
+ * switch included, sending not paused, not practice only), so a Challenge button never draws dead.
+ */
+async function noticeButtonsAt($: $) {
+  const cfg = await serverCfg($)
+  const cf = await configOf($, cfg)
+  return {
+    phase: (await rankedShared($)).phase,
+    signedIn: !!cfg.token && !(await read($, link)).unknownToken,
+    challenges: challengesOf(cf).send && !cf.practiceOnly && (await challengesLive($)),
+  }
+}
+
+/** The notice `id`, from config's notices or the live match's feed. */
+async function noticeById($: $, source: 'config' | 'feed', id: string): Promise<Notice | null> {
+  const list = source === 'feed' ? feedNotices((await read($, link)).ranked?.notices, await configOf($)) : await noticesNow($)
+  return list.find(n => n.id === id) ?? null
+}
+
+/**
+ * A notice's button pressed: its action, then counted as a press when it did something (but
+ * Dismiss and Snooze, which are their own). A queue press that queued nothing, or a Challenge
+ * whose form didn't open, isn't one: a notice that stops on a press would be gone for good after it.
+ */
+async function noticePress($: $, source: 'config' | 'feed', id: string, index: number, place: Place, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') {
+  const n = await noticeById($, source, id)
+  const act = n?.actions[index]
+  if (!n || !act || act.hidden) return
+  const did = await runAction($, n, act, place, surface)
+  if (did && act.do !== 'dismiss' && act.do !== 'snooze') {
+    const t = await $.clock.now()
+    void noticeWrite($, async () => {
+      if (n.preview) return
+      await changeLedger($, l => noteClick(l, n, { now: t }))
+      await changeStats($, s => bumpStats(s, n, 'clicked'))
+    }).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+  }
+  await update($, noticeRev, x => x + 1)
+}
+
+/**
+ * What a notice's button does: one case per action in the vocabulary (actions.ts parses them;
+ * scripts/freeze-manifest.txt looks for each `case '<do>':` here, so none can be missing from
+ * the launch mod). `open` and `install_app` draw as Links (noticeButtons), which the engine
+ * opens itself, so their presses never reach the mod (https://ccsr.gg/go/<id> counts open's).
+ * True when the press did something (noticePress counts only those).
+ */
+async function runAction($: $, n: Notice, a: Action, place: Place, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile'): Promise<boolean> {
+  switch (a.do) {
+    case 'open':
+      // A Link to https://ccsr.gg/go/<id>: the engine opens it and the server counts it.
+      return true
+    case 'tab':
+      // Every tab the vocabulary names, W10b's Finishers view included (selectTab reads GET /me/finishers as it opens).
+      // actions.ts hides a Finishers button while config's `finishers` is off, so a press here means the view can draw.
+      await selectTab($, a.tab)
+      await $.ui.open({ id: PANE, title: 'CCSR' })
+      return true
+    case 'queue': {
+      // W2b's queueWith, with W3b's bucket: a bucket not on screen becomes it between matches; false when nothing was queued.
+      const queued = await queueWith($, { lengthsMin: a.lengthsMin, bucket: a.bucket })
+      // The Match tab holds the queue and the note that says why nothing was queued: a press anywhere else opens it, but in
+      // the band, which shows the queue itself and needs the Match tab only for a refusal.
+      if (!MATCH_PLACES.includes(place) && (place !== 'band' || !queued)) await openPane($, 'match')
+      return queued
+    }
+    case 'challenge': {
+      // W6b's challenge form, for the handle and the length the notice names (either may be null). Its button draws only
+      // while the form can open (noticeButtonsAt), so false is a race: the Match tab then, where the box or the match is.
+      const opened = await openChallengeForm($, a.handle, a.lengthMin)
+      if (!opened) await openPane($, 'match')
+      return opened
+    }
+    case 'signin':
+      // W5b's sign-in card, opened on the Match tab.
+      await startSignIn($, a.provider, 'action')
+      return true
+    case 'install_app':
+      // A Link to the GitHub App's install page, drawn only after installAppUrlOk (noticeButtons).
+      return true
+    case 'copy': {
+      const c = await $.ui.copy({ text: a.text, surface }).catch(() => ({ isCopied: false }))
+      // A reply to a press, so it shows whatever the toasts switch says: the words copied, or the text itself when the clipboard refused.
+      $.ui.toast(c.isCopied ? NOTICE.copied : a.text, { timeoutMs: 6000 })
+      return true
+    }
+    case 'update': {
+      await updateMod($, surface)
+      // What the update did, wherever it was pressed (Settings keeps the same line): updateMod toasts a finished
+      // update itself, unless toasts are off; the copied command, or the command itself, it only notes.
+      const said = (await read($, link)).updateNote
+      const toasted = said === MOD.updated && (await read($, settings)).surfaces.toasts !== 'off'
+      if (said && !toasted) $.ui.toast(said, { timeoutMs: 8000 })
+      return true
+    }
+    case 'snooze': {
+      const t = await $.clock.now()
+      noticeSession = noteSnooze({}, noticeSession, n, { now: t }, a.min).session
+      if (noticeOpened?.id === n.id) noticeOpened = null
+      await noticeWrite($, () => changeLedger($, l => noteSnooze(l, SESSION0, n, { now: t }, a.min).ledger))
+      return true
+    }
+    case 'dismiss':
+      await dismissNotice($, n)
+      return true
+    case 'notice':
+      // The notice it names, in this notice's place, past its caps and trigger, until it's dismissed or closed.
+      noticeSession = openNotice(noticeSession, a.id, place)
+      noticeOpened = { id: a.id, place }
+      return true
+    default: {
+      const left: never = a
+      return left
+    }
+  }
+}
+
+/** A notice dismissed (its own Dismiss, or a `{ do: 'dismiss' }` button): gone here now, and for its cap's period everywhere. */
+async function dismissNotice($: $, n: Notice) {
+  const t = await $.clock.now()
+  const v = { now: t, day: dayKey(t + configSkewMs()) }
+  noticeSession = noteDismiss({}, noticeSession, n, v).session
+  if (noticeOpened?.id === n.id) noticeOpened = null
+  await noticeWrite($, async () => {
+    if (n.preview) return
+    await changeLedger($, l => noteDismiss(l, SESSION0, n, v).ledger)
+    await changeStats($, s => bumpStats(s, n, 'dismissed'))
+  })
+}
+
+async function noticeDismissPress($: $, source: 'config' | 'feed', id: string) {
+  const n = await noticeById($, source, id)
+  if (!n?.dismissible) return
+  await dismissNotice($, n)
+  await update($, noticeRev, x => x + 1)
+}
+
+/** Close on a notice a button opened: its slot goes back to its own pick. Nothing is counted. */
+async function noticeClose($: $, id: string) {
+  const opened = { ...noticeSession.opened }
+  delete opened[id]
+  noticeSession = { ...noticeSession, opened }
+  if (noticeOpened?.id === id) noticeOpened = null
+  await update($, noticeRev, x => x + 1)
+}
+
+/**
+ * A notice's buttons as drawn now (buttonsFor: not hidden by config, Queue only signed in and
+ * between matches, queued or on the result, Challenge only signed in, between matches and while
+ * W6b's form can open, noticeButtonsAt's `challenges`): a Link for open and for
+ * install_app (after installAppUrlOk: one bad href refuses the whole tree), a Button for the
+ * rest, then Dismiss when it's dismissible, or Close when a button opened it and it isn't.
+ */
+function noticeButtons(els: El, n: Notice, place: Place, source: 'config' | 'feed', prefix: string, at: { phase: RankedShared['phase']; signedIn: boolean; challenges: boolean }, a: Actions): RenderElement[] {
+  const { Button, Link } = els
+  const out: RenderElement[] = []
+  for (const x of buttonsFor(n, at)) {
+    const i = n.actions.indexOf(x)
+    const key = `${prefix}-${n.id}-${i}`
+    if (x.do === 'open') out.push(<Link key={key} href={x.url} label={x.label ?? undefined} />)
+    else if (x.do === 'install_app') {
+      if (installAppUrlOk(x.url)) out.push(<Link key={key} href={x.url} label={x.label ?? undefined} />)
+    } else out.push(<Button key={key} label={x.label ?? ''} onPress={p => a.noticePress(source, n.id, i, place, p.surface)} />)
+  }
+  // A plain Button: role="dismiss" marks the button that closes its site (the pane or the band), which a desktop draws as its
+  // own close control at the site's edge, so a notice's Dismiss must never carry it (band-clear and ready-decline do).
+  if (n.dismissible) out.push(<Button key={`${prefix}-${n.id}-dismiss`} label={NOTICE.dismiss} onPress={() => a.noticeDismiss(source, n.id)} />)
+  else if (noticeSession.opened[n.id]) out.push(<Button key={`${prefix}-${n.id}-close`} label={NOTICE.close} onPress={() => a.noticeClose(n.id)} />)
+  return out
+}
+
+/**
+ * A notice as its form draws it. A card: its title, its body through Markdown (notices.ts allows
+ * only bold, italics, code and canonical https links on ccsr.gg and github.com) and its buttons,
+ * in a full hairline border, signal orange for critical and warn (never a colored edge on one
+ * side). A banner is one line in the same border: the title, the body as plain text, the buttons.
+ * A line (the World room, the band) is the banner unframed.
+ */
+function noticeBlock(els: El, n: Notice, form: NoticeForm, words: { title: string; body: string | null }, buttons: RenderElement[]): RenderElement {
+  const { Box, Text, Markdown } = els
+  const hot = n.level === 'critical' || n.level === 'warn'
+  const title = (
+    <Text bold color={hot ? ORANGE : undefined} wrap="wrap">
+      {words.title}
+    </Text>
+  )
+  if (form === 'card')
+    return (
+      <Box key={`notice-${n.id}`} flexDirection="column" paddingX={1} borderStyle="round" borderColor={hot ? ORANGE : undefined} borderDimColor={!hot}>
+        {title}
+        {words.body !== null && <Markdown text={words.body} />}
+        {buttons.length > 0 && (
+          <Box gap={1} alignItems="center" flexWrap="wrap">
+            {buttons}
+          </Box>
+        )}
+      </Box>
+    )
+  const row = (
+    <Box gap={1} alignItems="center" flexWrap="wrap">
+      {title}
+      {words.body !== null && (
+        <Text dimColor wrap="truncate-end">
+          {plainText(words.body)}
+        </Text>
+      )}
+      {buttons}
+    </Box>
+  )
+  if (form !== 'banner') return row
+  return (
+    <Box key={`notice-${n.id}`} paddingX={1} borderStyle="round" borderColor={hot ? ORANGE : undefined} borderDimColor={!hot}>
+      {row}
+    </Box>
+  )
+}
+
+/** The pick a `{ do: 'notice' }` press opened, when its place is one of `places` and it may draw there. */
+function openedPick(list: readonly Notice[], places: readonly Place[], v: NoticeView): NoticePick | null {
+  const o = noticeOpened
+  if (!o || !places.includes(o.place)) return null
+  const n = list.find(x => x.id === o.id)
+  return n && eligible(n, o.place, v) ? { notice: n, slot: o.place, form: formFor(n, o.place) } : null
+}
+
+/**
+ * The one notice for a screen across `places` (the opened one first, else pickFor, the critical
+ * fallback included when the Match tab's top slot is among them), drawn only when its slot is
+ * `only` (or any, without it). Its first draw this session counts as its showing.
+ */
+async function drawPick($: $, e: { surface: string }, els: El, a: Actions, list: readonly Notice[], places: readonly Place[], only?: Place): Promise<RenderElement | null> {
+  if (list.length === 0) return null
+  const v = await noticeView($, e.surface)
+  const pick = openedPick(list, places, v) ?? pickFor(list, places, v)
+  if (!pick || (only !== undefined && pick.slot !== only)) return null
+  const words = noticeText(pick.notice, v.now, v.skewMs)
+  if (!words) return null
+  const el = noticeBlock(els, pick.notice, pick.form, words, noticeButtons(els, pick.notice, pick.slot, 'config', 'notice', await noticeButtonsAt($), a))
+  noticeDrawn($, pick.notice, v)
+  return el
+}
+
+/** The Match tab's one notice, drawn where it goes: its top slot (`match`), the queue screen (`queue`) or the result (`result`). */
+async function matchNotice($: $, e: { surface: string }, els: El, a: Actions, slot: 'match' | 'queue' | 'result'): Promise<RenderElement | null> {
+  const list = await noticesNow($)
+  return drawPick($, e, els, a, list, matchTabPlaces((await rankedShared($)).phase), slot)
+}
+
+/** The top slot of the tab on screen. The Chat tab's World line draws in the room (worldNotice); Backtest and Lab have none. */
+async function noticeTop($: $, e: { surface: string }, els: El, a: Actions, cur: Tab): Promise<RenderElement | null> {
+  if (cur === 'match') return matchNotice($, e, els, a, 'match')
+  const place: Place | null = cur === 'ranked' || cur === 'grind' || cur === 'chat' || cur === 'settings' ? cur : null
+  if (!place) return null
+  return drawPick($, e, els, a, (await noticesNow($)).filter(n => n.layout !== 'world'), [place])
+}
+
+/** A World notice: a line in the World room, while World is on screen in the Chat tab. */
+async function worldNotice($: $, e: { surface: string }, els: El, a: Actions): Promise<RenderElement | null> {
+  return drawPick($, e, els, a, (await noticesNow($)).filter(n => n.layout === 'world'), ['chat'])
+}
+
+/** The band's notice: one line (a card draws as its banner, unframed here), with its buttons, under the band's switches. */
+async function bandNotice($: $, e: RenderInput<'AbovePrompt'>, a: Actions): Promise<RenderElement | null> {
+  const list = await noticesNow($)
+  if (list.length === 0) return null
+  const els = $.ui.resolve(e) as El
+  const v = await noticeView($, e.surface)
+  const pick = openedPick(list, ['band'], v) ?? pickFor(list, ['band'], v)
+  if (!pick) return null
+  const words = noticeText(pick.notice, v.now, v.skewMs)
+  if (!words) return null
+  const el = noticeBlock(els, pick.notice, 'line', words, noticeButtons(els, pick.notice, 'band', 'config', 'band-notice', await noticeButtonsAt($), a))
+  noticeDrawn($, pick.notice, v)
+  return el
+}
+
+/**
+ * A live match's feed notices, as lines on the live screen: critical always, warn unless Notices is
+ * off (feedLine), each with its buttons; one the player put away stays gone (dismissed or snoozed
+ * here, or held away by the store for every session: feedLine's putAway), and one the Match tab's
+ * slot already draws isn't drawn twice.
+ */
+async function feedNoticeLines($: $, e: { surface: string }, els: El, a: Actions, r: RankedMatch): Promise<RenderElement | null> {
+  const list = feedNotices(r.notices, await configOf($))
+  if (list.length === 0) return null
+  const v = await noticeView($, e.surface)
+  const cfgList = await noticesNow($)
+  const slotPick = openedPick(cfgList, matchTabPlaces(v.phase), v) ?? pickFor(cfgList, matchTabPlaces(v.phase), v)
+  const at = await noticeButtonsAt($)
+  const { Box } = els
+  const lines: RenderElement[] = []
+  for (const n of list) {
+    if (!feedLine(n, v) || slotPick?.notice.id === n.id) continue
+    const words = noticeText(n, v.now, v.skewMs)
+    if (!words) continue
+    lines.push(noticeBlock(els, n, 'banner', words, noticeButtons(els, n, 'match', 'feed', 'feed', at, a)))
+    noticeDrawn($, n, v)
+  }
+  if (lines.length === 0) return null
+  return (
+    <Box flexDirection="column" gap={1}>
+      {lines}
+    </Box>
+  )
 }
 
 // ================================================================== UI
@@ -2354,7 +5932,8 @@ export type Actions = {
   setSurface: (key: SurfaceKey, value: string) => void
   askCommit: () => void
   copyRecap: (surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void
-  queueAgain: () => void
+  /** Queue again after a match, from the band or the Match tab: from the band, a press that queues nothing opens the Match tab. */
+  queueAgain: (where: 'band' | 'pane') => void
   setupSeen: () => void
   askForfeit: (isAsking: boolean) => void
   setPreset: (preset: 'full' | 'quiet') => void
@@ -2378,7 +5957,7 @@ export type Actions = {
   setServer: (url: string) => void
   queue: () => void
   leaveQueue: () => void
-  toggleLength: (h: 1 | 3) => void
+  toggleLength: (min: number) => void
   accept: () => void
   decline: () => void
   rankedForfeit: () => void
@@ -2387,6 +5966,81 @@ export type Actions = {
   setRoom: (room: ApiRoom) => void
   roomChat: (text: string) => void
   updateMod: (surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void
+  /** W3b: a bucket row press on the Match tab (`bucket-<id>`): queue there from now on. */
+  chooseBucket: (id: string) => void
+  /** W3b: a bucket row press on the Ranked or Grind tab (`board-<id>`, `board-grind-<id>`). */
+  chooseBoard: (which: 'ranked' | 'grind', id: string) => void
+  /** W3b: the bucket checklist's sign-in step, W5b's seam (`checklistSignIn`). */
+  checklistSignIn: (provider: Provider) => void
+  // W5b: sign-in with a provider.
+  startSignIn: (provider: Provider, from: SignInFrom) => void
+  cancelSignIn: () => void
+  dismissSignIn: () => void
+  againSignIn: () => void
+  joinSignIn: (handle: string) => void
+  switchSignIn: () => void
+  copySignInCode: (surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void
+  unlinkProvider: (provider: Provider) => void
+  /** W6b: take a challenge, from its card, the band or the code box. */
+  challengeAccept: (id: string, via: 'card' | 'band' | 'code') => void
+  /** W6b: decline a challenge to you, or withdraw one of yours. */
+  challengeDecline: (id: string) => void
+  /** W6b: Mute on a card (the second press mutes the sender). */
+  challengeMute: (id: string) => void
+  /** W6b: Report on a card asks why; null puts the question away. */
+  challengeAskReport: (id: string | null) => void
+  challengeReport: (id: string, reason: 'spam' | 'abuse' | 'other') => void
+  /** W6b: the form: a fresh one (a handle, or open), a pick in it, the message typed, Send, Cancel. */
+  challengeStart: (kind: 'handle' | 'open') => void
+  challengePick: (patch: { handle?: string; lengthMin?: number; bucket?: string }) => void
+  challengeDraft: (text: string) => void
+  challengeSend: () => void
+  challengeCancel: () => void
+  /** W6b: the code box (a code or its ccsr.gg link), and putting its challenge away. */
+  challengeCode: (input: string) => void
+  challengeCodeClose: () => void
+  /** W6b: Copy link on one of yours. */
+  challengeCopy: (id: string, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void
+  /** W6b: Rematch on a result: the form, filled in with them and the match's length (openChallengeForm). */
+  challengeRematch: (handle: string, lengthMin: number) => void
+  /** W7-2: the Model stats switch in Settings (`stats-on`, `stats-off`): PATCH /me, held on the server. */
+  setModelStats: (isOn: boolean) => void
+  /** W4b: a notice's button: the action at `index` of notice `id`, from config's notices or the live match's feed, pressed in `place`. */
+  noticePress: (source: 'config' | 'feed', id: string, index: number, place: Place, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void
+  /** W4b: a dismissible notice's own Dismiss. */
+  noticeDismiss: (source: 'config' | 'feed', id: string) => void
+  /** W4b: Close on a notice another notice's button opened, when it can't be dismissed. */
+  noticeClose: (id: string) => void
+  /** W10b: Replay on a finisher (a ranked match's, by its id, or practice's), and Play on the Finishers view's preview. */
+  finisherReplay: (id: string) => void
+  finisherPreview: () => void
+  /** W10b: a pick in the Finishers view: a callout from config's pool (null is your handle's own headline), or a color. */
+  finisherCallout: (callout: string | null) => void
+  finisherAccent: (key: string) => void
+  /** W10e: Make your own: Make a finisher, Start over (two presses), Preview, Copy the prompt, Ask Claude to fix it. */
+  finisherMake: () => void
+  finisherRestart: () => void
+  finisherCheck: () => void
+  finisherCopyPrompt: (surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void
+  finisherFix: () => void
+  /** W10e: Submit's slot, its title box as typed, and Submit. */
+  finisherSlot: (kind: string) => void
+  finisherTitle: (text: string) => void
+  finisherSubmit: () => void
+  /** W10e: equip art in a slot by its id, or empty the slot (null); `matchId` is a result's, for the line under its art. */
+  finisherEquip: (slot: string, id: string | null, matchId?: string) => void
+  /** W10e: Delete on your own art (two presses). */
+  finisherDelete: (id: string) => void
+  /** W10e: the gallery: a sort, a slot (null is every slot) or More; Preview on a row; the code box as typed, and its Equip. */
+  finisherGallery: (patch: { sort?: 'top' | 'new'; slot?: string | null; more?: boolean }) => void
+  finisherGalleryPreview: (id: string, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void
+  finisherCode: (text: string) => void
+  finisherEquipCode: () => void
+  /** W10e: Report on a result's custom art: its reasons open for that match (null closes them), then one sent. */
+  finisherAskReport: (matchId: string | null) => void
+  finisherReport: (matchId: string, reason: ReportReason) => void
+  /** W10e: Play on the draft's preview or a gallery row's. */
+  finisherPlay: (which: 'draft' | 'gallery') => void
 }
 
 export const ORANGE = '#FF6A2A'
@@ -2416,7 +6070,11 @@ function when(t: number) {
   return `${DAYS[(d.getDay() + 6) % 7]} ${d.getDate()}/${d.getMonth() + 1} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-function ago(t: number, n: number) {
+/**
+ * "4m ago" between two clock readings. Its own name: Settings' `ago` takes an ISO time, and with
+ * two top-level functions of one name the loader keeps the last, so this one drew "NaN days ago".
+ */
+function agoMs(t: number, n: number) {
   const s = Math.max(0, Math.round((n - t) / 1000))
   if (s < 60) return `${s}s ago`
   if (s < 3600) return `${Math.round(s / 60)}m ago`
@@ -2480,7 +6138,7 @@ function raceFromServer(r: RankedMatch, me: string, t: number): Race | null {
   const s = r.summary
   if (!s || !s.started_at) return null
   const start = Date.parse(s.started_at)
-  const len = s.length * 60
+  const len = s.length_min
   const mine = s.sides.find(x => x.player.handle === me) ?? s.sides[0]
   const them = s.sides.find(x => x !== mine) ?? s.sides[1]
   const end = s.ended_at ? Math.min(Date.parse(s.ended_at), start + len * 60_000) : t
@@ -2489,13 +6147,28 @@ function raceFromServer(r: RankedMatch, me: string, t: number): Race | null {
   const side = (h: string) => scores.filter(e => e.handle === h).map(e => ({ t: min(e.at), points: e.points, craft: e.craft }))
   const live = s.status === 'live' || s.status === 'grace'
   return {
-    hours: s.length,
+    hours: len / 60,
     now: Math.max(0, Math.min(len, (Math.min(t, end) - start) / 60_000)),
-    mode: 'RANKED',
-    hot: live && !!s.deadline && Date.parse(s.deadline) - t < 10 * 60_000,
+    mode: modeWord(s),
+    hot: live && !!s.deadline && Date.parse(s.deadline) - t < warnMs(s),
     me: { handle: mine.player.handle, commits: side(mine.player.handle) },
     them: { handle: them.player.handle, commits: side(them.player.handle) },
   }
+}
+
+/** The drawings' mode word for a server match (W6b): CHALLENGE for a challenge's, else RANKED (an unknown kind reads as ranked, docs/api.md). */
+function modeWord(s: Pick<ApiMatchSummary, 'kind'>) {
+  return s.kind === 'challenge' ? 'CHALLENGE' : 'RANKED'
+}
+
+/** A server match the drawings show unrated (W6b: a challenge): `{ rated: false }` to spread into a drawing's values, else nothing. */
+function unratedOf(s: Pick<ApiMatchSummary, 'kind'>): { rated?: false } {
+  return s.kind === 'challenge' ? { rated: false } : {}
+}
+
+/** The seconds a challenge's ready check runs, for its ring (W6a: max(2 minutes, 2.5 x the inbox poll)), never fewer than are left. */
+function offerSeconds(cf: ModConfig, left: number) {
+  return Math.max(120, Math.round((2.5 * cf.poll.inbox) / 1000), left)
 }
 
 function rankedSides(s: ApiMatchSummary, me: string) {
@@ -2515,6 +6188,43 @@ function waitLabel(ms: number | null) {
   return m < 1 ? '<1 min' : `~${m} min`
 }
 
+/** 15m, or 15m and 1h, or 15m, 30m and 1h. */
+function andList(words: readonly string[]) {
+  return words.length < 2 ? words.join('') : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`
+}
+
+// ------------------------------------------------------------------ buckets on the cards (W3b)
+// Where you stand is per bucket. Open is GET /me's `player`, exactly as before buckets, so with
+// one bucket every card is today's. Another bucket swaps in GET /me's standing there (rating,
+// tier, placement, matches, record) and the rank and last matches its own reads found.
+
+/** You as the cards draw you in bucket `id`: Open's player, or that player with the bucket's standing; null before GET /me answers, or with no standing there. */
+function meIn(l: LinkState, id: string): ApiPlayer | null {
+  if (!l.me || id === OPEN) return l.me
+  const st = standingFor({ player: l.me, buckets: l.meBuckets }, id)
+  return st ? { ...l.me, rating: st.rating, tier: st.tier, placement: st.placement, matches_played: st.matches ?? 0, record: st.record ?? { w: 0, l: 0, d: 0 } } : null
+}
+
+/** Your rank in bucket `id`'s Ranked board (null while placing there, or not read yet). */
+function rankIn(l: LinkState, id: string) {
+  return id === OPEN ? l.myRank : (l.boards?.[id]?.rank ?? null)
+}
+
+/** Your last ranked matches in bucket `id`, newest first. */
+function recentIn(l: LinkState, id: string) {
+  return id === OPEN ? l.recent : (l.boards?.[id]?.recent ?? null)
+}
+
+/** The link as the Ranked tab draws bucket `id`: Open's is the link itself; another's has your standing, its top 10 and your rank there. */
+function viewIn(l: LinkState, id: string): LinkState {
+  return id === OPEN ? l : { ...l, me: meIn(l, id), ladder: l.boards?.[id]?.ladder ?? null, myRank: rankIn(l, id) }
+}
+
+/** The bucket a ready check is for: the offer's, else the server's queue bucket, else Open. */
+function offerBucket(o: ApiQueueState['offer'], sh: RankedShared) {
+  return bucketIdOf(o?.bucket) ?? sh.bucket ?? OPEN
+}
+
 // ------------------------------------------------------------------ band
 
 export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions): Promise<RenderElement | null> {
@@ -2528,20 +6238,29 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
   const l = await read($, link)
   const cfg = await serverCfg($)
   const me = cfg.handle ?? s.handle
-  const chatOk = p.bandChat === 'on' && p.chat === 'on'
+  const cf = await configOf($, cfg)
+  // Match chat paused by the switchboard: no chat line and no Reply in the band.
+  const chatOk = p.bandChat === 'on' && p.chat === 'on' && cf.chat.match
 
   // The ready check ignores every switch: it's the one thing a player has to answer.
   if (sh.phase === 'offered' && l.queue?.offer) {
     const o = l.queue.offer
     const secs = Math.max(0, Math.round((Date.parse(o.expires_at) - t) / 1000))
-    const line = `${o.opponent.handle} · ${o.opponent.placement ? 'Mud, placing' : `${o.opponent.tier} ${o.opponent.rating}`} · ${o.opponent_record.w}-${o.opponent_record.l} · win +${o.stakes.win}, loss ${o.stakes.loss}`
+    // W6b: a challenge's is unrated: no stakes, and its check runs longer than a ranked one's minute.
+    const challenge = o.kind === 'challenge'
+    const tierText = o.opponent.placement ? 'Mud, placing' : `${o.opponent.tier} ${o.opponent.rating}`
+    const record = `${o.opponent_record.w}-${o.opponent_record.l}`
+    const line = challenge ? CHALLENGE.bandOffer(o.opponent.handle, tierText, record) : `${o.opponent.handle} · ${tierText} · ${record} · win +${o.stakes.win}, loss ${o.stakes.loss}`
     return (
       <Box gap={1} alignItems="center" flexWrap="wrap">
         {rich ? (
-          <Svg source={bandStrip({ kind: 'found', me, them: o.opponent.handle, theirRating: o.opponent.rating, seconds: secs })} alt={`Opponent found: ${line}. ${secs} seconds to accept.`} />
+          <Svg
+            source={bandStrip({ kind: 'found', me, them: o.opponent.handle, theirRating: o.opponent.rating, seconds: secs, ...(challenge ? { mode: 'challenge' as const, of: offerSeconds(cf, secs) } : {}) })}
+            alt={`${challenge ? 'Challenge' : 'Opponent found'}: ${line}. ${secs} seconds to accept.`}
+          />
         ) : (
           <Text bold color={ORANGE}>
-            OPPONENT FOUND
+            {challenge ? CHALLENGE.bandTitle : 'OPPONENT FOUND'}
           </Text>
         )}
         <Text wrap="truncate-end">{rich ? line : `${line} · ${secs}s`}</Text>
@@ -2553,6 +6272,8 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
             <Button key="band-decline" label="Decline" onPress={() => a.decline()} />
           </>
         )}
+        {/* W6b: a challenge's taker waits on the sender for minutes, not a ranked check's one: they can still back out. */}
+        {o.you_accepted && challenge && <Button key="band-decline" label="Decline" onPress={() => a.decline()} />}
       </Box>
     )
   }
@@ -2561,10 +6282,12 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
     if (sh.phase === 'queued') {
       const secs = Math.max(0, Math.round((t - sh.since) / 1000))
       const half = l.queue?.range ? Math.round((l.queue.range.max - l.queue.range.min) / 2) : 60
+      // W3b: your standing in the bucket you're queued in (placing there draws text, so its hidden rating never shows).
+      const qme = meIn(l, sh.bucket ?? OPEN)
       return (
         <Box gap={1} alignItems="center">
-          {rich && l.me && !l.me.placement ? (
-            <Svg source={bandStrip({ kind: 'queue', seconds: secs, hours: sh.lengths, rating: l.me.rating, range: half })} alt={`In queue ${mmss(secs * 1000)}.`} />
+          {rich && qme && !qme.placement ? (
+            <Svg source={bandStrip({ kind: 'queue', seconds: secs, hours: sh.queuedMin.map(m => m / 60), rating: qme.rating, range: half })} alt={`In queue ${mmss(secs * 1000)}.`} />
           ) : (
             <Text bold color={ORANGE}>
               CCSR in queue {mmss(secs * 1000)}
@@ -2593,7 +6316,7 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
           <Box gap={1} alignItems="center" flexWrap="wrap">
             {rich ? (
               <Svg
-                source={bandStrip({ kind: 'result', mode: 'RANKED', outcome: rankedOutcome(sm, me), hours: sm.length, delta, ratingBefore: mine.rating_before, ratingAfter: mine.rating_after ?? mine.rating_before, mine: mine.points, theirs: them.points, placing: placingOfSide(mine) })}
+                source={bandStrip({ kind: 'result', mode: modeWord(sm), outcome: rankedOutcome(sm, me), hours: sm.length_min / 60, delta, ratingBefore: mine.rating_before, ratingAfter: mine.rating_after ?? mine.rating_before, mine: mine.points, theirs: them.points, placing: placingOfSide(mine), ...unratedOf(sm) })}
                 alt={line}
               />
             ) : (
@@ -2614,7 +6337,7 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
                 </Text>
               )}
             </Box>
-            <Button key="band-again" label="Queue again" variant="primary" onPress={() => a.queueAgain()} />
+            {!cf.practiceOnly && <Button key="band-again" label="Queue again" variant="primary" onPress={() => a.queueAgain('band')} />}
             <Button key="band-recap" label="Copy recap" onPress={x => a.copyRecap(x.surface)} />
             <Button key="band-clear" label="Dismiss" role="dismiss" onPress={() => a.rankedClear()} />
           </Box>
@@ -2623,7 +6346,7 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
       if (!closed) {
         const race = raceFromServer(rk, me, t)
         const left = sm.deadline ? Date.parse(sm.deadline) - t : 0
-        const hot = sm.status === 'live' && left <= 10 * 60_000
+        const hot = sm.status === 'live' && left <= warnMs(sm)
         const behind = them.points - mine.points
         const offline = l.online === false
         const d = await read($, dirty)
@@ -2631,10 +6354,10 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
         return (
           <Box gap={1} alignItems="center" flexWrap="wrap">
             {rich && race ? (
-              <Svg source={bandStrip({ kind: 'race', race, mode: 'RANKED', offlineAgo })} alt={`${mine.player.handle} ${mine.points}, ${them.player.handle} ${them.points}. ${clock(left)} to the bell.`} />
+              <Svg source={bandStrip({ kind: 'race', race, mode: modeWord(sm), offlineAgo })} alt={`${mine.player.handle} ${mine.points}, ${them.player.handle} ${them.points}. ${clock(left)} to the bell.`} />
             ) : (
               <Text bold color={hot ? ORANGE : undefined}>
-                {hot ? 'BELL' : `CCSR ${sm.length}H`} {clock(left)} · {mine.player.handle} {mine.points} vs {them.points} {them.player.handle}
+                {hot ? 'BELL' : `CCSR ${lengthLabel(sm.length_min).toUpperCase()}`} {clock(left)} · {mine.player.handle} {mine.points} vs {them.points} {them.player.handle}
               </Text>
             )}
             {sm.status === 'grace' ? (
@@ -2702,6 +6425,22 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
       )
     }
 
+    // W6b: a challenge to you, between matches (a result's 15 minutes and a practice race come first): take it or decline it from here, the newest. Never its message.
+    const incoming = sh.phase === 'idle' || sh.phase === 'done' ? await bandChallenge($) : null
+    if (incoming) {
+      return (
+        <Box gap={1} alignItems="center" flexWrap="wrap">
+          <Text bold color={ORANGE}>
+            {CHALLENGE.bandTitle}
+          </Text>
+          <Text wrap="truncate-end">{CHALLENGE.bandIncoming(incoming.from.handle, incoming.label)}</Text>
+          {!cf.practiceOnly && <Button key="band-ch-accept" label={CHALLENGE.accept} variant="primary" onPress={() => a.challengeAccept(incoming.id, 'band')} />}
+          <Button key="band-ch-decline" label={CHALLENGE.decline} onPress={() => a.challengeDecline(incoming.id)} />
+          <Button key="band-open" label="Open" onPress={() => a.open('match')} />
+        </Box>
+      )
+    }
+
     if (m && m.kind === 'practice' && m.status !== 'live' && t - (m.endedAt ?? m.deadline) < 15 * 60_000) {
       const delta = (m.ratingAfter ?? m.ratingBefore) - m.ratingBefore
       if (rich)
@@ -2759,7 +6498,7 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
   const last = list.filter(c => !c.matchOnly).sort((x, y) => y.scoredAt - x.scoredAt)[0]
   if (!last || (p.band === 'after' && t - last.scoredAt > 2 * 60_000)) return null
   const sc = await read($, scan)
-  const queueBtn = cfg.token ? <Button key="band-queue" label="Queue" onPress={() => a.open('match')} /> : null
+  const queueBtn = cfg.token && !cf.practiceOnly ? <Button key="band-queue" label="Queue" onPress={() => a.open('match')} /> : null
   if (rich)
     return (
       <Box gap={1} alignItems="center">
@@ -2820,6 +6559,14 @@ export async function renderPane($: $, e: RenderInput<'Pane'>, a: Actions): Prom
   const wk = totals(list, periodStart('week', t), await read($, weekTotals))
   // The chat poller's heartbeat: it stops once the pane stops drawing.
   paneSeenAt = await $.clock.now()
+  // Where this install last drew, for GET /config?surface= (the server keeps it for targeting).
+  paneSurface = e.surface
+  // W4b: the pane's first draw after a minute without one is the notices' pane_open. The moment is kept now, so this draw's slots
+  // see it; the redraw and the toast and flash check run from a timer, another event, since a state write made while a render is
+  // being dispatched is refused (drawing is pure).
+  if (paneSeenAt - paneDrawnAt > PANE_GAP_MS && recordMoment({ on: 'pane_open' }, paneSeenAt))
+    $.clock.after(0, () => void noticesMoved($).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`)))
+  paneDrawnAt = paneSeenAt
 
   let body: RenderElement
   if (cur === 'match') body = await matchTab($, e, els, a, t)
@@ -2828,14 +6575,24 @@ export async function renderPane($: $, e: RenderInput<'Pane'>, a: Actions): Prom
   else if (cur === 'backtest') body = await backtestTab($, e, els, a, t)
   else if (cur === 'lab') body = await labTab($, e, els, a)
   else if (cur === 'settings') body = await settingsTab($, e, els, a)
+  else if (cur === 'finishers') body = await finishersTab($, e, els, a)
   else body = await grindTab($, e, els, a, t)
+  // W4b: the tab's own notice slot, on top (the Match tab's queue and result slots draw inside it).
+  const top = await noticeTop($, e, els, a, cur)
+  if (top) body = (
+    <Box flexDirection="column" gap={1}>
+      {top}
+      {body}
+    </Box>
+  )
 
   const me = l.me
   const placing = me?.placement ?? null
   const who = me ? `${me.handle} · ${placing ? `Mud, placing ${placing.played} of ${placing.of}` : `${me.tier} ${me.rating}`}` : `${s.handle} · ${tierOf(r)} ${r} practice`
   const sub = `${who} · Grind ${wk.points}${l.grindRank ? ` · #${l.grindRank}` : ''}`
   const tierK: TierKey = me ? (placing ? 'mud' : (me.tier.toLowerCase() as TierKey)) : tierKey(r)
-  const framed = cur === 'backtest' ? 'grind' : cur === 'lab' ? 'settings' : cur
+  // W10b: the Finishers view opens from Settings, so Settings stays lit over it.
+  const framed = cur === 'backtest' ? 'grind' : cur === 'lab' || cur === 'finishers' ? 'settings' : cur
   return (
     <Box flexDirection="column" gap={1}>
       {rich ? (
@@ -2913,9 +6670,30 @@ async function grindTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: nu
   const maxPts = Math.max(1, ...cols.map(c => c.points))
   const barW = Math.max(8, Math.min(30, e.props.bodyColumns - 22))
   const label = p === 'week' ? 'this week' : p === 'month' ? 'this month' : 'all time'
+  // W3b: with more than one bucket, a row picks whose Grind your rank is among: Open is everyone (as before buckets); another is the players who meet its requirements.
+  const bl = bucketsOf(await configOf($))
+  const shownRow = bucketRowShown(bl)
+  const gpick = shownRow ? pickBucket(bl, (await read($, boardPick)).grind) : null
+  const gb = gpick && gpick.id !== OPEN ? (srv.boards?.[gpick.id] ?? null) : null
+  const grindRank = gpick && gpick.id !== OPEN ? (gb?.grindRank ?? null) : srv.grindRank
+  const grindOf = gpick && gpick.id !== OPEN ? (gb?.grindOf ?? null) : srv.grindOf
 
   return (
     <Box flexDirection="column" gap={1}>
+      {shownRow && (
+        <Box flexDirection="column">
+          <Box gap={1} flexWrap="wrap">
+            {bl.map(b => (
+              <Button key={`board-grind-${b.id}`} label={b.label} variant={b.id === (gpick?.id ?? OPEN) ? 'primary' : 'secondary'} onPress={() => a.chooseBoard('grind', b.id)} />
+            ))}
+          </Box>
+          {gpick && gpick.id !== OPEN && (
+            <Text dimColor wrap="wrap">
+              {BUCKET.grindOnly(gpick.label)}
+            </Text>
+          )}
+        </Box>
+      )}
       <Box gap={1}>
         <Button key="p-week" label="This week" variant={p === 'week' ? 'primary' : 'secondary'} onPress={() => a.setPeriod('week')} />
         <Button key="p-month" label="Month" variant={p === 'month' ? 'primary' : 'secondary'} onPress={() => a.setPeriod('month')} />
@@ -2923,7 +6701,7 @@ async function grindTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: nu
       </Box>
       {rich ? (
         <Svg
-          source={grind({ points: tot.points, commits: tot.commits, caption: `PTS ${label.toUpperCase()}`, rank: p === 'week' ? (srv.grindRank ?? undefined) : undefined, of: srv.grindOf ?? undefined, days: cols.slice(-7).map(c => ({ label: c.label, points: c.points, today: c.isToday })) })}
+          source={grind({ points: tot.points, commits: tot.commits, caption: `PTS ${label.toUpperCase()}`, rank: p === 'week' ? (grindRank ?? undefined) : undefined, of: grindOf ?? undefined, days: cols.slice(-7).map(c => ({ label: c.label, points: c.points, today: c.isToday })) })}
           alt={`Grind ${label}: ${tot.points} points from ${tot.commits} commits.`}
         />
       ) : (
@@ -2944,7 +6722,7 @@ async function grindTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: nu
         <Button key="past-sessions" label="Score past sessions" onPress={() => a.setTab('backtest')} />
         <Text dimColor wrap="truncate-end">
           {s.tracking ? `Tracking since ${when(since)}` : 'Tracking is off'} · {sc.note || 'not scanned yet'}
-          {sc.lastAt ? ` · ${ago(sc.lastAt, Math.max(t, sc.lastAt))}` : ''}
+          {sc.lastAt ? ` · ${agoMs(sc.lastAt, Math.max(t, sc.lastAt))}` : ''}
         </Text>
       </Box>
       {problems.length > 0 && (
@@ -3019,10 +6797,14 @@ function commitRow(els: El, c: ScoredCommit, cols: number) {
 
 // ---------------------------------------------------------------- match tab
 
-/** Recent ranked matches from the profile, as the recent-matches drawing reads them. */
+/**
+ * Recent matches from the profile, as the recent-matches drawing reads them. A row's `forfeit` is
+ * that player's own forfeit (docs/api.md; the other side's reads `win`), so it's a loss, read from
+ * `result`, never from the delta's sign: a challenge's delta is 0 (W6b), and it draws UNRATED.
+ */
 function recentRow(x: ApiRecentMatch) {
-  const result: 'won' | 'lost' | 'draw' = x.result === 'win' ? 'won' : x.result === 'loss' ? 'lost' : x.result === 'forfeit' ? (x.delta >= 0 ? 'won' : 'lost') : 'draw'
-  return { day: DAYS[(new Date(Date.parse(x.ended_at)).getDay() + 6) % 7] ?? '', result, hours: x.length, mine: x.score[0], theirs: x.score[1], opponent: x.opponent.handle, opponentRating: x.opponent.rating, delta: x.delta, series: { mine: x.series[0], theirs: x.series[1] } }
+  const result: 'won' | 'lost' | 'draw' = x.result === 'win' ? 'won' : x.result === 'loss' || x.result === 'forfeit' ? 'lost' : 'draw'
+  return { day: DAYS[(new Date(Date.parse(x.ended_at)).getDay() + 6) % 7] ?? '', result, hours: x.length_min / 60, label: lengthLabel(x.length_min), mine: x.score[0], theirs: x.score[1], opponent: x.opponent.handle, opponentRating: x.opponent.rating, delta: x.delta, series: { mine: x.series[0], theirs: x.series[1] }, ...unratedOf(x) }
 }
 
 /**
@@ -3033,10 +6815,13 @@ function recentRow(x: ApiRecentMatch) {
 async function rankedBox($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: number): Promise<RenderElement> {
   const body = await rankedBody($, e, els, a, t)
   const banner = await recoveryBanner($, e, els, a)
-  if (!banner) return body
+  // W5b: a sign-in started from the first-run card, an action or a bucket, once this install is signed in.
+  const card = await signInMatchCard($, e, els, a)
+  if (!banner && !card) return body
   const { Box } = els
   return (
     <Box flexDirection="column" gap={1}>
+      {card}
       {banner}
       {body}
     </Box>
@@ -3081,6 +6866,48 @@ async function joinBlock($: $, e: RenderInput<'Pane'>, els: El, a: Actions, pref
   )
 }
 
+/**
+ * A bucket's checklist, in Queue's place while it can't be queued yet (W3b): each row as the
+ * server sent it, met or not yet, and what fixes an unmet one. Install the App is a Link to the
+ * server's url, drawn only when `installAppUrlOk` passes it (one bad href would refuse the whole
+ * pane). Sign in with GitHub is a Button that starts W5b's sign-in (`checklistSignIn`). Any
+ * other action draws nothing here; a hidden one (config has its feature off) draws nothing either.
+ */
+function checklistBox(els: El, b: Bucket, a: Actions): RenderElement {
+  const { Box, Text, Button, Link } = els
+  return (
+    <Box flexDirection="column">
+      <Text bold wrap="wrap">
+        {BUCKET.checklist(b.label)}
+      </Text>
+      {b.requires.map(r => {
+        const act = r.met || !r.action || r.action.hidden ? null : r.action
+        const install = act?.do === 'install_app' && installAppUrlOk(act.url) ? act : null
+        const signin = act?.do === 'signin' ? act : null
+        return (
+          <Box key={`req-${b.id}-${r.id}`} gap={1} alignItems="center" flexWrap="wrap">
+            <Text dimColor={r.met} wrap="wrap">
+              {r.met ? BUCKET.met(r.label) : BUCKET.unmet(r.label)}
+            </Text>
+            {install && <Link href={install.url} label={install.label ?? BUCKET.install} />}
+            {signin && checklistSignInReady && <Button key={`req-${b.id}-${r.id}-go`} label={signin.label ?? r.label} onPress={() => a.checklistSignIn(signin.provider)} />}
+          </Box>
+        )
+      })}
+    </Box>
+  )
+}
+
+// The checklist's sign-in step: W3b's seam, filled by W5b's sign-in driver. The row's button
+// starts the provider's sign-in from the bucket (`startSignIn($, provider, 'bucket')`), whose
+// card draws on the Match tab above the Ranked box. After a link or an unlink lands the mod
+// reads config again (`refreshConfig($, 'bucket')`, in applySignIn and unlinkProvider): the
+// checklist's `met` moves without moving config's version.
+const checklistSignInReady: boolean = true
+async function checklistSignIn($: $, provider: Provider) {
+  await startSignIn($, provider, 'bucket')
+}
+
 async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: number): Promise<RenderElement> {
   const { Box, Text, Button, Svg, Input } = els
   const rich = e.surface !== 'terminal'
@@ -3096,6 +6923,7 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
       <Box flexDirection="column" gap={1}>
         {rich ? <Svg source={setupHero({ placementMatches: 3 })} alt={`${LINES.handle} Everyone starts in the mud.`} /> : <Text bold>{LINES.handle}</Text>}
         {await joinBlock($, e, els, a, 'match-')}
+        {await signInEntry($, e, els, a, 'first_run')}
         {l.note && (
           <Text color={ORANGE} wrap="wrap">
             {l.note}
@@ -3112,21 +6940,62 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
           <Button key="setup-share-off" label="Off" variant={s.share ? 'secondary' : 'primary'} onPress={() => a.setShare(false)} />
         </Box>
         <Text dimColor>{LINES.privacy}</Text>
+        <Text dimColor>{MOD.autoUpdate}</Text>
       </Box>
     )
 
   const q = l.queue
+  const cf = await configOf($, cfg)
+  // The lengths offered to you (GET /queue's lanes), and their labels; a length they don't hold takes config's catalog label, else the mod's own.
+  const offered: ApiLane[] = l.lanes ?? []
+  const catalog = catalogOf(cf.raw)
+  const label = (min: number) => labelFor(min, offered, catalog)
+  // W3b: config's buckets. With more than one, the queued view and the ready check say which bucket (its label, the server's, as Text).
+  const list = bucketsOf(cf)
+  const bucketLine = (id: string) => {
+    const name = bucketRowShown(list) ? list.find(b => b.id === id)?.label : undefined
+    return name ? <Text dimColor>{name}</Text> : null
+  }
   if (sh.phase === 'idle') {
-    const lanes = ([1, 3] as const).map(h => ({ hours: h, ticked: sh.lengths.includes(h), wait: waitLabel(q?.per_length[String(h) as '1' | '3']?.wait_ms ?? null), waiting: q?.per_length[String(h) as '1' | '3']?.waiting ?? 0 }))
-    const mine = l.me
+    // W3b: the bucket on screen (the row's pick while config lists it, else Open) and where you stand there. One bucket: no row, and Open's card as before.
+    const onScreen = pickBucket(list, sh.bucket)
+    const bid = onScreen?.id ?? OPEN
+    // Its lanes only: another bucket's still cached (a read in flight when the row moved, say) draw nothing until its own land.
+    const shown: ApiLane[] = lanesIn(l, onScreen?.id ?? null) ?? []
+    const picked = pickedLengths(sh.lengthsMin, shown)
+    const lanes = shown.map(x => ({ min: x.length_min, label: x.label, hours: x.length_min / 60, ticked: picked.includes(x.length_min), wait: waitLabel(x.wait_ms), waiting: x.waiting, swing: x.swing }))
+    // The picker line names only lengths offered: the shortest and the longest lane.
+    const line = pickerLine(shown.map(x => x.label))
+    const mine = meIn(l, bid)
+    const myRank = rankIn(l, bid)
     const placing = mine?.placement ?? undefined
-    const recent = (l.recent ?? []).slice(0, 3).map(recentRow)
+    const recent = (recentIn(l, bid) ?? []).slice(0, 3).map(recentRow)
     // Below the server's floor: Update takes Queue's place (the server would refuse the queue anyway).
     const gated = standing(l.release) === 'required'
+    // The server's checklist for the bucket on screen isn't met: it takes Queue's place (the server enforces it; the mod draws it as sent).
+    // Only with a row left to meet: `can_queue` false with nothing unmet (Open sent without it, say) draws Queue, and the server says no if it must.
+    const blocked = !gated && !cf.practiceOnly && !!onScreen && !onScreen.canQueue && onScreen.requires.some(r => !r.met)
     return (
       <Box flexDirection="column" gap={1}>
+        {bucketRowShown(list) && (
+          <Box flexDirection="column">
+            <Box gap={1} flexWrap="wrap">
+              {list.map(b => (
+                <Button key={`bucket-${b.id}`} label={b.label} variant={b.id === bid ? 'primary' : 'secondary'} onPress={() => a.chooseBucket(b.id)} />
+              ))}
+            </Box>
+            {onScreen?.blurb && (
+              <Text dimColor wrap="wrap">
+                {onScreen.blurb}
+              </Text>
+            )}
+          </Box>
+        )}
         {rich ? (
-          <Svg source={queueBar({ lanes })} alt={`Queue up. Lose in public. ${lanes.map(x => `${x.hours}h ${x.ticked ? 'ticked' : 'not ticked'}, ${x.wait}, ${x.waiting} waiting`).join('. ')}.`} />
+          <Svg
+            source={queueBar({ lanes: lanes.map(x => ({ hours: x.hours, ticked: x.ticked, wait: x.wait, waiting: x.waiting, swing: x.swing ?? undefined })), line })}
+            alt={`Queue up. Lose in public. ${line ? `${line} ` : ''}${lanes.map(x => `${x.label} ${x.ticked ? 'ticked' : 'not ticked'}, ${x.wait}, ${x.waiting} waiting${x.swing !== null ? `, swing ${x.swing}` : ''}`).join('. ')}.`}
+          />
         ) : (
           <Box flexDirection="column">
             <Box gap={1}>
@@ -3135,10 +7004,10 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
               </Text>
               <Text dimColor>Lose in public.</Text>
             </Box>
-            <Text dimColor>{LINES.lengths}</Text>
+            {line && <Text dimColor>{line}</Text>}
             {lanes.map(x => (
               <Text color={x.ticked ? ORANGE : STONE}>
-                {x.ticked ? '◉' : '○'} {x.hours}h · {x.wait} · {x.waiting} waiting{x.ticked ? '' : ' · off'}
+                {x.ticked ? '◉' : '○'} {x.label} · {x.wait} · {x.waiting} waiting{x.swing !== null ? ` · ±${x.swing}` : ''}{x.ticked ? '' : ' · off'}
               </Text>
             ))}
             <Text dimColor>1 pick lengths › 2 queue › 3 accept in 60s › 4 ship before the bell</Text>
@@ -3146,11 +7015,16 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
         )}
         <Box gap={1} alignItems="center">
           {lanes.map(x => (
-            <Button key={`rl-${x.hours}`} label={`${x.ticked ? '✓ ' : ''}${x.hours}h`} onPress={() => a.toggleLength(x.hours)} />
+            <Button key={`rl-${x.min}`} label={`${x.ticked ? '✓ ' : ''}${x.label}`} onPress={() => a.toggleLength(x.min)} />
           ))}
           {gated ? (
             <Button key="ranked-update" label="Update" variant="primary" onPress={x => a.updateMod(x.surface)} />
-          ) : (
+          ) : cf.practiceOnly ? (
+            // Ranked is paused for this player (queue.practice_only): the line takes Queue's place.
+            <Text color={ORANGE} wrap="wrap">
+              {MOD.rankedPaused}
+            </Text>
+          ) : blocked ? null : (
             <Button key="ranked-queue" label="Queue" variant="primary" onPress={() => a.queue()} />
           )}
         </Box>
@@ -3164,6 +7038,7 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
             {l.updateNote}
           </Text>
         )}
+        {blocked && onScreen && checklistBox(els, onScreen, a)}
         {l.note && (
           <Text color={ORANGE} wrap="wrap">
             {l.note}
@@ -3172,12 +7047,12 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
         {mine &&
           (rich ? (
             <Svg
-              source={ratingCard({ rating: mine.rating, rank: l.myRank ?? undefined, wins: mine.record.w, losses: mine.record.l, placing })}
-              alt={placing ? `Mud, placing ${placing.played} of ${placing.of}, ${mine.record.w}-${mine.record.l}.` : `${mine.tier} ${mine.rating}${l.myRank ? `, rank ${l.myRank}` : ''}, ${mine.record.w}-${mine.record.l}.`}
+              source={ratingCard({ rating: mine.rating, rank: myRank ?? undefined, wins: mine.record.w, losses: mine.record.l, placing })}
+              alt={placing ? `Mud, placing ${placing.played} of ${placing.of}, ${mine.record.w}-${mine.record.l}.` : `${mine.tier} ${mine.rating}${myRank ? `, rank ${myRank}` : ''}, ${mine.record.w}-${mine.record.l}.`}
             />
           ) : (
             <Text bold>
-              {placing ? `Mud · placing ${placing.played} of ${placing.of}` : `${mine.tier} ${mine.rating}${l.myRank ? ` · #${l.myRank}` : ''}`} · {mine.record.w}-{mine.record.l}
+              {placing ? `Mud · placing ${placing.played} of ${placing.of}` : `${mine.tier} ${mine.rating}${myRank ? ` · #${myRank}` : ''}`} · {mine.record.w}-{mine.record.l}
             </Text>
           ))}
         {mine && mine.matches_played === 0 ? (
@@ -3189,44 +7064,60 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
             <Box flexDirection="column">
               {recent.map(x => (
                 <Text dimColor>
-                  {x.day} {x.result === 'won' ? 'W' : x.result === 'lost' ? 'L' : 'D'} {x.hours}h {x.mine}-{x.theirs} vs {x.opponent} {x.delta >= 0 ? '+' : ''}
-                  {x.delta}
+                  {x.day} {x.result === 'won' ? 'W' : x.result === 'lost' ? 'L' : 'D'} {x.label} {x.mine}-{x.theirs} vs {x.opponent} {x.rated === false ? CHALLENGE.unrated : `${x.delta >= 0 ? '+' : ''}${x.delta}`}
                 </Text>
               ))}
             </Box>
           )
         ) : null}
+        {await challengeBox($, e, els, a, t)}
       </Box>
     )
   }
 
   if (sh.phase === 'queued') {
     const secs = Math.max(0, Math.round((t - sh.since) / 1000))
-    const mine = l.me
+    // W3b: your standing in the bucket the server queued you in: placing there draws text, so its hidden rating never shows.
+    const qb = sh.bucket ?? OPEN
+    const mine = meIn(l, qb)
     const half = q?.range ? Math.round((q.range.max - q.range.min) / 2) : 60
     const center = q?.range ? Math.round((q.range.max + q.range.min) / 2) : (mine?.rating ?? 1000)
     const widens = (q?.widening ?? []).map(w => ({ range: Math.round((w.range.max - w.range.min) / 2), label: `+${Math.max(1, Math.round(w.after_ms / 60_000))} min` }))
-    const waiting = sh.lengths.map(h => ({ hours: h, count: q?.per_length[String(h) as '1' | '3']?.waiting ?? 0, ratings: q?.per_length[String(h) as '1' | '3']?.ratings ?? [] }))
+    // What the server queued you for, each with the lane's waiting count and ratings.
+    const waiting = sh.queuedMin.map(min => {
+      const lane = offered.find(x => x.length_min === min)
+      return { min, hours: min / 60, count: lane?.waiting ?? 0, ratings: lane?.ratings ?? [] }
+    })
     return (
       <Box flexDirection="column" gap={1}>
+        {bucketLine(qb)}
         {rich && mine && !mine.placement ? (
-          <Svg source={queueSvg({ seconds: secs, hours: sh.lengths, rating: center, range: half, widens, waiting })} alt={`In queue ${mmss(secs * 1000)}, searching ${center} plus or minus ${half}.`} />
+          <Svg
+            source={queueSvg({ seconds: secs, hours: waiting.map(w => w.hours), rating: center, range: half, widens, waiting: waiting.map(w => ({ hours: w.hours, count: w.count, ratings: w.ratings })) })}
+            alt={`In queue ${mmss(secs * 1000)} for ${andList(waiting.map(w => label(w.min)))}, searching ${center} plus or minus ${half}.`}
+          />
         ) : (
           <Box flexDirection="column">
             <Text bold>
-              In the queue · {mmss(secs * 1000)} · {sh.lengths.map(h => `${h}h`).join(' and ')}
+              In the queue · {mmss(secs * 1000)} · {andList(waiting.map(w => label(w.min)))}
             </Text>
             {waiting.map(w => (
               <Text dimColor>
-                {w.hours}h: {w.count} waiting
+                {label(w.min)}: {w.count} waiting
               </Text>
             ))}
           </Box>
         )}
         <Text dimColor>{LINES.queue[Math.floor(secs / 8) % LINES.queue.length]}</Text>
+        {await matchNotice($, e, els, a, 'queue')}
         <Box>
           <Button key="ranked-leave" label="Leave queue" onPress={() => a.leaveQueue()} />
         </Box>
+        {l.note && (
+          <Text color={ORANGE} wrap="wrap">
+            {l.note}
+          </Text>
+        )}
       </Box>
     )
   }
@@ -3234,33 +7125,50 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
   if (sh.phase === 'offered' && q?.offer) {
     const o = q.offer
     const secs = Math.max(0, Math.round((Date.parse(o.expires_at) - t) / 1000))
-    const mine = l.me
+    // W3b: the ready check stands you in the offer's bucket: its rating, record, rank and placement, as the opponent's and the stakes are.
+    const ob = offerBucket(o, sh)
+    const mine = meIn(l, ob)
+    // W6b: a challenge's ready check is unrated: UNRATED where the stakes go, never +0, and it runs longer than a minute.
+    const challenge = o.kind === 'challenge'
     return (
       <Box flexDirection="column" gap={1}>
+        {bucketLine(ob)}
         {rich && mine ? (
           <Svg
             source={readyCheck({
-              hours: o.length,
+              hours: o.length_min / 60,
               seconds: secs,
-              me: { handle: mine.handle, rating: mine.rating, wins: mine.record.w, losses: mine.record.l, rank: l.myRank ?? 0, placing: mine.placement ?? undefined },
+              me: { handle: mine.handle, rating: mine.rating, wins: mine.record.w, losses: mine.record.l, rank: rankIn(l, ob) ?? 0, placing: mine.placement ?? undefined },
               them: { handle: o.opponent.handle, rating: o.opponent.rating, wins: o.opponent_record.w, losses: o.opponent_record.l, rank: o.opponent_rank ?? 0, placing: o.opponent.placement ?? undefined },
-              stakes: o.stakes,
+              stakes: challenge ? null : o.stakes,
+              ...(challenge ? { mode: 'challenge' as const, of: offerSeconds(cf, secs) } : {}),
             })}
-            alt={`Opponent found: ${o.opponent.handle}, ${o.length}h. ${secs} seconds to accept. Win ${o.stakes.win}, draw ${o.stakes.draw}, loss ${o.stakes.loss}.`}
+            alt={challenge ? `Challenge: ${o.opponent.handle}, ${label(o.length_min)}. ${secs} seconds to accept. Unrated.` : `Opponent found: ${o.opponent.handle}, ${label(o.length_min)}. ${secs} seconds to accept. Win ${o.stakes.win}, draw ${o.stakes.draw}, loss ${o.stakes.loss}.`}
           />
+        ) : challenge ? (
+          <Text bold>{CHALLENGE.readyText(o.opponent.handle, o.opponent.placement ? 'placing' : o.opponent.tier, label(o.length_min), secs)}</Text>
         ) : (
           <Text bold>
-            Opponent found: {o.opponent.handle} ({o.opponent.placement ? 'placing' : o.opponent.tier}) · {o.length}h · {secs}s to accept · win +{o.stakes.win} / loss {o.stakes.loss}
+            Opponent found: {o.opponent.handle} ({o.opponent.placement ? 'placing' : o.opponent.tier}) · {label(o.length_min)} · {secs}s to accept · win +{o.stakes.win} / loss {o.stakes.loss}
           </Text>
         )}
-        <Text>{LINES.found}</Text>
+        {challenge ? !o.you_accepted && <Text>{CHALLENGE.readyTaken(o.opponent.handle)}</Text> : <Text>{LINES.found}</Text>}
         {o.you_accepted ? (
-          <Text dimColor>Accepted. Waiting for {o.opponent.handle}.</Text>
+          <Box gap={1} alignItems="center" flexWrap="wrap">
+            <Text dimColor>Accepted. Waiting for {o.opponent.handle}.</Text>
+            {/* W6b: a challenge's taker waits on the sender for minutes (max(2 minutes, 2.5 x poll_ms.inbox)), not a ranked check's one: they can still back out. */}
+            {challenge && <Button key="ranked-decline" label="Decline" onPress={() => a.decline()} />}
+          </Box>
         ) : (
           <Box gap={1}>
             <Button key="ranked-accept" label="Accept" variant="primary" onPress={() => a.accept()} />
             <Button key="ranked-decline" label="Decline" onPress={() => a.decline()} />
           </Box>
+        )}
+        {l.note && (
+          <Text color={ORANGE} wrap="wrap">
+            {l.note}
+          </Text>
         )}
       </Box>
     )
@@ -3274,21 +7182,27 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
     const live = sm.status === 'live' || sm.status === 'grace'
     const closed = sm.status === 'finished' || sm.status === 'void'
     const left = sm.deadline ? Date.parse(sm.deadline) - t : 0
-    const hot = sm.status === 'live' && left <= 10 * 60_000
+    const hot = sm.status === 'live' && left <= warnMs(sm)
     const scores = r.events.filter((x): x is Extract<typeof x, { kind: 'score' }> => x.kind === 'score').slice(-12).reverse()
     const chats = r.events.filter((x): x is Extract<typeof x, { kind: 'chat' }> => x.kind === 'chat').slice(-8)
     const delta = (mine.rating_after ?? mine.rating_before) - mine.rating_before
     const line = closed ? rankedResultLine(sm, me) : ''
     const asking = await read($, forfeitAsk)
+    // W6b: a challenge's match says so, and its result is unrated (never +0). After any match, Rematch sends them a challenge.
+    const challenge = sm.kind === 'challenge'
+    const kindWord = challenge ? CHALLENGE.liveText(label(sm.length_min)) : `Ranked ${label(sm.length_min)}`
+    const rematch = closed && !cf.practiceOnly && challengesOf(cf).send && (await challengesLive($))
     return (
       <Box flexDirection="column" gap={1}>
         {live && l.online === false && <Text color={ORANGE}>{MOD.offline}</Text>}
-        {rich && race && !closed && <Svg source={raceClimb(race)} alt={`Ranked ${sm.length}h: ${mine.player.handle} ${mine.points}, ${them.player.handle} ${them.points}. ${clock(left)} to the bell.`} />}
+        {live && (await feedNoticeLines($, e, els, a, r))}
+        {rich && race && !closed && <Svg source={raceClimb(race)} alt={`${kindWord}: ${mine.player.handle} ${mine.points}, ${them.player.handle} ${them.points}. ${clock(left)} to the bell.`} />}
+        {closed && (await finisherBlock($, e, els, a, sm, me))}
         {rich && race && closed && (
           <Svg
             source={result({
               outcome: rankedOutcome(sm, me),
-              mode: 'RANKED',
+              mode: modeWord(sm),
               race,
               delta,
               ratingBefore: mine.rating_before,
@@ -3296,13 +7210,14 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
               commits: { mine: mine.commits, theirs: them.commits },
               biggest: { points: mine.biggest_commit?.points ?? 0, craft: (mine.biggest_commit?.craft as 'clean' | 'neutral' | 'sloppy' | undefined) ?? 'neutral' },
               placing: placingOfSide(mine),
+              ...unratedOf(sm),
             })}
             alt={line}
           />
         )}
         {(!rich || !race) && (
           <Text bold>
-            Ranked {sm.length}h · {mine.player.handle} {mine.points} vs {them.points} {them.player.handle} · {closed ? line : sm.deadline ? `${clock(left)} to the bell` : sm.status}
+            {kindWord} · {mine.player.handle} {mine.points} vs {them.points} {them.player.handle} · {closed ? line : sm.deadline ? `${clock(left)} to the bell` : sm.status}
           </Text>
         )}
         {closed && rich && <Text bold>{line}</Text>}
@@ -3324,11 +7239,13 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
           <Box gap={1} flexWrap="wrap">
             {live && <Button key="ranked-titles" label={`Titles: ${s.share ? 'shown' : 'private'}`} onPress={() => a.setShare(!s.share)} />}
             {sm.status === 'live' && <Button key="ranked-forfeit" label="Forfeit" onPress={() => a.askForfeit(true)} />}
-            {closed && <Button key="ranked-again" label="Queue again" variant="primary" onPress={() => a.queueAgain()} />}
+            {closed && !cf.practiceOnly && <Button key="ranked-again" label="Queue again" variant="primary" onPress={() => a.queueAgain('pane')} />}
+            {rematch && <Button key="ranked-rematch" label={CHALLENGE.rematch} onPress={() => a.challengeRematch(them.player.handle, sm.length_min)} />}
             {closed && <Button key="ranked-recap" label="Copy recap" onPress={x => a.copyRecap(x.surface)} />}
             {closed && <Button key="ranked-clear" label="Dismiss" onPress={() => a.rankedClear()} />}
           </Box>
         )}
+        {closed && (await matchNotice($, e, els, a, 'result'))}
         {rich && scores.length > 0 ? (
           <Svg
             source={feedSvg(scores.map(x => ({ at: hhmm(Date.parse(x.at)), mine: x.handle === me, handle: x.handle, points: x.points, craft: x.craft, category: x.category, title: x.title, files: x.files, lines: x.lines_added + x.lines_deleted })))}
@@ -3356,8 +7273,11 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
                 <Text wrap="truncate-end">{clean(c.text)}</Text>
               </Box>
             ))}
-            {them.chat_enabled && e.surface !== 'mobile' && (
-              <Input key="ranked-chat" placeholder={LINES.chatPlaceholder[chats.length % 2]} submitLabel="Send" value={draft} onInput={v => a.setDraft(v)} onSubmit={v => a.rankedChat(v)} />
+            {!cf.chat.match ? (
+              <Text dimColor>{MOD.chatPaused}</Text>
+            ) : (
+              them.chat_enabled &&
+              e.surface !== 'mobile' && <Input key="ranked-chat" placeholder={LINES.chatPlaceholder[chats.length % 2]} submitLabel="Send" value={draft} onInput={v => a.setDraft(v)} onSubmit={v => a.rankedChat(v)} />
             )}
           </Box>
         ) : (
@@ -3367,6 +7287,183 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
     )
   }
   return <Text dimColor>Checking with the server.</Text>
+}
+
+/** One of yours as the box says it, by how it stands; null for one with nobody to name. */
+function outgoingLine(x: Challenge) {
+  const who = x.takenBy?.handle ?? x.to?.handle ?? null
+  if (x.status === 'pending') return x.to ? CHALLENGE.waiting(x.to.handle, x.label) : CHALLENGE.open(x.label, x.id)
+  if (x.status === 'cancelled') return CHALLENGE.withdrawn(x.label)
+  if (x.status === 'expired') return CHALLENGE.expired(x.label)
+  if (!who) return null
+  if (x.status === 'accepted') return CHALLENGE.taken(who, x.label)
+  if (x.status === 'played') return CHALLENGE.played(who, x.label)
+  return CHALLENGE.declined(who, x.label)
+}
+
+/**
+ * The challenge box on the Match tab, between matches (W6b), while challenges are on here: the
+ * challenges to you, each with its message as Text (only while the Chat switch is on), Accept,
+ * Decline, Mute and Report; yours, by how they stand, with Copy link and Withdraw; the form
+ * (a handle, or open, the length and the bucket, a message); and the code box, which takes a
+ * code or its ccsr.gg link. On mobile the inputs are left out: open challenges, a form a Rematch
+ * filled in, and the cards still work. A full hairline border, never a single-side edge.
+ */
+async function challengeBox($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: number): Promise<RenderElement | null> {
+  if (!(await boxIsMine($))) return null
+  const { Box, Text, Button, Input } = els
+  const cf = await configOf($)
+  const c = challengesOf(cf)
+  const ui = await read($, challengeUi)
+  const l = await read($, link)
+  const sh = await rankedShared($)
+  const chatOn = (await read($, settings)).surfaces.chat === 'on'
+  const me = (await serverCfg($)).handle ?? ''
+  const mobile = e.surface === 'mobile'
+  // Ranked paused for this player: the server refuses sending and taking alike (403 ranked_paused), so neither is offered.
+  const paused = cf.practiceOnly
+  const buckets = bucketsOf(cf)
+  const inBucket = (id: string) => (bucketRowShown(buckets) && id !== OPEN ? buckets.find(b => b.id === id)?.label : undefined)
+  const words = (id: string) => (chatOn ? (challengeMessages.get(id) ?? null) : null)
+  const incoming = (ui.incoming ?? []).filter(x => x.status === 'pending' && x.expiresAt > t)
+  const outgoing = ui.outgoing ?? []
+  const form = ui.form
+  const pick = form ? challengePick(cf, l, sh, form) : null
+  const catalog = catalogOf(cf.raw)
+  const cc = ui.code
+  const ccChallenge = cc?.challenge ?? null
+  const takeable = !!ccChallenge && !paused && ccChallenge.status === 'pending' && ccChallenge.expiresAt > t && ccChallenge.from.handle !== me && (ccChallenge.to === null || ccChallenge.to.handle === me)
+  const ccWhy = !ccChallenge ? (cc?.problem || CHALLENGE.checking) : ccChallenge.from.handle === me ? CHALLENGE.ownCode : ccChallenge.status !== 'pending' || ccChallenge.expiresAt <= t ? CHALLENGE.closed : ccChallenge.to && ccChallenge.to.handle !== me ? CHALLENGE.forSomeoneElse : CHALLENGE.left(ccChallenge.expiresAt - t)
+  return (
+    <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+      <Text bold color={STONE}>
+        {CHALLENGE.title.toUpperCase()}
+      </Text>
+      <Text dimColor wrap="wrap">
+        {CHALLENGE.explainer}
+      </Text>
+      {incoming.slice(0, BOX_SHOWN).map(x => {
+        const said = words(x.id)
+        const where = inBucket(x.bucket)
+        return (
+          <Box key={`ch-in-${x.id}`} flexDirection="column">
+            <Text bold wrap="wrap">
+              {where ? CHALLENGE.incomingIn(x.from.handle, x.label, where) : CHALLENGE.incoming(x.from.handle, x.label)}
+            </Text>
+            <Text dimColor>{CHALLENGE.left(x.expiresAt - t)}</Text>
+            {said !== null && <Text wrap="wrap">{said}</Text>}
+            {ui.reportAsk === x.id ? (
+              <Box gap={1} alignItems="center" flexWrap="wrap">
+                <Text>{CHALLENGE.reportAsk(x.from.handle)}</Text>
+                {(['spam', 'abuse', 'other'] as const).map(why => (
+                  <Button key={`ch-report-${x.id}-${why}`} label={CHALLENGE.reasons[why]} onPress={() => a.challengeReport(x.id, why)} />
+                ))}
+                <Button key={`ch-report-${x.id}-cancel`} label={CHALLENGE.cancel} onPress={() => a.challengeAskReport(null)} />
+              </Box>
+            ) : (
+              <Box gap={1} flexWrap="wrap">
+                {!paused && <Button key={`ch-accept-${x.id}`} label={CHALLENGE.accept} variant="primary" onPress={() => a.challengeAccept(x.id, 'card')} />}
+                <Button key={`ch-decline-${x.id}`} label={CHALLENGE.decline} onPress={() => a.challengeDecline(x.id)} />
+                <Button key={`ch-mute-${x.id}`} label={CHALLENGE.mute} variant={ui.muteAsk === x.id ? 'primary' : 'secondary'} onPress={() => a.challengeMute(x.id)} />
+                <Button key={`ch-report-${x.id}`} label={CHALLENGE.report} onPress={() => a.challengeAskReport(x.id)} />
+              </Box>
+            )}
+          </Box>
+        )
+      })}
+      {incoming.length > BOX_SHOWN && <Text dimColor>{CHALLENGE.more(incoming.length - BOX_SHOWN)}</Text>}
+      {outgoing.slice(0, BOX_SHOWN).map(x => {
+        const said = x.status === 'pending' ? words(x.id) : null
+        const lineText = outgoingLine(x)
+        if (lineText === null) return null
+        const open = x.status === 'pending' && x.expiresAt > t
+        return (
+          <Box key={`ch-out-${x.id}`} flexDirection="column">
+            <Box gap={1} alignItems="center" flexWrap="wrap">
+              <Text dimColor={!open} wrap="wrap">
+                {lineText}
+              </Text>
+              {open && <Text dimColor>{CHALLENGE.left(x.expiresAt - t)}</Text>}
+              {open && challengeHref(x.id) && <Button key={`ch-copy-${x.id}`} label={CHALLENGE.copyLink} onPress={p => a.challengeCopy(x.id, p.surface)} />}
+              {open && <Button key={`ch-withdraw-${x.id}`} label={CHALLENGE.withdraw} onPress={() => a.challengeDecline(x.id)} />}
+            </Box>
+            {said !== null && (
+              <Text dimColor wrap="wrap">
+                {said}
+              </Text>
+            )}
+          </Box>
+        )
+      })}
+      {outgoing.length > BOX_SHOWN && <Text dimColor>{CHALLENGE.more(outgoing.length - BOX_SHOWN)}</Text>}
+      {paused ? (
+        <Text color={ORANGE} wrap="wrap">
+          {CHALLENGE.paused}
+        </Text>
+      ) : !c.send ? (
+        <Text dimColor wrap="wrap">
+          {CHALLENGE.sendPaused}
+        </Text>
+      ) : form && pick ? (
+        <Box flexDirection="column">
+          <Text bold wrap="wrap">
+            {form.kind === 'open' ? CHALLENGE.formOpen : form.handle ? CHALLENGE.formHandle(form.handle) : CHALLENGE.formHandleless}
+          </Text>
+          {form.kind === 'handle' && !mobile && <Input key="challenge-handle" label={CHALLENGE.handleLabel} placeholder={CHALLENGE.handlePlaceholder} value={form.handle} onInput={v => a.challengePick({ handle: v })} onSubmit={() => a.challengeSend()} />}
+          {form.kind === 'handle' && mobile && !form.handle && <Text dimColor wrap="wrap">{CHALLENGE.noHandleHere}</Text>}
+          {pick.usable.length > 1 && (
+            <Box gap={1} flexWrap="wrap">
+              {pick.usable.map(b => (
+                <Button key={`ch-bucket-${b.id}`} label={b.label} variant={b.id === pick.bucket ? 'primary' : 'secondary'} onPress={() => a.challengePick({ bucket: b.id })} />
+              ))}
+            </Box>
+          )}
+          {pick.lengths.length === 0 ? (
+            <Text dimColor>{CHALLENGE.noLength}</Text>
+          ) : (
+            <Box gap={1} flexWrap="wrap">
+              {pick.lengths.map(m => (
+                <Button key={`ch-len-${m}`} label={labelFor(m, pick.lanes, catalog)} variant={m === pick.lengthMin ? 'primary' : 'secondary'} onPress={() => a.challengePick({ lengthMin: m })} />
+              ))}
+            </Box>
+          )}
+          {c.message_max > 0 && chatOn && !mobile && <Input key="challenge-message" label={CHALLENGE.messageLabel} placeholder={CHALLENGE.messagePlaceholder(c.message_max)} value={challengeDraft} onInput={v => a.challengeDraft(v)} onSubmit={() => a.challengeSend()} />}
+          <Box gap={1}>
+            {!(form.kind === 'handle' && mobile && !form.handle) && pick.lengthMin !== null && <Button key="challenge-send" label={CHALLENGE.send} variant="primary" onPress={() => a.challengeSend()} />}
+            <Button key="challenge-cancel" label={CHALLENGE.cancel} onPress={() => a.challengeCancel()} />
+          </Box>
+        </Box>
+      ) : (
+        <Box gap={1} flexWrap="wrap">
+          {!mobile && <Button key="challenge-new" label={CHALLENGE.challengeHandle} onPress={() => a.challengeStart('handle')} />}
+          {c.open && <Button key="challenge-open" label={CHALLENGE.openOne} onPress={() => a.challengeStart('open')} />}
+        </Box>
+      )}
+      {!mobile && !paused && <Input key="challenge-code" label={CHALLENGE.codeLabel} placeholder={CHALLENGE.codePlaceholder} submitLabel={CHALLENGE.lookUp} onSubmit={v => a.challengeCode(v)} />}
+      {cc && (
+        <Box flexDirection="column">
+          {ccChallenge && (
+            <Text bold wrap="wrap">
+              {ccChallenge.to ? CHALLENGE.codeTo(ccChallenge.from.handle, ccChallenge.to.handle, ccChallenge.label) : CHALLENGE.codeOpen(ccChallenge.from.handle, ccChallenge.label)}
+            </Text>
+          )}
+          {ccChallenge && words(ccChallenge.id) !== null && <Text wrap="wrap">{words(ccChallenge.id)}</Text>}
+          <Text dimColor wrap="wrap">
+            {ccWhy}
+          </Text>
+          <Box gap={1}>
+            {takeable && <Button key="ch-code-accept" label={CHALLENGE.accept} variant="primary" onPress={() => a.challengeAccept(cc.code, 'code')} />}
+            <Button key="ch-code-close" label={CHALLENGE.close} onPress={() => a.challengeCodeClose()} />
+          </Box>
+        </Box>
+      )}
+      {ui.note && (
+        <Text color={ORANGE} wrap="wrap">
+          {ui.note}
+        </Text>
+      )}
+    </Box>
+  )
 }
 
 async function matchTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: number): Promise<RenderElement> {
@@ -3439,6 +7536,7 @@ async function matchTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: nu
 
   return (
     <Box flexDirection="column" gap={1}>
+      {!live && (await practiceFinisherBlock($, e, els, a, m))}
       {!live && <Text bold>{resultLine(m)}</Text>}
       {rich && !live ? (
         <Svg
@@ -3556,7 +7654,17 @@ async function rankedTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Pro
   const { Box, Text, Svg } = els
   const rich = e.surface !== 'terminal'
   const l = await read($, link)
-  if (l.me && l.ladder) return serverRanked(els, rich, l)
+  // W3b: with more than one bucket, a row picks whose board shows (`board-<id>`); Open is the link as before buckets.
+  const conf = await configOf($)
+  const list = bucketsOf(conf)
+  // W5b: while config has GitHub sign-in on, a handle with GitHub linked carries the ladder badge, on every bucket's board.
+  const badges = providersOn(conf).includes('github')
+  const pick = bucketRowShown(list) ? pickBucket(list, (await read($, boardPick)).ranked) : null
+  if (pick && pick.id !== OPEN) {
+    const v = viewIn(l, pick.id)
+    return boardRow(els, list, pick, a, v.me && v.ladder ? serverRanked(els, rich, v, badges) : <Text dimColor>{BUCKET.loading}</Text>)
+  }
+  if (l.me && l.ladder) return boardRow(els, list, pick, a, serverRanked(els, rich, l, badges))
   const r = await read($, rating)
   const rec = await read($, record)
   const s = await read($, settings)
@@ -3564,7 +7672,11 @@ async function rankedTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Pro
   const pw = Math.max(15, ...rows.map(row => row.handle.length + 2))
 
   const top = rows[0]
-  return (
+  return boardRow(
+    els,
+    list,
+    pick,
+    a,
     <Box flexDirection="column" gap={1}>
       {top && numberOneCard(els, rich, { handle: top.handle, rating: top.rt, wins: Number(top.wl.split('-')[0]) || 0, losses: Number(top.wl.split('-')[1]) || 0 })}
       {rich ? <Svg source={ratingCard({ rating: r, wins: rec.w, losses: rec.l })} alt={`Practice rating ${r}, ${tierOf(r)}, ${rec.w}-${rec.l}.`} /> : null}
@@ -3593,18 +7705,48 @@ async function rankedTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Pro
       <Text dimColor>
         Elo: K 40 for your first 10 matches, then 24. Win, loss or draw only. Tiers: Mud, Iron 650, Bronze 800, Silver 950, Gold 1100, Platinum 1250, Diamond 1400, Master 1600.
       </Text>
+    </Box>,
+  )
+}
+
+/**
+ * The Ranked tab's bucket row over its body (W3b): one button per bucket (`board-<id>`, the
+ * server's label as the button's text) and the picked bucket's blurb. With one bucket (`pick`
+ * null) it is the body alone, exactly as before buckets.
+ */
+function boardRow(els: El, list: readonly Bucket[], pick: Bucket | null, a: Actions, body: RenderElement): RenderElement {
+  if (!pick) return body
+  const { Box, Text, Button } = els
+  return (
+    <Box flexDirection="column" gap={1}>
+      <Box flexDirection="column">
+        <Box gap={1} flexWrap="wrap">
+          {list.map(b => (
+            <Button key={`board-${b.id}`} label={b.label} variant={b.id === pick.id ? 'primary' : 'secondary'} onPress={() => a.chooseBoard('ranked', b.id)} />
+          ))}
+        </Box>
+        {pick.blurb && (
+          <Text dimColor wrap="wrap">
+            {pick.blurb}
+          </Text>
+        )}
+      </Box>
+      {body}
     </Box>
   )
 }
 
-/** The Ranked tab from the server: your card (Mud while placing), the frieze, the top 10 and your row. */
-function serverRanked(els: El, rich: boolean, l: LinkState) {
+/**
+ * The Ranked tab from the server: your card (Mud while placing), the frieze, the top 10 and your
+ * row. `githubBadges` (W5b, config's sign-in on): a handle with GitHub linked carries the badge.
+ */
+function serverRanked(els: El, rich: boolean, l: LinkState, githubBadges = false) {
   const { Box, Text, Svg } = els
   const me = l.me as ApiPlayer
   const placing = me.placement ?? undefined
-  const rows = (l.ladder ?? []).map(x => ({ rank: x.rank, handle: x.player.handle, rating: x.player.rating, wins: x.w, losses: x.l, me: x.player.handle === me.handle }))
+  const rows = (l.ladder ?? []).map(x => ({ rank: x.rank, handle: x.player.handle, rating: x.player.rating, wins: x.w, losses: x.l, me: x.player.handle === me.handle, github: githubBadges && refLinked(x.player, 'github') }))
   const mineShown = rows.some(x => x.me)
-  const ladderRows = mineShown || l.myRank === null ? rows : [...rows, null, { rank: l.myRank, handle: me.handle, rating: me.rating, wins: me.record.w, losses: me.record.l, me: true }]
+  const ladderRows = mineShown || l.myRank === null ? rows : [...rows, null, { rank: l.myRank, handle: me.handle, rating: me.rating, wins: me.record.w, losses: me.record.l, me: true, github: githubBadges && refLinked(me, 'github') }]
   const top = l.ladder?.[0]
   return (
     <Box flexDirection="column" gap={1}>
@@ -3612,7 +7754,7 @@ function serverRanked(els: El, rich: boolean, l: LinkState) {
       {rich && <Svg source={ratingCard({ rating: me.rating, rank: l.myRank ?? undefined, wins: me.record.w, losses: me.record.l, placing })} alt={placing ? `Mud, placing ${placing.played} of ${placing.of}.` : `${me.tier} ${me.rating}${l.myRank ? `, #${l.myRank}` : ''}, ${me.record.w}-${me.record.l}.`} />}
       {rich && <Svg source={tierFrieze({ handle: me.handle, rating: me.rating, placing })} alt={placing ? 'Tiers. You are placing in Mud.' : `Tiers. You are ${me.tier} at ${me.rating}.`} />}
       {rich && ladderRows.length > 0 ? (
-        <Svg source={ladder(ladderRows)} alt={`Ranked: ${rows.map(x => `${x.rank} ${x.handle} ${x.rating}`).join('; ')}`} />
+        <Svg source={ladder(ladderRows)} alt={`Ranked: ${rows.map(x => `${x.rank} ${x.handle} ${x.rating}${x.github ? ` ${PROVIDER_NAMES.github}` : ''}`).join('; ')}`} />
       ) : (
         <Box flexDirection="column">
           {ladderRows.length === 0 && <Text dimColor>Nobody is ranked yet.</Text>}
@@ -3623,6 +7765,7 @@ function serverRanked(els: El, rich: boolean, l: LinkState) {
                 {x.handle.padEnd(16)}
                 {String(x.rating).padEnd(6)}
                 {x.wins}-{x.losses}
+                {x.github ? `  ${PROVIDER_NAMES.github}` : ''}
               </Text>
             ) : (
               <Text dimColor>...</Text>
@@ -3677,26 +7820,42 @@ async function chatTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promi
       </Box>
     )
   if (s.surfaces.chat !== 'on') return <Text dimColor>Chat is off. Turn it on in Settings.</Text>
-  const rooms = l.rooms ?? []
-  const lines = (l.lobby && l.lobby.room === l.room ? l.lobby.events : []).slice(-12)
+  const cf = await configOf($, cfg)
+  // Rooms the server lists that this mod knows; a room switched off (by config or the server's `paused`) has no button and isn't read.
+  const rooms = (l.rooms ?? []).filter(x => ROOMS.includes(x.room))
+  const off = (r: ApiRoom) => roomOff(cf, l.rooms, r)
+  const room = shownRoom(cf, l)
+  // A line it can't draw (an event it has no words for, a missing tier) is dropped, never thrown on.
+  const lines = (room && l.lobby && l.lobby.room === room ? l.lobby.events : []).filter(drawableLine).slice(-12)
   const me = cfg.handle ?? ''
   const msgs = lines.map(x =>
     x.kind === 'chat'
       ? { at: hhmm(Date.parse(x.at)), handle: x.player.handle, tier: x.player.tier.toLowerCase() as TierKey, rank: x.rank ?? undefined, text: x.text, mine: x.player.handle === me }
-      : { at: hhmm(Date.parse(x.at)), handle: x.handle, tier: x.tier.toLowerCase() as TierKey, text: SYSTEM_LINE[x.event](x.handle, x.tier), system: true },
+      : { at: hhmm(Date.parse(x.at)), handle: x.handle, tier: String(x.tier).toLowerCase() as TierKey, text: SYSTEM_LINE[x.event as keyof typeof SYSTEM_LINE](x.handle, String(x.tier)), system: true },
   )
-  const open = rooms.filter(x => x.can_post)
+  const open = rooms.filter(x => x.can_post && !off(x.room))
   const roomName = (r: string) => (r === 'world' ? 'World' : `${r[0]?.toUpperCase()}${r.slice(1)} room`)
+  const pausedMine = myRooms(l).filter(off)
+  const current = room ?? l.room
   return (
     <Box flexDirection="column" gap={1}>
-      {rich && rooms.length > 0 && <Svg source={chatRooms({ rooms: rooms.map(x => ({ key: x.room as 'world' | TierKey, online: x.online, open: x.can_post })), current: l.room as 'world' | TierKey })} alt={`Chat rooms. ${roomName(l.room)}, ${rooms.find(x => x.room === l.room)?.online ?? 0} online.`} />}
+      {rich && rooms.length > 0 && <Svg source={chatRooms({ rooms: rooms.map(x => ({ key: x.room as 'world' | TierKey, online: x.online, open: x.can_post && !off(x.room) })), current: current as 'world' | TierKey })} alt={`Chat rooms. ${roomName(current)}, ${rooms.find(x => x.room === current)?.online ?? 0} online.`} />}
       <Box gap={1} alignItems="center" flexWrap="wrap">
         {open.map(x => (
-          <Button key={`room-${x.room}`} label={roomName(x.room)} variant={x.room === l.room ? 'primary' : 'secondary'} onPress={() => a.setRoom(x.room)} />
+          <Button key={`room-${x.room}`} label={roomName(x.room)} variant={x.room === room ? 'primary' : 'secondary'} onPress={() => a.setRoom(x.room)} />
         ))}
         {rooms.length > open.length && <Text dimColor>{MOD.locked}</Text>}
       </Box>
-      {rich ? (
+      {room &&
+        pausedMine.map(r => (
+          <Text key={`paused-${r}`} dimColor>
+            {MOD.roomPaused(roomName(r))}
+          </Text>
+        ))}
+      {room === 'world' && (await worldNotice($, e, els, a))}
+      {!room ? (
+        <Text color={ORANGE}>{MOD.chatPaused}</Text>
+      ) : rich ? (
         <Svg source={chatLog({ me, messages: msgs })} alt={msgs.length ? msgs.map(m => `${m.handle}: ${m.text}`).join(' / ') : 'No messages yet.'} />
       ) : (
         <Box flexDirection="column">
@@ -3708,7 +7867,7 @@ async function chatTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promi
           ))}
         </Box>
       )}
-      {e.surface !== 'mobile' && <Input key="room-chat" placeholder={LINES.chatPlaceholder[msgs.length % 2]} submitLabel="Send" value={draft} onInput={v => a.setDraft(v)} onSubmit={v => a.roomChat(v)} />}
+      {room && e.surface !== 'mobile' && <Input key="room-chat" placeholder={LINES.chatPlaceholder[msgs.length % 2]} submitLabel="Send" value={draft} onInput={v => a.setDraft(v)} onSubmit={v => a.roomChat(v)} />}
       <Text dimColor>Drawn here only. Chat never reaches Claude's context.</Text>
       {l.note && <Text color={ORANGE} wrap="wrap">{l.note}</Text>}
     </Box>
@@ -3775,7 +7934,7 @@ function sessionRow(els: El, s: PastSession, run: BacktestRun | undefined, isOpe
         <Text color={run?.status === 'done' && run.points > 0 ? ORANGE : STONE}>{status}</Text>
       </Box>
       <Text dimColor wrap="truncate-end">
-        {s.project} · {when(s.startAt)} · {dur(s.endAt - s.startAt)} · {ago(s.endAt, Math.max(t, s.endAt))}
+        {s.project} · {when(s.startAt)} · {dur(s.endAt - s.startAt)} · {agoMs(s.endAt, Math.max(t, s.endAt))}
       </Text>
       {run?.status === 'partial' && <Text dimColor wrap="wrap">{run.note}</Text>}
       <Box gap={1}>
@@ -3855,6 +8014,12 @@ function coinSvg() {
 
 // ---------------------------------------------------------------- settings tab
 
+/**
+ * Report a bug (W4b): through the server's go link, which counts the press and can point
+ * somewhere else without a release. W4a seeds `bug` with Jaen's profile on X.
+ */
+const BUG_LINK = 'https://ccsr.gg/go/bug'
+
 /** "4 min ago" from an ISO time. */
 function ago(iso: string | null, now: number) {
   if (!iso) return 'never'
@@ -3909,6 +8074,22 @@ async function accountRows($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
   )
 }
 
+/** Settings, while eval capture is on for this player (W7-2): Model stats, held on the server, on by default. */
+async function modelStatsRow($: $, els: El, a: Actions, cfg: ServerConfig): Promise<RenderElement> {
+  const { Box, Text, Button } = els
+  const isOn = (await modelStatsOf($, cfg)) !== false
+  return (
+    <Box flexDirection="column">
+      <Box gap={1} alignItems="center">
+        <Text>{EVAL.label}</Text>
+        <Button key="stats-on" label={EVAL.on} variant={isOn ? 'primary' : 'secondary'} onPress={() => a.setModelStats(true)} />
+        <Button key="stats-off" label={EVAL.off} variant={isOn ? 'secondary' : 'primary'} onPress={() => a.setModelStats(false)} />
+      </Box>
+      <Text dimColor>{EVAL.what}</Text>
+    </Box>
+  )
+}
+
 async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promise<RenderElement> {
   const { Box, Text, Button, Input, Select, Link } = els
   const s = await read($, settings)
@@ -3917,6 +8098,8 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
   const sw = s.surfaces
   const l = await read($, link)
   const cfg = await serverCfg($)
+  const cf = await configOf($, cfg)
+  const claude = await claudeVersion($)
   // The Server section's lines: approved with the rest of the mod's copy (docs/copy.md, "The mod").
   const server = (
     <Box flexDirection="column">
@@ -3936,6 +8119,7 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
         await joinBlock($, e, els, a, '')
       )}
       {l.me && (await accountRows($, e, els, a))}
+      {await signInSettings($, e, els, a)}
       {l.note && <Text color={ORANGE} wrap="wrap">{l.note}</Text>}
       {e.surface !== 'mobile' && <Input key="server-url" label="Server URL" value={cfg.url} submitLabel="Use" onSubmit={v => a.setServer(v)} />}
     </Box>
@@ -3955,7 +8139,9 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
         <Button key="preset-quiet" label="Quiet" variant={presetOf(sw) === 'quiet' ? 'primary' : 'secondary'} onPress={() => a.setPreset('quiet')} />
         {presetOf(sw) === 'custom' && <Text dimColor>Custom</Text>}
       </Box>
-      {SURFACE_ROWS.map(row =>
+      {/* W6b: the Challenges switch only while config's `challenges` reads on for this player: dark, there's no challenge UI at all. */}
+      {/* W10b: the two finisher switches only while config's `finishers` is on: off, or a server before W10a, the result card is today's. */}
+      {SURFACE_ROWS.filter(row => (row[0] !== 'challenges' || challengesOf(cf).on) && ((row[0] !== 'finishers' && row[0] !== 'oppFinishers') || finishersOf(cf.raw).on)).map(row =>
         row[0] === 'group' ? (
           <Text bold color={STONE}>
             {row[1].toUpperCase()}
@@ -3965,12 +8151,24 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
             <Box gap={1} alignItems="center" flexWrap="wrap">
               <Text>{row[1]}</Text>
               {row[2].map(([value, label]) => (
-                <Button key={`sw-${row[0]}-${value}`} label={label} variant={sw[row[0] as SurfaceKey] === value ? 'primary' : 'secondary'} onPress={() => a.setSurface(row[0] as SurfaceKey, value)} />
+                // The Challenges, Notices and two finisher switches' keys are spelled out in code by switchKey: scripts/freeze-manifest.txt looks for each one.
+                <Button
+                  key={switchKey(row[0] as SurfaceKey, value)}
+                  label={label}
+                  variant={sw[row[0] as SurfaceKey] === value ? 'primary' : 'secondary'}
+                  onPress={() => a.setSurface(row[0] as SurfaceKey, value)}
+                />
               ))}
             </Box>
             <Text dimColor>{SURFACE_WHAT[row[0] as SurfaceKey]}</Text>
           </Box>
         ),
+      )}
+      {/* W10b: the Finishers view (your callout and color), while config has finishers on and the server knows this install. */}
+      {finishersOf(cf.raw).on && l.me && (
+        <Box>
+          <Button key="finishers-open" label={FINISHER.open} onPress={() => a.setTab('finishers')} />
+        </Box>
       )}
       <Text dimColor>These stay on this machine and apply to every session; chat off also tells your opponent. The match-found check can't be turned off.</Text>
       <Box gap={1} alignItems="center">
@@ -3978,6 +8176,7 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
         <Button key="share-on" label="On" variant={s.share ? 'primary' : 'secondary'} onPress={() => a.setShare(true)} />
         <Button key="share-off" label="Off" variant={s.share ? 'secondary' : 'primary'} onPress={() => a.setShare(false)} />
       </Box>
+      {l.me && captureOn(cf.raw) && (await modelStatsRow($, els, a, cfg))}
       {e.surface !== 'mobile' && (
         <Select
           key="model"
@@ -3996,12 +8195,14 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
         <Button key="reset-grind" label={`Reset Grind: tracking starts now (${list.length} commits)`} onPress={() => a.resetGrind()} />
       </Box>
       <Text bold>What leaves your machine</Text>
-      <Text dimColor>Your code never leaves your machine. Only the points do. And the trash talk.</Text>
-      <Text dimColor>
-        Each scored commit sends its points, category, size and author time, with salted hashes standing in for the repo and the commit. Its title goes only if you share titles. Each judge call runs on your own Claude plan, one call per new commit. Rubric {RUBRIC}.
-      </Text>
+      {privacyLines(cf, RUBRIC).map((x, i) => (
+        <Text key={`privacy-${i}`} dimColor>
+          {x}
+        </Text>
+      ))}
       <Text bold>Version</Text>
       <Text dimColor>{MOD.version(VERSION)}</Text>
+      <Text dimColor>{MOD.claudeFloor(CLAUDE_FLOOR.terminal, CLAUDE_FLOOR.desktop, claude)}</Text>
       <Text dimColor>{MOD.autoUpdate}</Text>
       {l.release && standing(l.release) !== 'current' && (
         <Box gap={1} alignItems="center" flexWrap="wrap">
@@ -4017,9 +8218,1293 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
       <Text bold>Report a bug</Text>
       <Box gap={1} alignItems="center" flexWrap="wrap">
         <Text>Tag or DM</Text>
-        <Link href="https://x.com/speedrunjaen" label="@speedrunjaen" />
+        <Link href={BUG_LINK} label="@speedrunjaen" />
         <Text>on X.</Text>
       </Box>
+    </Box>
+  )
+}
+
+
+// ---------------------------------------------------------------- finishers (W10b)
+// The six win animations (finishers.ts) on a decided match, from the server's pick
+// (MatchSummary.finisher), on the winner's and the loser's screens; practice and replays pick
+// their own with the same rules (finisherplay.ts). Each match's finisher plays once on this
+// machine: its first draw goes in the store (K.finisherSeen), and every draw after the
+// animation's end shows its last frame (freeze), never the playing string, since a new source or
+// a remount restarts every CSS animation. Replay plays it again in this session, a counter comment
+// making the source new. The terminal draws the same beats as text. The Finishers view (a tab off
+// Settings, framed as Settings) picks your callout and color through PATCH /me/finishers. Server
+// text (titles, lines) is cleaned by finisherOf and escaped by the drawing, and never reaches a
+// command reply, $.prompt or $.session.append.
+
+/** Post to X and Post the L: ccsr.gg's share redirect (W10c), which counts the click and opens X's composer with the server's post. */
+const SHARE_BASE = 'https://ccsr.gg/s/'
+/** The Finishers view's preview plays under this id, never a match's. */
+const PREVIEW_ID = 'preview'
+
+/** Where each finisher is in this session: when its play started (its first draw on this machine, or a Replay) and the Replay count. */
+const finisherPlays = new Map<string, { at: number; n: number }>()
+/** One redraw timer per beat of a play, so redraws never stack them. */
+const finisherTimers = new Map<string, { cancel: () => void }>()
+/** The drawings built lately, by what they were built from, so a redraw builds nothing. */
+const finisherMemo = new Map<string, FinisherDrawing>()
+
+/** A Settings switch's button key. The Challenges, Notices and two finisher switches' are spelled out, for scripts/freeze-manifest.txt. */
+function switchKey(row: SurfaceKey, value: string) {
+  if (row === 'challenges') return `sw-challenges-${value}`
+  if (row === 'notices') return `sw-notices-${value}`
+  if (row === 'finishers') return `sw-finishers-${value}`
+  if (row === 'oppFinishers') return `sw-opp-finishers-${value}`
+  return `sw-${row}-${value}`
+}
+
+/** "Bronze" from config's lowercase "bronze". */
+function tierName(t: string) {
+  return t.charAt(0).toUpperCase() + t.slice(1)
+}
+
+/** The drawing for an input, built once (the newest four are kept). */
+function finisherDrawing(input: FinisherInput, short: boolean): FinisherDrawing {
+  const key = JSON.stringify([input, short])
+  const have = finisherMemo.get(key)
+  if (have) return have
+  const drawing = buildFinisher(input, { short })
+  finisherMemo.set(key, drawing)
+  for (const k of [...finisherMemo.keys()].slice(0, Math.max(0, finisherMemo.size - 4))) finisherMemo.delete(k)
+  return drawing
+}
+
+/** The share link for one screen of a match: Post to X on the winner's, Post the L on the loser's; null when it isn't a link the mod may draw (safeLink). */
+function shareLink(id: string, view: 'win' | 'lose') {
+  const path = sharePath(id, view)
+  const href = path ? `${SHARE_BASE}${path}` : null
+  return href && safeLink(href, ['ccsr.gg']) ? { href, label: view === 'win' ? FINISHER.postWin : FINISHER.postLoss } : null
+}
+
+/**
+ * When this match's finisher started playing here: this session's last Replay, else its first
+ * draw on this machine (the store's record, written now when there is none, after this draw).
+ */
+async function finisherStart($: $, id: string, t: number) {
+  const here = finisherPlays.get(id)
+  if (here) return here
+  const seen = seenOf(await storeGet<unknown>($, K.finisherSeen, []))
+  const first = seen.find(x => x.id === id)
+  const play = { at: first ? first.at : t, n: 0 }
+  finisherPlays.set(id, play)
+  for (const k of [...finisherPlays.keys()].slice(0, Math.max(0, finisherPlays.size - 20))) if (k !== PREVIEW_ID) finisherPlays.delete(k)
+  // Never awaited inside the draw: every other session, and every draw after the animation's end, shows the last frame.
+  if (!first) void save($, K.finisherSeen, seenWith(seen, id, t))
+  return play
+}
+
+/** A redraw `ms` from now (finisherRev moves), once per `key`. */
+function finisherAfter($: $, key: string, ms: number) {
+  if (finisherTimers.has(key)) return
+  finisherTimers.set(
+    key,
+    $.clock.after(Math.max(0, ms) + 40, () => {
+      finisherTimers.delete(key)
+      void update($, finisherRev, n => n + 1)
+    }),
+  )
+}
+
+/** What a finisher on screen needs: its id (a match's, or the preview's), its drawing's input, when it started playing here (null: its last frame), its replay button and its share link. */
+type FinisherShow = { id: string; input: FinisherInput; play: { at: number; n: number } | null; replayKey: string; replayLabel: string; onReplay: () => void; share: { href: string; label: string } | null }
+
+/**
+ * A finisher on screen: the drawing (desktop, VS Code, mobile) or the terminal's beats, then its
+ * buttons. The drawing plays from its start for `totalMs`, then shows `freeze(svg, totalMs +
+ * 3000)`; Short is the drawing's own (the action already over, the headline at once). The
+ * terminal draws the bell line, the headline as four half-block rows in the accent color (one
+ * bold line when the rows are wider than the pane), an inverted flash, then the line and the
+ * stats; Short draws them at once.
+ */
+async function finisherView($: $, e: RenderInput<'Pane'>, els: El, f: FinisherShow): Promise<RenderElement> {
+  await read($, finisherRev)
+  const { Box, Text, Button, Svg, Link } = els
+  const short = (await read($, settings)).surfaces.finishers === 'short'
+  const t = await $.clock.now()
+  const words = finisherWords(f.input)
+  const buttons = (
+    <Box gap={1} alignItems="center" flexWrap="wrap">
+      <Button key={f.replayKey} label={f.replayLabel} onPress={() => f.onReplay()} />
+      {f.share && <Link href={f.share.href} label={f.share.label} />}
+    </Box>
+  )
+  const elapsed = f.play ? t - f.play.at : Number.POSITIVE_INFINITY
+  if (e.surface === 'terminal') {
+    const phase = termPhase(elapsed, short)
+    if (f.play && phase !== 'done') for (const beat of TERM_BEATS) if (beat > elapsed) finisherAfter($, `${f.id}:${f.play.n}:${beat}`, beat - elapsed)
+    const color = accentOf(f.input.accent).base
+    const rows = termRows(words.title, e.props.bodyColumns)
+    const flash = phase === 'flash'
+    return (
+      <Box flexDirection="column">
+        <Text dimColor>{FINISHER.bell}</Text>
+        {phase !== 'bell' &&
+          (rows ? (
+            rows.map(r => (
+              <Text color={color} inverse={flash} wrap="truncate-end">
+                {r}
+              </Text>
+            ))
+          ) : (
+            <Text bold color={color} inverse={flash}>
+              {words.title}
+            </Text>
+          ))}
+        {phase === 'done' && words.line && (
+          <Text bold wrap="wrap">
+            {words.line}
+          </Text>
+        )}
+        {phase === 'done' && (
+          <Text dimColor wrap="wrap">
+            {words.stats}
+          </Text>
+        )}
+        {buttons}
+      </Box>
+    )
+  }
+  const drawing = finisherDrawing(f.input, short)
+  const playing = !!f.play && elapsed < drawing.totalMs
+  if (f.play && playing) finisherAfter($, `${f.id}:${f.play.n}`, drawing.totalMs - elapsed)
+  const source = playing ? withCounter(drawing.svg, f.play?.n ?? 0) : freeze(drawing.svg, drawing.totalMs + 3000)
+  return (
+    <Box flexDirection="column">
+      <Svg source={source} alt={FINISHER.alt(words.title, words.line, words.stats)} />
+      {buttons}
+    </Box>
+  )
+}
+
+/**
+ * A decided ranked match's finisher, from the server's pick, above today's result card, which
+ * stays. Null (today's card only) while config has finishers off, with Finishers set to Off, and
+ * for a match with none (a draw, a void, a forfeit, a match decided before W10a).
+ */
+async function finisherBlock($: $, e: RenderInput<'Pane'>, els: El, a: Actions, sm: ApiMatchSummary, me: string): Promise<RenderElement | null> {
+  const sw = (await read($, settings)).surfaces
+  if (sw.finishers === 'off') return null
+  const cfg = finishersOf((await configOf($)).raw)
+  const f = cfg.on ? finisherOf(sm.finisher) : null
+  const input = f ? finisherInput(sm, me, f, { theirs: sw.oppFinishers !== 'default' }) : null
+  if (!f || !input) return null
+  // W10e: the win's custom art, where this screen draws it (artShown): while it's being fetched, a line and no play yet; held,
+  // it plays in our frame from the start; failed, the default kind plays. Either way it plays once, from its first draw.
+  const art = await artFor($, e.surface, sm, input, sw.oppFinishers !== 'default', cleanServer(me))
+  if (art === 'loading') {
+    const { Text } = els
+    return <Text dimColor>{CUSTOM.loading}</Text>
+  }
+  const play = await finisherStart($, sm.id, await $.clock.now())
+  const show: FinisherShow = { id: sm.id, input, play, replayKey: 'ranked-replay', replayLabel: FINISHER.replay, onReplay: () => a.finisherReplay(sm.id), share: cfg.share ? shareLink(sm.id, input.view) : null }
+  if (art) return customFrame($, els, show, art.held, art.ref.by, await artActions($, els, a, sm, art.ref, cleanServer(me), kindOf(f.kind)))
+  return finisherView($, e, els, show)
+}
+
+/** A finished practice match's or replay's finisher, picked here with the server's rules over its own commits; null for a draw, a void or a forfeit. */
+async function practiceFinisherBlock($: $, e: RenderInput<'Pane'>, els: El, a: Actions, m: Match): Promise<RenderElement | null> {
+  if (m.status === 'live') return null
+  const s = await read($, settings)
+  if (s.surfaces.finishers === 'off' || !finishersOf((await configOf($)).raw).on) return null
+  const input = practiceFinisher(m, s.handle)
+  if (!input) return null
+  const play = await finisherStart($, m.id, await $.clock.now())
+  return finisherView($, e, els, { id: m.id, input, play, replayKey: 'practice-replay', replayLabel: FINISHER.replay, onReplay: () => a.finisherReplay(m.id), share: null })
+}
+
+/** Replay (and the preview's Play): the finisher plays again here from now, its source made new by the counter (withCounter). */
+async function replayFinisher($: $, id: string) {
+  const t = await $.clock.now()
+  finisherPlays.set(id, { at: t, n: (finisherPlays.get(id)?.n ?? 0) + 1 })
+  await update($, finisherRev, n => n + 1)
+}
+
+async function playPreview($: $) {
+  await replayFinisher($, PREVIEW_ID)
+}
+
+/**
+ * The finisher's own sound for the ranked match just decided (config's finishers.sounds, only
+ * https://ccsr.gg/sfx/), while finishers are on and Finishers isn't Off; null for the mod's own
+ * stings. ring() asks only for the result's win or loss sting, which pollMatch rings right after
+ * it holds the decided summary.
+ */
+async function finisherSting($: $): Promise<string | null> {
+  if ((await read($, settings)).surfaces.finishers === 'off') return null
+  const f = finisherOf((await read($, link)).ranked?.summary?.finisher)
+  return f ? soundFor(finishersOf((await configOf($)).raw), f.kind) : null
+}
+
+/**
+ * GET /me/finishers for the Finishers view: your picks and which colors you've unlocked, which
+ * move outside config's version. `keepNote` keeps a refusal's line on screen (the read after it).
+ */
+async function refreshFinishers($: $, keepNote: boolean) {
+  const cfg = await serverCfg($)
+  if (!cfg.token) return
+  const key = keyOf(cfg)
+  await update($, finisherUi, u => ({ key, me: u.key === key ? u.me : null, busy: true, note: keepNote && u.key === key ? u.note : '' }))
+  const r = await api($, 'GET', '/me/finishers', undefined, { keepNote: true })
+  if (keyOf(await serverCfg($)) !== key) return
+  const mine = r.status === 200 ? finisherMeOf(r.json) : null
+  await update($, finisherUi, u => (u.key !== key ? u : mine ? { ...u, me: mine, busy: false } : { ...u, busy: false, note: u.note || failLine(r) }))
+  // W10e: the same answer carries your own art and what each slot plays (My finishers).
+  if (r.status === 200) await holdMine($, key, r.json)
+}
+
+/** Why the server refused a pick, in its own words when it gave some, else the mod's line for the code. */
+function finisherRefusal(r: { status: number; json: unknown }) {
+  const err = errorOf(r.json)
+  if (err && err.message !== err.code) return err.message
+  if (err?.code === 'callout_unknown') return FINISHER.calloutGone
+  const tier = (r.json as { tier?: unknown } | null)?.tier
+  if (err?.code === 'accent_locked' && typeof tier === 'string' && /^[a-z]{2,16}$/.test(tier)) return FINISHER.locked(tierName(tier))
+  return failLine(r)
+}
+
+/**
+ * A pick in the Finishers view, as PATCH /me/finishers takes it. Its answer is the view's new
+ * state. A refusal shows the server's line; callout_unknown means the pool changed under this
+ * mod (config is read again) and accent_locked that your tier moved: either way the picks are
+ * read again.
+ */
+async function patchFinishers($: $, body: { callout: string | null } | { accent: string }) {
+  const cfg = await serverCfg($)
+  if (!cfg.token) return
+  const key = keyOf(cfg)
+  await update($, finisherUi, u => ({ ...u, busy: true, note: '' }))
+  const r = await api($, 'PATCH', '/me/finishers', body, { keepNote: true })
+  if (keyOf(await serverCfg($)) !== key) return
+  const mine = r.status === 200 ? finisherMeOf(r.json) : null
+  if (mine) {
+    await update($, finisherUi, u => ({ ...u, key, me: mine, busy: false, note: '' }))
+    // W10e: PATCH answers GET's shape, your art and equips included.
+    await holdMine($, key, r.json)
+    return
+  }
+  await update($, finisherUi, u => ({ ...u, busy: false, note: finisherRefusal(r) }))
+  const code = errorOf(r.json)?.code
+  if (code === 'callout_unknown') void refreshConfig($, 'bucket').catch(() => null)
+  if (code === 'callout_unknown' || code === 'accent_locked') void refreshFinishers($, true).catch(() => null)
+}
+
+async function pickCallout($: $, callout: string | null) {
+  await patchFinishers($, { callout })
+}
+
+async function pickAccent($: $, key: string) {
+  await patchFinishers($, { accent: key })
+}
+
+/**
+ * The Finishers view, off Settings (and a notice's `{ do: 'tab', tab: 'finishers' }`): the
+ * callouts from config, the colors you've unlocked (a locked one says the tier that unlocks
+ * it), and your knockout previewed on its last frame, with Play. Your picks and the locks come
+ * from GET /me/finishers, read each time it opens (selectTab); a pick is PATCH /me/finishers.
+ * With finishers off, or this install not signed in, it says why and offers nothing to pick.
+ */
+async function finishersTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promise<RenderElement> {
+  const { Box, Text, Button } = els
+  const cfg = await serverCfg($)
+  const l = await read($, link)
+  const fc = finishersOf((await configOf($, cfg)).raw)
+  const ui = await read($, finisherUi)
+  const back = (
+    <Box>
+      <Button key="back-settings" label={FINISHER.back} onPress={() => a.setTab('settings')} />
+    </Box>
+  )
+  const head = (
+    <Box flexDirection="column">
+      <Text bold>{FINISHER.title}</Text>
+      <Text dimColor wrap="wrap">
+        {FINISHER.what}
+      </Text>
+    </Box>
+  )
+  if (!fc.on || !cfg.token || l.unknownToken)
+    return (
+      <Box flexDirection="column" gap={1}>
+        {head}
+        <Text dimColor wrap="wrap">
+          {fc.on ? FINISHER.signIn : FINISHER.off}
+        </Text>
+        {back}
+      </Box>
+    )
+  const mine = ui.key === keyOf(cfg) ? ui.me : null
+  const handle = cleanServer(l.me?.handle ?? cfg.handle ?? '')
+  const accents = mine && mine.accents.length > 0 ? mine.accents : fc.accents
+  const callout = mine && mine.callout !== null && fc.callouts.includes(mine.callout) ? mine.callout : null
+  const accent = mine?.accent ?? 'signal'
+  const input = previewInput({ handle, callout, accent, tier: l.me && !l.me.placement ? l.me.tier : 'Mud' })
+  const preview = await finisherView($, e, els, { id: PREVIEW_ID, input, play: finisherPlays.get(PREVIEW_ID) ?? null, replayKey: 'fin-play', replayLabel: FINISHER.play, onReplay: () => a.finisherPreview(), share: null })
+  return (
+    <Box flexDirection="column" gap={1}>
+      {head}
+      {!mine && !ui.note && <Text dimColor>{FINISHER.checking}</Text>}
+      <Box flexDirection="column">
+        <Text bold color={STONE}>
+          {FINISHER.callout.toUpperCase()}
+        </Text>
+        <Box gap={1} flexWrap="wrap">
+          <Button key="fin-callout-none" label={FINISHER.handleCallout(handle)} variant={mine && callout === null ? 'primary' : 'secondary'} onPress={() => a.finisherCallout(null)} />
+          {fc.callouts.map((c, i) => (
+            <Button key={`fin-callout-${i}`} label={c} variant={callout === c ? 'primary' : 'secondary'} onPress={() => a.finisherCallout(c)} />
+          ))}
+        </Box>
+      </Box>
+      <Box flexDirection="column">
+        <Text bold color={STONE}>
+          {FINISHER.color.toUpperCase()}
+        </Text>
+        {/* Each color as a swatch beside its name: a Button once unlocked, else the tier that unlocks it. */}
+        <Box gap={2} flexWrap="wrap">
+          {accents
+            .filter(x => x.unlocked)
+            .map(x => (
+              <Box key={`fin-swatch-${x.key}`} gap={1} alignItems="center">
+                <Text color={accentOf(x.key).base}>■</Text>
+                <Button key={`fin-accent-${x.key}`} label={FINISHER.accents[x.key] ?? x.key} variant={mine && accent === x.key ? 'primary' : 'secondary'} onPress={() => a.finisherAccent(x.key)} />
+              </Box>
+            ))}
+        </Box>
+        {accents
+          .filter(x => !x.unlocked && x.tier)
+          .map(x => (
+            <Box key={`fin-locked-${x.key}`} gap={1}>
+              <Text color={accentOf(x.key).base} dimColor>
+                ■
+              </Text>
+              <Text>{FINISHER.accents[x.key] ?? x.key}</Text>
+              <Text dimColor>{FINISHER.unlocks(tierName(x.tier ?? ''))}</Text>
+            </Box>
+          ))}
+      </Box>
+      <Box flexDirection="column">
+        <Text bold color={STONE}>
+          {FINISHER.preview.toUpperCase()}
+        </Text>
+        {preview}
+      </Box>
+      {/* W10e: Make your own, My finishers and the gallery, each only while config's finishers.custom has it on for you. */}
+      {await customSections($, e, els, a)}
+      {ui.note && (
+        <Text color={ORANGE} wrap="wrap">
+          {cleanServer(ui.note)}
+        </Text>
+      )}
+      {back}
+    </Box>
+  )
+}
+
+
+// ---------------------------------------------------------------- custom finishers (W10e)
+// Players' own finisher art, dark until config's `finishers.custom` says otherwise (customOf in
+// finishers-custom.ts reads it). Authoring uses the player's own Claude: Make a finisher writes
+// ~/ccsr-finisher/SPEC.md and starter.svg from the files this mod ships (mod/finishers/), writes
+// finisher.svg from the starter only when it's missing, and puts CUSTOM.prompt in the prompt box
+// (or offers it to copy). Preview checks finisher.svg with the shared validator (finisherart.ts's
+// checkArt, config's limits held to its ceilings) and draws it in our frame; Submit posts
+// { slot, title, svg }, the check being advice only (the server decides). A win's art
+// (MatchSummary.finisher.art) draws as three stacked Svgs, our HUD, the art sanitized again with
+// the validator's ceilings, our strip, where artShown says; any fetch or check failure draws the
+// default kind. Other players' art, titles and handles live only in this module's memory (art in
+// an 8-entry LRU): never $.state, $.store, the disk, a prompt or a command reply. `customRev`
+// moves the redraw.
+
+/** The draft folder under the home directory, and its three files, overwritten in place ($.fs has no delete). */
+const DRAFT_DIR = 'ccsr-finisher'
+const DRAFT = { spec: 'SPEC.md', starter: 'starter.svg', art: 'finisher.svg' } as const
+/** The previews' plays (finisherPlays): never a match's id. */
+const DRAFT_PLAY = 'draft'
+const GALLERY_PLAY = 'gallery'
+/** Sanitized art kept in memory, by sha256: the newest 8. Art that failed: the newest 64. */
+const ART_KEEP = 8
+const ART_FAILED_KEEP = 64
+/** The art a decided match played, by match id: the newest 20. */
+const ART_REFS_KEEP = 20
+/** An art fetch that hasn't answered by then draws the default kind ($.http.fetch has no timeout). */
+const ART_FETCH_MS = 10_000
+/** My finishers reads GET /me/finishers again while one of yours is pending: at most once a minute, for 30 minutes. */
+const MINE_EVERY_MS = 60_000
+const MINE_FOR_MS = 30 * 60_000
+const MINE_LOOP = 'finishers-mine'
+/** A server's message drawn as a note, cut to a line's worth. */
+const NOTE_MAX = 280
+
+/** Art fetched and checked here: the canonical art, how long it runs, and its held last frame. */
+type HeldArt = { clean: string; durationMs: number; frozen: string }
+type GalleryUi = { sort: 'top' | 'new'; slot: FinisherKind | null; items: Art[]; total: number; read: boolean; note: string }
+/** The custom finishers' state in the Finishers view, for one account. Module memory only (other players' titles and handles are in it). */
+type CustomUi = {
+  /** `<server url>|<handle>`: whose this is. Another account's never draws. */
+  key: string
+  /** GET /me/finishers' `mine` and `equips`, as last read; null until then. */
+  me: CustomMe | null
+  /** The last Preview: what the check found, the sanitized art when it passed, how long it runs and its held last frame. */
+  draft: { problems: Problem[]; clean: string | null; durationMs: number; frozen: string | null } | null
+  /** The last Submit's 422 `finisher_invalid` problems, drawn with the same lines. */
+  refused: Problem[] | null
+  note: string
+  /** A prompt Make or Ask Claude to fix it couldn't put in the box, for Copy the prompt. */
+  prompt: string | null
+  restartAsk: boolean
+  deleteAsk: string | null
+  slot: FinisherKind
+  gallery: GalleryUi
+  galleryPreview: Art | null
+}
+
+function customUi0(key: string): CustomUi {
+  return { key, me: null, draft: null, refused: null, note: '', prompt: null, restartAsk: false, deleteAsk: null, slot: 'knockout', gallery: { sort: 'top', slot: null, items: [], total: 0, read: false, note: '' }, galleryPreview: null }
+}
+
+let customUi: CustomUi = customUi0('')
+/** The title box and the code box, as typed (module variables, like the challenge message). */
+let customTitle = ''
+let customCode = ''
+const artRefs = new Map<string, ArtRef>()
+const artHeld = new Map<string, HeldArt>()
+const artFailed = new Set<string>()
+const artLoading = new Set<string>()
+/** A line under a result's custom art (reported, equipped, or why not), by match id. */
+const artNotes = new Map<string, string>()
+/** The match whose art's report reasons are open. */
+let reportOpen: string | null = null
+let minePollSince = 0
+/** Our HUD and strip around custom art, built once per input. */
+const frameMemo = new Map<string, string>()
+
+/** This account's custom state: a fresh one when the account changed. */
+function customFor(key: string) {
+  if (customUi.key !== key) customUi = customUi0(key)
+  return customUi
+}
+
+async function customMoved($: $) {
+  await update($, customRev, n => n + 1)
+}
+
+/** A line for this account's Finishers view, then a redraw. */
+async function customNote($: $, key: string, note: string) {
+  customFor(key).note = note
+  await customMoved($)
+}
+
+/** A table's own entry (never one every object inherits: a server can send `constructor`), else the fallback. */
+function ownLine(table: Readonly<Record<string, string>>, key: string, fallback: string) {
+  return Object.hasOwn(table, key) ? (table[key] ?? fallback) : fallback
+}
+
+const slotName = (k: string) => ownLine(CUSTOM.slots, k, CUSTOM.slotOther)
+
+/** A problem as the mod draws it (and as Ask Claude to fix it sends it): its own line for the code, and where. */
+function problemLine(p: Problem) {
+  const line = ownLine(CUSTOM.problems, p.code, CUSTOM.problemOther)
+  return p.at === null ? line : `${line} ${CUSTOM.at(p.at)}`
+}
+
+/** Your art's status in a line: a rejection says why, in the mod's words for each reason. */
+function artStatusLine(art: Art) {
+  if (art.status === 'rejected') return CUSTOM.rejected(art.reasons.map(r => ownLine(CUSTOM.reasons, r, CUSTOM.reasonOther)).join(', '))
+  return ownLine(CUSTOM.status, art.status, CUSTOM.statusOther)
+}
+
+/** A refusal in the server's own words (a code added after the freeze still reads), else the mod's line for the status. */
+function customRefusal(r: { status: number; json: unknown }) {
+  const err = errorOf(r.json)
+  if (err && err.message !== err.code) return cleanServer(err.message).slice(0, NOTE_MAX)
+  return reachedOf(r) ? MOD.answered(r.status) : MOD.noServer
+}
+
+/** ~/ccsr-finisher: the folder the player points Claude at. It holds no secret and no other player's art. */
+async function draftDir($: $) {
+  const home = (await $.env.get('HOME').catch(() => undefined)) || (await $.env.get('USERPROFILE').catch(() => undefined))
+  return home ? `${home.replace(/[\\/]+$/, '')}/${DRAFT_DIR}` : null
+}
+
+/** The authoring files this mod ships (mod/finishers/), as bundled: never anything from the server. */
+async function readBundle($: $) {
+  try {
+    const spec = String(await $.fs.read(`${$.plugin.root}/finishers/${DRAFT.spec}`))
+    const starter = String(await $.fs.read(`${$.plugin.root}/finishers/${DRAFT.starter}`))
+    return spec && starter ? { spec, starter } : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Puts `text` in the prompt box, unless the box holds a draft of the player's (a fill would replace
+ * it) or the engine can't (a dialog is open, or headless): then Copy the prompt offers it. True when
+ * it's in the box.
+ */
+async function fillPrompt($: $, key: string, text: string) {
+  let draft = ''
+  try {
+    draft = (await $.prompt.read()).text
+  } catch {
+    draft = ''
+  }
+  if (!draft.trim()) {
+    try {
+      if ((await $.prompt.fill({ text })).isFilled) {
+        customFor(key).prompt = null
+        return true
+      }
+    } catch {
+      // Not filled: offered to copy below.
+    }
+  }
+  customFor(key).prompt = text
+  return false
+}
+
+/**
+ * Make a finisher: SPEC.md and starter.svg in ~/ccsr-finisher from the files this mod ships, and
+ * finisher.svg from the starter only when $.fs.exists says it's missing, so a second press never
+ * loses work. Then the bundled prompt goes in the prompt box; Claude Code asks before Claude reads
+ * or edits outside the project.
+ */
+async function makeFinisher($: $) {
+  const cfg = await serverCfg($)
+  const key = keyOf(cfg)
+  if (!customOf((await configOf($, cfg)).raw).create) return
+  customFor(key).restartAsk = false
+  const dir = await draftDir($)
+  if (!dir) return customNote($, key, CUSTOM.noHome)
+  const bundle = await readBundle($)
+  if (!bundle) return customNote($, key, CUSTOM.noBundle)
+  let kept = false
+  try {
+    await $.fs.write(`${dir}/${DRAFT.spec}`, bundle.spec)
+    await $.fs.write(`${dir}/${DRAFT.starter}`, bundle.starter)
+    kept = await $.fs.exists(`${dir}/${DRAFT.art}`)
+    if (!kept) await $.fs.write(`${dir}/${DRAFT.art}`, bundle.starter)
+  } catch {
+    return customNote($, key, CUSTOM.notWritten)
+  }
+  const filled = await fillPrompt($, key, CUSTOM.prompt)
+  await customNote($, key, `${kept ? CUSTOM.madeKept : CUSTOM.made} ${filled ? CUSTOM.filled : CUSTOM.notFilled}`)
+}
+
+/** Start over: the first press asks, the second writes finisher.svg from the starter again. */
+async function restartFinisher($: $) {
+  const cfg = await serverCfg($)
+  const key = keyOf(cfg)
+  if (!customOf((await configOf($, cfg)).raw).create) return
+  const ui = customFor(key)
+  if (!ui.restartAsk) {
+    ui.restartAsk = true
+    return customNote($, key, CUSTOM.restartAsk)
+  }
+  ui.restartAsk = false
+  const dir = await draftDir($)
+  if (!dir) return customNote($, key, CUSTOM.noHome)
+  const bundle = await readBundle($)
+  if (!bundle) return customNote($, key, CUSTOM.noBundle)
+  try {
+    await $.fs.write(`${dir}/${DRAFT.art}`, bundle.starter)
+  } catch {
+    return customNote($, key, CUSTOM.notWritten)
+  }
+  ui.draft = null
+  ui.refused = null
+  await customNote($, key, CUSTOM.restarted)
+}
+
+/** finisher.svg as it stands, or null after saying why (no home folder, none yet, unreadable). */
+async function readDraft($: $, key: string): Promise<string | null> {
+  const dir = await draftDir($)
+  if (!dir) {
+    await customNote($, key, CUSTOM.noHome)
+    return null
+  }
+  const path = `${dir}/${DRAFT.art}`
+  try {
+    if (!(await $.fs.exists(path))) {
+      await customNote($, key, CUSTOM.noDraft)
+      return null
+    }
+    return String(await $.fs.read(path))
+  } catch {
+    await customNote($, key, CUSTOM.notRead)
+    return null
+  }
+}
+
+/**
+ * Preview: finisher.svg through the shared validator (checkArt, config's limits held to the
+ * module's ceilings), its problems drawn with the mod's own lines, and when it passes, the art in
+ * our frame on its last frame, with Play.
+ */
+async function checkDraft($: $) {
+  const cfg = await serverCfg($)
+  const key = keyOf(cfg)
+  const cc = customOf((await configOf($, cfg)).raw)
+  if (!cc.create) return
+  const ui = customFor(key)
+  ui.restartAsk = false
+  const svg = await readDraft($, key)
+  if (svg === null) return
+  const check = checkArt(svg, cc.limits)
+  const clean = check.ok ? check.clean : null
+  const frozen = clean ? freezeArt(clean, (customTiming(check.stats.duration_ms).totalMs + 3000) / 1000) : null
+  ui.draft = { problems: localProblems(check.problems), clean, durationMs: check.stats.duration_ms, frozen }
+  ui.refused = null
+  ui.note = ''
+  // The preview starts on its last frame; Play plays it.
+  finisherPlays.delete(DRAFT_PLAY)
+  await customMoved($)
+}
+
+/**
+ * Ask Claude to fix it: only the mod's own problem lines (and where in the file), for the player's
+ * own file. A title the server refused is the title box's (drawn there), never a problem in the file.
+ */
+async function fixDraft($: $) {
+  const key = keyOf(await serverCfg($))
+  const ui = customFor(key)
+  const refused = artProblems(ui.refused)
+  const list = refused.length ? refused : artProblems(ui.draft?.problems)
+  if (!list.length) return
+  const filled = await fillPrompt($, key, CUSTOM.fixPrompt(list.map(problemLine)))
+  await customNote($, key, filled ? CUSTOM.fixFilled : CUSTOM.notFilled)
+}
+
+async function copyCustomPrompt($: $, surface: 'terminal' | 'desktop' | 'vscode' | 'mobile') {
+  const key = keyOf(await serverCfg($))
+  const text = customFor(key).prompt ?? CUSTOM.prompt
+  const c = await $.ui.copy({ text, surface }).catch(() => ({ isCopied: false }))
+  await customNote($, key, c.isCopied ? CUSTOM.copied : CUSTOM.notCopied)
+}
+
+async function pickCustomSlot($: $, kind: string) {
+  const key = keyOf(await serverCfg($))
+  customFor(key).slot = kindOf(kind)
+  await customMoved($)
+}
+
+/**
+ * Submit: POST /finishers with exactly { slot, title, svg }, finisher.svg read again as it stands.
+ * The local check never blocks it (the server's allowlist can widen after the freeze). A 422 draws
+ * its problems with the same lines; any other refusal shows the server's message.
+ */
+async function submitDraft($: $) {
+  const cfg = await serverCfg($)
+  if (!cfg.token) return
+  const key = keyOf(cfg)
+  if (!customOf((await configOf($, cfg)).raw).create) return
+  const ui = customFor(key)
+  ui.restartAsk = false
+  const svg = await readDraft($, key)
+  if (svg === null) return
+  const slot = ui.slot
+  const title = titleFor(customTitle, CUSTOM.defaultTitle(slotName(slot)))
+  const r = await api($, 'POST', '/finishers', { slot, title, svg }, { keepNote: true })
+  if (keyOf(await serverCfg($)) !== key) return
+  const err = errorOf(r.json)
+  if (r.status === 201) {
+    ui.refused = null
+    await customNote($, key, CUSTOM.sent)
+    // Your art, the new one pending: My finishers reads it, and reads again until it is reviewed.
+    void refreshFinishers($, true).catch(() => null)
+    return
+  }
+  if (r.status === 422 && err?.code === 'finisher_invalid') {
+    ui.refused = problemsOf(r.json)
+    return customNote($, key, '')
+  }
+  ui.refused = null
+  if (err?.code === 'finishers_closed') void refreshConfig($, 'bucket').catch(() => null)
+  await customNote($, key, customRefusal(r))
+}
+
+/**
+ * GET /me/finishers' (or PATCH's) `mine` and `equips`, for this account: My finishers draws them.
+ * Your art that left review since this session last read it gets one toast on the machine (the
+ * store's finisherTold, ids only), under the Toasts switch; while any is pending the poll runs.
+ */
+async function holdMine($: $, key: string, json: unknown) {
+  const ui = customFor(key)
+  const before = ui.me
+  const next = customMeOf(json)
+  ui.me = next
+  await customMoved($)
+  if (before) {
+    const done = next.mine.filter(x => (x.status === 'approved' || x.status === 'rejected') && before.mine.some(b => b.id === x.id && b.status === 'pending'))
+    if (done.length) await tellReviewed($, done)
+  }
+  if (next.mine.some(x => x.status === 'pending')) await startMinePoll($)
+}
+
+async function tellReviewed($: $, done: Art[]) {
+  const raw = await storeGet<unknown>($, K.finisherTold, [])
+  const told = Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : []
+  const fresh = done.filter(x => !told.includes(x.id))
+  if (!fresh.length) return
+  await save($, K.finisherTold, [...told, ...fresh.map(x => x.id)].slice(-20))
+  for (const x of fresh) await ambient($, x.status === 'approved' ? CUSTOM.toastApproved(slotName(x.slot).toLowerCase()) : CUSTOM.toastRejected(slotName(x.slot).toLowerCase()))
+}
+
+/** My finishers' poll: GET /me/finishers at max(60 s, poll_ms.idle) while one of yours is pending, for 30 minutes at most. */
+async function startMinePoll($: $) {
+  if (loops.has(MINE_LOOP)) return
+  minePollSince = await $.clock.now()
+  loop($, MINE_LOOP, async () => Math.max(MINE_EVERY_MS, (await configOf($)).poll.idle), isCurrent => pollMine($, isCurrent))
+}
+
+async function pollMine($: $, isCurrent: () => boolean): Promise<Answer | void> {
+  const cfg = await serverCfg($)
+  if (!cfg.token || (await $.clock.now()) - minePollSince > MINE_FOR_MS) return stopLoop(MINE_LOOP)
+  const key = keyOf(cfg)
+  const r = await api($, 'GET', '/me/finishers', undefined, { keepNote: true })
+  if (!isCurrent() || keyOf(await serverCfg($)) !== key) return r
+  if (r.status === 200) {
+    await holdMine($, key, r.json)
+    if (!customFor(key).me?.mine.some(x => x.status === 'pending')) stopLoop(MINE_LOOP)
+  }
+  return r
+}
+
+/**
+ * Equips art in a slot (PATCH /me/finishers `{ equip: { slot, id } }`, or `{ slot, code }` for a
+ * typed code), or empties the slot (`id: null`). A code typed for another slot goes once more in
+ * the slot the server names (409 finisher_wrong_slot), so a code needs no slot picked. The answer
+ * has GET /me/finishers' shape, which My finishers and the picks take. `matchId` puts the line
+ * under that result's art instead of in the view.
+ */
+async function equipArt($: $, slot: string, pick: { id: string | null } | { code: string }, matchId: string | null) {
+  const cfg = await serverCfg($)
+  if (!cfg.token) return
+  const key = keyOf(cfg)
+  let used = kindOf(slot)
+  let r = await api($, 'PATCH', '/me/finishers', { equip: { slot: used, ...pick } }, { keepNote: true })
+  const named = 'code' in pick && r.status === 409 && errorOf(r.json)?.code === 'finisher_wrong_slot' ? wrongSlotOf(r.json) : null
+  if (named && named !== used) {
+    used = named
+    r = await api($, 'PATCH', '/me/finishers', { equip: { slot: used, ...pick } }, { keepNote: true })
+  }
+  if (keyOf(await serverCfg($)) !== key) return
+  let line: string
+  if (r.status === 200) {
+    await holdMine($, key, r.json)
+    const picks = finisherMeOf(r.json)
+    if (picks) await update($, finisherUi, u => (u.key === key ? { ...u, me: picks } : u))
+    line = 'id' in pick && pick.id === null ? CUSTOM.unequippedNow(slotName(used).toLowerCase()) : CUSTOM.equippedNow(slotName(used).toLowerCase())
+  } else {
+    if (errorOf(r.json)?.code === 'finishers_closed') void refreshConfig($, 'bucket').catch(() => null)
+    line = customRefusal(r)
+  }
+  if (!matchId) return customNote($, key, line)
+  artNotes.set(matchId, line)
+  await update($, finisherRev, n => n + 1)
+}
+
+/** Equip a code: the typed code (any case, spaces and dashes ignored), in the gallery's slot, or wherever the server says it goes. */
+async function equipTypedCode($: $) {
+  const key = keyOf(await serverCfg($))
+  const code = artCode(customCode)
+  if (!code) return customNote($, key, CUSTOM.badCode)
+  await equipArt($, customFor(key).gallery.slot ?? 'knockout', { code }, null)
+}
+
+/** Delete on your own art: the first press asks, the second deletes it (DELETE /finishers/:id) and reads your art again. */
+async function deleteArt($: $, id: string) {
+  const cfg = await serverCfg($)
+  if (!cfg.token) return
+  const key = keyOf(cfg)
+  const ui = customFor(key)
+  if (ui.deleteAsk !== id) {
+    ui.deleteAsk = id
+    return customNote($, key, CUSTOM.deleteAsk)
+  }
+  ui.deleteAsk = null
+  const r = await api($, 'DELETE', `/finishers/${id}`, undefined, { keepNote: true })
+  if (keyOf(await serverCfg($)) !== key) return
+  await customNote($, key, r.status === 204 ? CUSTOM.deleted : customRefusal(r))
+  void refreshFinishers($, true).catch(() => null)
+}
+
+/**
+ * The gallery (GET /finishers?sort=&slot=&offset=&limit=20), while config's gallery is on for you:
+ * a sort or a slot reads its first page, More appends the next. A 403 finishers_closed means config
+ * is stale, so it is read again.
+ */
+async function readGallery($: $, patch: { sort?: 'top' | 'new'; slot?: string | null; more?: boolean }) {
+  const cfg = await serverCfg($)
+  if (!cfg.token || !customOf((await configOf($, cfg)).raw).gallery) return
+  const key = keyOf(cfg)
+  const ui = customFor(key)
+  const g = ui.gallery
+  if (patch.sort) g.sort = patch.sort
+  if (patch.slot !== undefined) g.slot = patch.slot === null ? null : kindOf(patch.slot)
+  const offset = patch.more ? g.items.length : 0
+  await customMoved($)
+  const r = await api($, 'GET', `/finishers?sort=${g.sort}${g.slot ? `&slot=${g.slot}` : ''}&offset=${offset}&limit=${GALLERY_PAGE}`, undefined, { keepNote: true })
+  if (keyOf(await serverCfg($)) !== key) return
+  const now2 = customFor(key).gallery
+  const page = r.status === 200 ? galleryOf(r.json) : null
+  if (page) {
+    now2.items = patch.more ? [...now2.items, ...page.items.filter(x => !now2.items.some(y => y.id === x.id))] : page.items
+    now2.total = page.total
+    now2.read = true
+    now2.note = ''
+  } else {
+    now2.note = customRefusal(r)
+    if (errorOf(r.json)?.code === 'finishers_closed') void refreshConfig($, 'bucket').catch(() => null)
+  }
+  await customMoved($)
+}
+
+/** Preview on a gallery row: that art in our frame (fetched into memory only on a surface that draws it), on its last frame, with Play. */
+async function previewGalleryArt($: $, id: string, surface: string) {
+  const cfg = await serverCfg($)
+  const key = keyOf(cfg)
+  const ui = customFor(key)
+  const art = ui.gallery.items.find(x => x.id === id) ?? null
+  ui.galleryPreview = art
+  finisherPlays.delete(GALLERY_PLAY)
+  await customMoved($)
+  if (art?.sha256 && drawsArt(customOf((await configOf($, cfg)).raw), surface)) wantArt($, { id: art.id, sha256: art.sha256 }, false)
+}
+
+/** The Finishers view opened: the gallery's first page, while it is on for you. */
+async function customOpened($: $) {
+  const cfg = await serverCfg($)
+  if (cfg.token && customOf((await configOf($, cfg)).raw).gallery) await readGallery($, {})
+}
+
+async function askArtReport($: $, matchId: string | null) {
+  reportOpen = matchId
+  await update($, finisherRev, n => n + 1)
+}
+
+/** Report on a result's custom art: POST /finishers/:id/report with the reason and the match it played in. */
+async function reportArt($: $, matchId: string, reason: ReportReason) {
+  reportOpen = null
+  const ref = artRefs.get(matchId)
+  if (!ref || !(REPORT_REASONS as readonly string[]).includes(reason)) return
+  const body = /^m_[A-Za-z0-9_-]{12}$/.test(matchId) ? { reason, match_id: matchId } : { reason }
+  const r = await api($, 'POST', `/finishers/${ref.id}/report`, body, { keepNote: true })
+  artNotes.set(matchId, r.status === 204 ? CUSTOM.reported : customRefusal(r))
+  await update($, finisherRev, n => n + 1)
+}
+
+/** Art held in memory, the most recently drawn kept longest. */
+function heldArt(sha: string) {
+  const held = artHeld.get(sha)
+  if (held) {
+    artHeld.delete(sha)
+    artHeld.set(sha, held)
+  }
+  return held
+}
+
+/**
+ * Starts fetching `ref`'s art unless it is held, failed or already coming. From a draw (`inDraw`)
+ * it starts on a timer, since a draw writes nothing and the fetch's redraw is a state write.
+ */
+function wantArt($: $, ref: { id: string; sha256: string }, inDraw: boolean) {
+  if (artHeld.has(ref.sha256) || artFailed.has(ref.sha256) || artLoading.has(ref.sha256)) return
+  artLoading.add(ref.sha256)
+  const go = () => void fetchArt($, ref).catch(err => $.ui.log(`CCSR finisherart: ${(err as Error).message}`))
+  if (inDraw) $.clock.after(0, go)
+  else go()
+}
+
+/**
+ * GET /finishers/:id/art into memory: the art the server sent (its sha256 the ref's), checked again
+ * with the validator's ceilings (art approved under higher limits stays approved when they are
+ * lowered), and its held last frame. A refusal, an answer that doesn't hold, a check that fails or
+ * no answer in 10 s marks it failed: it draws the default kind this session.
+ */
+async function fetchArt($: $, ref: { id: string; sha256: string }) {
+  let settled = false
+  const fail = () => {
+    if (settled) return
+    settled = true
+    artLoading.delete(ref.sha256)
+    artFailed.add(ref.sha256)
+    for (const k of [...artFailed].slice(0, Math.max(0, artFailed.size - ART_FAILED_KEEP))) artFailed.delete(k)
+    void update($, finisherRev, n => n + 1)
+    void customMoved($)
+  }
+  const watchdog = $.clock.after(ART_FETCH_MS, fail)
+  try {
+    const r = await api($, 'GET', `/finishers/${ref.id}/art`, undefined, { keepNote: true })
+    if (settled) return
+    const body = (r.json ?? {}) as { id?: unknown; sha256?: unknown; svg?: unknown }
+    if (r.status !== 200 || body.id !== ref.id || body.sha256 !== ref.sha256 || typeof body.svg !== 'string' || (await sha256hex(body.svg)) !== ref.sha256) return fail()
+    const check = checkArt(body.svg, ART_CEILINGS)
+    const clean = check.ok ? check.clean : null
+    const frozen = clean ? freezeArt(clean, (customTiming(check.stats.duration_ms).totalMs + 3000) / 1000) : null
+    if (!clean || !frozen || settled) return fail()
+    settled = true
+    watchdog.cancel()
+    artLoading.delete(ref.sha256)
+    artHeld.set(ref.sha256, { clean, durationMs: check.stats.duration_ms, frozen })
+    for (const k of [...artHeld.keys()].slice(0, Math.max(0, artHeld.size - ART_KEEP))) artHeld.delete(k)
+    await update($, finisherRev, n => n + 1)
+    await customMoved($)
+  } catch {
+    fail()
+  }
+}
+
+/**
+ * Takes a summary's `finisher.art` into module memory, never the link atom ($.state), and starts
+ * fetching the art when this pane draws it (so a result rarely waits on it). Returns the summary
+ * without it.
+ */
+async function keepArtRef($: $, sm: ApiMatchSummary): Promise<ApiMatchSummary> {
+  const f = sm.finisher
+  if (!f || f.art === undefined) return sm
+  const ref = artRefOf(f.art)
+  if (!ref) artRefs.delete(sm.id)
+  else {
+    artRefs.delete(sm.id)
+    artRefs.set(sm.id, ref)
+    for (const k of [...artRefs.keys()].slice(0, Math.max(0, artRefs.size - ART_REFS_KEEP))) artRefs.delete(k)
+    const me = cleanServer((await serverCfg($)).handle ?? '')
+    const sw = (await read($, settings)).surfaces
+    const custom = customOf((await configOf($)).raw)
+    if (paneSurface && sw.finishers !== 'off' && artShown({ custom, surface: paneSurface, view: sm.winner === me ? 'win' : 'lose', theirs: sw.oppFinishers !== 'default', own: ref.by === me })) wantArt($, ref, false)
+  }
+  return { ...sm, finisher: { ...f, art: null } }
+}
+
+/**
+ * The custom art a decided match's finisher draws on this screen: the art held in memory, 'loading'
+ * while it is being fetched (a fetch is started), or null for the default kind (no art, not drawn
+ * here, or a fetch or check that failed).
+ */
+async function artFor($: $, surface: string, sm: ApiMatchSummary, input: FinisherInput, theirs: boolean, me: string): Promise<{ ref: ArtRef; held: HeldArt } | 'loading' | null> {
+  // The fetch's redraw moves finisherRev: every branch reads it, the loading line's included, or a draw that shows the line
+  // would never hear the art land (found in the suite: the line stayed until some other state happened to move).
+  await read($, finisherRev)
+  const ref = artRefs.get(sm.id)
+  if (!ref) return null
+  const custom = customOf((await configOf($)).raw)
+  if (!artShown({ custom, surface, view: input.view, theirs, own: ref.by === me })) return null
+  const held = heldArt(ref.sha256)
+  if (held) return { ref, held }
+  if (artFailed.has(ref.sha256)) return null
+  wantArt($, ref, true)
+  return 'loading'
+}
+
+/** Our HUD and strip for custom art, each built once per input. */
+function customHud(input: FinisherInput) {
+  const key = `hud ${JSON.stringify(input)}`
+  const have = frameMemo.get(key)
+  if (have !== undefined) return have
+  const svg = finisherHud(input)
+  frameMemo.set(key, svg)
+  for (const k of [...frameMemo.keys()].slice(0, Math.max(0, frameMemo.size - 8))) frameMemo.delete(k)
+  return svg
+}
+
+function customStrip(input: FinisherInput, atMs: number) {
+  const key = `strip ${atMs} ${JSON.stringify(input)}`
+  const have = frameMemo.get(key)
+  if (have !== undefined) return have
+  const svg = finisherStrip(input, { atMs })
+  frameMemo.set(key, svg)
+  for (const k of [...frameMemo.keys()].slice(0, Math.max(0, frameMemo.size - 8))) frameMemo.delete(k)
+  return svg
+}
+
+/**
+ * Custom art on screen: three stacked Svgs with no gap, our HUD (the handles, the points, the bell
+ * at 0.8 s), the art, our strip (the line and the stats, in at customTiming's lineAtMs), playing
+ * from the start for customTiming's totalMs, then each held on its last frame at totalMs + 3000
+ * (freeze for ours, freezeArt for the art), as the six finishers do. Short draws the held frames at
+ * once. Replay changes all three sources (withCounter). Then "Finisher by {handle}" as Text, Replay,
+ * the share link, and `extra` (a result's Report and Equip this).
+ */
+async function customFrame($: $, els: El, f: FinisherShow, held: HeldArt, by: string, extra: RenderElement | null): Promise<RenderElement> {
+  await read($, finisherRev)
+  const { Box, Text, Button, Svg, Link } = els
+  const short = (await read($, settings)).surfaces.finishers === 'short'
+  const t = await $.clock.now()
+  const { lineAtMs, totalMs } = customTiming(held.durationMs)
+  const hud = customHud(f.input)
+  const strip = customStrip(f.input, lineAtMs)
+  const elapsed = f.play ? t - f.play.at : Number.POSITIVE_INFINITY
+  const playing = !short && !!f.play && elapsed < totalMs
+  if (f.play && playing) finisherAfter($, `${f.id}:${f.play.n}:custom`, totalMs - elapsed)
+  const n = f.play?.n ?? 0
+  const hold = totalMs + 3000
+  const words = finisherWords(f.input)
+  return (
+    <Box flexDirection="column">
+      <Svg source={playing ? withCounter(hud, n) : freeze(hud, hold)} alt={words.stats} />
+      <Svg source={playing ? withCounter(held.clean, n) : held.frozen} alt={CUSTOM.artAlt(by)} />
+      <Svg source={playing ? withCounter(strip, n) : freeze(strip, hold)} alt={words.line} />
+      <Text dimColor>{CUSTOM.by(by)}</Text>
+      <Box gap={1} alignItems="center" flexWrap="wrap">
+        <Button key={f.replayKey} label={f.replayLabel} onPress={() => f.onReplay()} />
+        {f.share && <Link href={f.share.href} label={f.share.label} />}
+      </Box>
+      {extra}
+    </Box>
+  )
+}
+
+/** Under a result's custom art: Report (its six reasons, two presses) and Equip this (while the gallery is on for you), for another player's art; then any line. */
+async function artActions($: $, els: El, a: Actions, sm: ApiMatchSummary, ref: ArtRef, me: string, slot: string): Promise<RenderElement | null> {
+  const { Box, Text, Button } = els
+  const note = artNotes.get(sm.id)
+  const theirs = ref.by !== me
+  if (!theirs && !note) return null
+  const gallery = customOf((await configOf($)).raw).gallery
+  return (
+    <Box flexDirection="column">
+      {theirs &&
+        (reportOpen === sm.id ? (
+          <Box flexDirection="column">
+            <Text>{CUSTOM.reportAsk}</Text>
+            <Box gap={1} flexWrap="wrap">
+              {REPORT_REASONS.map(r => (
+                <Button key={`ranked-report-${r}`} label={ownLine(CUSTOM.reportReasons, r, r)} onPress={() => a.finisherReport(sm.id, r)} />
+              ))}
+              <Button key="ranked-report-cancel" label={CUSTOM.cancel} onPress={() => a.finisherAskReport(null)} />
+            </Box>
+          </Box>
+        ) : (
+          <Box gap={1} flexWrap="wrap">
+            <Button key="ranked-report" label={CUSTOM.report} onPress={() => a.finisherAskReport(sm.id)} />
+            {gallery && <Button key="ranked-equip-art" label={CUSTOM.equipThis} onPress={() => a.finisherEquip(slot, ref.id, sm.id)} />}
+          </Box>
+        ))}
+      {note && (
+        <Text dimColor wrap="wrap">
+          {note}
+        </Text>
+      )}
+    </Box>
+  )
+}
+
+/** A preview of art in our frame with sample data, or why it doesn't draw: the draft's (your own file) and a gallery row's. */
+async function customPreview($: $, els: El, a: Actions, o: { play: string; held: HeldArt | null; loading: boolean; by: string; input: FinisherInput; drawn: boolean }) {
+  const { Text } = els
+  if (!o.drawn) return <Text dimColor>{CUSTOM.noSurface}</Text>
+  if (!o.held) return o.loading ? <Text dimColor>{CUSTOM.loading}</Text> : <Text dimColor>{CUSTOM.previewFailed}</Text>
+  const show: FinisherShow = { id: o.play, input: o.input, play: finisherPlays.get(o.play) ?? null, replayKey: `fin-${o.play}-play`, replayLabel: FINISHER.play, onReplay: () => a.finisherPlay(o.play === DRAFT_PLAY ? 'draft' : 'gallery'), share: null }
+  return customFrame($, els, show, o.held, o.by, null)
+}
+
+/**
+ * W10e's part of the Finishers view, under W10b's picks: Make your own (while config's create is on
+ * for you), My finishers (your art and what each slot plays, while you have any or may make some)
+ * and the gallery (while gallery is on for you). Nothing at all while none of them is.
+ */
+async function customSections($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promise<RenderElement | null> {
+  await read($, customRev)
+  const { Box, Text, Button, Input } = els
+  const cfg = await serverCfg($)
+  const l = await read($, link)
+  const cc = customOf((await configOf($, cfg)).raw)
+  const ui = customFor(keyOf(cfg))
+  const me = ui.me
+  const hasMine = !!me && (me.mine.length > 0 || Object.keys(me.equips).length > 0)
+  if (!cc.create && !cc.gallery && !hasMine) return null
+  const mobile = e.surface === 'mobile'
+  const handle = cleanServer(l.me?.handle ?? cfg.handle ?? '')
+  const sample = previewInput({ handle, callout: null, accent: 'signal', tier: l.me && !l.me.placement ? l.me.tier : 'Mud' })
+  const head = (label: string) => (
+    <Text bold color={STONE}>
+      {label.toUpperCase()}
+    </Text>
+  )
+  const lines = (list: Problem[], first: string) => (
+    <Box flexDirection="column">
+      <Text dimColor wrap="wrap">
+        {first}
+      </Text>
+      {list.map(p => (
+        <Text wrap="wrap">{`- ${problemLine(p)}`}</Text>
+      ))}
+    </Box>
+  )
+  // Make your own.
+  let make: RenderElement | null = null
+  if (cc.create) {
+    const d = ui.draft
+    const draftArt = d?.clean && d.frozen ? { clean: d.clean, durationMs: d.durationMs, frozen: d.frozen } : null
+    // A refusal's problems in the file go in its list (and to Ask Claude to fix it); a refused title is drawn by the title box.
+    const refusedArt = artProblems(ui.refused)
+    const fixable = artProblems(d?.problems).length > 0 || refusedArt.length > 0
+    make = (
+      <Box flexDirection="column" gap={1}>
+        <Box flexDirection="column">
+          {head(CUSTOM.make)}
+          <Text dimColor wrap="wrap">
+            {CUSTOM.makeWhat}
+          </Text>
+        </Box>
+        <Box gap={1} flexWrap="wrap">
+          <Button key="fin-make" label={CUSTOM.makeButton} onPress={() => a.finisherMake()} />
+          <Button key="fin-check" label={CUSTOM.check} onPress={() => a.finisherCheck()} />
+          <Button key="fin-restart" label={CUSTOM.restart} onPress={() => a.finisherRestart()} />
+          {ui.prompt && <Button key="fin-copy-prompt" label={CUSTOM.copyPrompt} onPress={x => a.finisherCopyPrompt(x.surface)} />}
+        </Box>
+        {d && d.problems.length > 0 && lines(d.problems, CUSTOM.found)}
+        {d && d.problems.length === 0 && <Text dimColor>{CUSTOM.clean((d.durationMs / 1000).toFixed(1))}</Text>}
+        {/* Your own file, sanitized, but custom art all the same: only on a surface config lists (never the terminal), as a gallery row's. */}
+        {d && d.problems.length === 0 && draftArt && (await customPreview($, els, a, { play: DRAFT_PLAY, held: draftArt, loading: false, by: handle, input: sample, drawn: drawsArt(cc, e.surface) }))}
+        {refusedArt.length > 0 && lines(refusedArt, CUSTOM.refused)}
+        {fixable && (
+          <Box>
+            <Button key="fin-fix" label={CUSTOM.fix} onPress={() => a.finisherFix()} />
+          </Box>
+        )}
+        <Box gap={1} alignItems="center" flexWrap="wrap">
+          <Text>{CUSTOM.slot}</Text>
+          {KINDS.map(k => (
+            <Button key={`fin-slot-${k}`} label={slotName(k)} variant={ui.slot === k ? 'primary' : 'secondary'} onPress={() => a.finisherSlot(k)} />
+          ))}
+        </Box>
+        {!mobile && <Input key="fin-title" label={CUSTOM.titleLabel} placeholder={CUSTOM.titlePlaceholder} value={customTitle} onInput={v => a.finisherTitle(v)} onSubmit={v => a.finisherTitle(v)} />}
+        {titleRefused(ui.refused) && (
+          <Text color={ORANGE} wrap="wrap">
+            {problemLine({ code: TITLE_PROBLEM, at: null })}
+          </Text>
+        )}
+        <Box>
+          <Button key="fin-submit" label={CUSTOM.submit} variant="primary" onPress={() => a.finisherSubmit()} />
+        </Box>
+      </Box>
+    )
+  }
+  // My finishers, and what each slot plays.
+  let mine: RenderElement | null = null
+  if (cc.create || hasMine) {
+    // Your own equipped art says so on its row (with Unequip); the list under it is other players' art you equipped.
+    const equipped = KINDS.filter(k => {
+      const ref = me?.equips[k]
+      return !!ref && !me?.mine.some(x => x.id === ref.id)
+    })
+    mine = (
+      <Box flexDirection="column" gap={1}>
+        {head(CUSTOM.mine)}
+        {!me ? (
+          <Text dimColor>{FINISHER.checking}</Text>
+        ) : me.mine.length === 0 ? (
+          <Text dimColor>{CUSTOM.noneYet}</Text>
+        ) : (
+          me.mine.map(art => {
+            const isOn = me.equips[kindOf(art.slot)]?.id === art.id
+            const line = isOn ? `${artStatusLine(art)} ${CUSTOM.equippedTag}` : artStatusLine(art)
+            return (
+              <Box key={`fin-art-${art.id}`} flexDirection="column">
+                <Text>{CUSTOM.row(art.title, slotName(art.slot))}</Text>
+                <Text dimColor wrap="wrap">
+                  {art.code ? `${line} ${CUSTOM.code(art.code)}` : line}
+                </Text>
+                <Box gap={1} flexWrap="wrap">
+                  {art.status === 'approved' &&
+                    (isOn ? (
+                      <Button key={`fin-unequip-${art.id}`} label={CUSTOM.unequip} onPress={() => a.finisherEquip(art.slot, null)} />
+                    ) : (
+                      <Button key={`fin-equip-${art.id}`} label={CUSTOM.equip} onPress={() => a.finisherEquip(art.slot, art.id)} />
+                    ))}
+                  <Button key={`fin-delete-${art.id}`} label={CUSTOM.delete} onPress={() => a.finisherDelete(art.id)} />
+                </Box>
+              </Box>
+            )
+          })
+        )}
+        {equipped.length > 0 && (
+          <Box flexDirection="column">
+            <Text bold>{CUSTOM.equipped}</Text>
+            {equipped.map(k => {
+              const ref = me?.equips[k]
+              return (
+                <Box key={`fin-equipped-${k}`} gap={1} alignItems="center" flexWrap="wrap">
+                  <Text>{CUSTOM.equippedBy(slotName(k), ref?.by ?? '')}</Text>
+                  <Button key={`fin-unequip-${k}`} label={CUSTOM.unequip} onPress={() => a.finisherEquip(k, null)} />
+                </Box>
+              )
+            })}
+          </Box>
+        )}
+      </Box>
+    )
+  }
+  // The gallery.
+  let gallery: RenderElement | null = null
+  if (cc.gallery) {
+    const g = ui.gallery
+    const p = ui.galleryPreview
+    const drawn = drawsArt(cc, e.surface)
+    const held = p?.sha256 ? (artHeld.get(p.sha256) ?? null) : null
+    gallery = (
+      <Box flexDirection="column" gap={1}>
+        {head(CUSTOM.gallery)}
+        <Box gap={1} flexWrap="wrap">
+          <Button key="fin-gallery-top" label={CUSTOM.top} variant={g.sort === 'top' ? 'primary' : 'secondary'} onPress={() => a.finisherGallery({ sort: 'top' })} />
+          <Button key="fin-gallery-new" label={CUSTOM.newest} variant={g.sort === 'new' ? 'primary' : 'secondary'} onPress={() => a.finisherGallery({ sort: 'new' })} />
+        </Box>
+        <Box gap={1} flexWrap="wrap">
+          <Button key="fin-gallery-all" label={CUSTOM.allSlots} variant={g.slot === null ? 'primary' : 'secondary'} onPress={() => a.finisherGallery({ slot: null })} />
+          {KINDS.map(k => (
+            <Button key={`fin-gallery-slot-${k}`} label={slotName(k)} variant={g.slot === k ? 'primary' : 'secondary'} onPress={() => a.finisherGallery({ slot: k })} />
+          ))}
+        </Box>
+        {!g.read && !g.note && <Text dimColor>{FINISHER.checking}</Text>}
+        {g.read && g.items.length === 0 && <Text dimColor>{CUSTOM.empty}</Text>}
+        {g.items.map(art => (
+          <Box key={`fin-gallery-row-${art.id}`} flexDirection="column">
+            <Text>{CUSTOM.galleryRow(art.title, art.by, slotName(art.slot))}</Text>
+            <Box gap={1} alignItems="center" flexWrap="wrap">
+              <Text dimColor>{CUSTOM.plays(art.plays)}</Text>
+              <Button key={`fin-gallery-preview-${art.id}`} label={CUSTOM.preview} onPress={x => a.finisherGalleryPreview(art.id, x.surface)} />
+              <Button key={`fin-gallery-equip-${art.id}`} label={CUSTOM.equip} onPress={() => a.finisherEquip(art.slot, art.id)} />
+            </Box>
+          </Box>
+        ))}
+        {g.items.length < g.total && (
+          <Box>
+            <Button key="fin-gallery-more" label={CUSTOM.more} onPress={() => a.finisherGallery({ more: true })} />
+          </Box>
+        )}
+        {p && (await customPreview($, els, a, { play: GALLERY_PLAY, held, loading: !!p.sha256 && artLoading.has(p.sha256), by: p.by, input: sample, drawn }))}
+        {g.note && (
+          <Text color={ORANGE} wrap="wrap">
+            {g.note}
+          </Text>
+        )}
+        <Box gap={1} alignItems="center" flexWrap="wrap">
+          {!mobile && <Input key="fin-code" label={CUSTOM.codeLabel} placeholder={CUSTOM.codePlaceholder} value={customCode} onInput={v => a.finisherCode(v)} onSubmit={v => {
+                a.finisherCode(v)
+                a.finisherEquipCode()
+              }} />}
+          <Button key="fin-code-equip" label={CUSTOM.equip} onPress={() => a.finisherEquipCode()} />
+        </Box>
+      </Box>
+    )
+  }
+  return (
+    <Box flexDirection="column" gap={1}>
+      {make}
+      {mine}
+      {gallery}
+      {ui.note && (
+        <Text color={ORANGE} wrap="wrap">
+          {ui.note}
+        </Text>
+      )}
     </Box>
   )
 }
@@ -4048,6 +9533,11 @@ const HELP = `CCSR commands:
 /ccsr status             one line of where you stand
 Chat lives in the pane only, so it never reaches Claude.`
 
+/** The help text, with W6b's `/ccsr challenge` line only while challenges are on for this player. */
+function helpText(cf: Pick<ModConfig, 'raw'>) {
+  return challengesOf(cf).on ? HELP.replace('\nChat lives in the pane only', `\n${CHALLENGE.help}\nChat lives in the pane only`) : HELP
+}
+
 /**
  * A toast nobody asked for (a score, an opponent commit, a warning, a result):
  * shown only while toasts are on and Quiet is off. `ready` is the match-found
@@ -4059,11 +9549,24 @@ async function ambient($: $, text: string, kind: 'note' | 'match' | 'ready' = 'n
   if (kind === 'ready' || p.toasts === 'all' || (p.toasts === 'match' && kind === 'match')) $.ui.toast(text, { timeoutMs })
 }
 
-/** One of the mod's sounds (mod/sounds/), while Sounds is on. */
+/**
+ * One of the mod's sounds (mod/sounds/), while Sounds is on. W10b: the result's win or loss sting
+ * is the finisher's own recorded sound when config names one for its kind (finisherSting), and the
+ * mod's own wav when it names none or that one won't play. The recorded one is started, never
+ * awaited: the engine fetches it with no stated timeout and play resolves only once it has played,
+ * and pollMatch rings the result inside the ranked loop's tick, which a slow or stalled fetch would
+ * hold until the watchdog gave up on it (a failure, so the loop backed off as the result landed).
+ */
 async function ring($: $, name: 'chime' | 'bell' | 'win' | 'loss') {
   if ((await read($, settings)).surfaces.sounds !== 'on') return
   try {
-    await $.audio.play({ asset: `sounds/${name}.wav` })
+    const url = name === 'win' || name === 'loss' ? await finisherSting($) : null
+    if (url)
+      void $.audio
+        .play({ url })
+        .catch(() => $.audio.play({ asset: `sounds/${name}.wav` }))
+        .catch(() => null)
+    else await $.audio.play({ asset: `sounds/${name}.wav` })
   } catch {
     // No player on this platform (a Linux or Windows terminal): stay quiet.
   }
@@ -4087,11 +9590,21 @@ async function statusLine($: $): Promise<string | undefined> {
   const cfg = await serverCfg($)
   const l = await read($, link)
   const sh = await rankedShared($)
+  // W4b: a notice's status flash, for its 8 s; the ready check's line is never covered.
+  if (noticeFlash && t < noticeFlash.until && sh.phase !== 'offered') return short ? noticeFlash.short : noticeFlash.full
   const placing = l.me?.placement ?? null
   const tier = l.me ? (placing ? `Mud, placing ${placing.played} of ${placing.of}` : `${l.me.tier} ${l.me.rating}`) : null
-  if (sh.phase === 'queued') return short ? `◆ queue ${mmss(t - sh.since)}` : `◆ CCSR  in queue ${mmss(t - sh.since)} · ${sh.lengths.map(h => `${h}h`).join(' ')}`
+  if (sh.phase === 'queued') {
+    const catalog = catalogOf((await configOf($, cfg)).raw)
+    const labels = sh.queuedMin.map(m => labelFor(m, l.lanes, catalog))
+    return short ? `◆ queue ${mmss(t - sh.since)}` : `◆ CCSR  in queue ${mmss(t - sh.since)}${labels.length ? ` · ${labels.join(' ')}` : ''}`
+  }
   if (sh.phase === 'offered' && l.queue?.offer) {
-    const left = mmss(Date.parse(l.queue.offer.expires_at) - t)
+    const o = l.queue.offer
+    const left = mmss(Date.parse(o.expires_at) - t)
+    // W6b: a challenge's ready check: the sender accepts; the taker already did, and waits on them.
+    if (o.kind === 'challenge' && o.you_accepted) return short ? CHALLENGE.statusShortWaiting(left) : CHALLENGE.statusWaiting(o.opponent.handle)
+    if (o.kind === 'challenge' && !short) return CHALLENGE.statusAccept(left)
     return short ? `◆ accept ${left}` : `◆ CCSR  opponent found · accept in ${left}`
   }
   if (sh.phase === 'live' && l.ranked?.summary) {
@@ -4103,7 +9616,7 @@ async function statusLine($: $): Promise<string | undefined> {
     const left = sm.deadline ? Date.parse(sm.deadline) - t : 0
     if (short) return `◆ ${score} · ${clock(left)}`
     const d = await read($, dirty)
-    if (left <= 10 * 60_000 && d && d.files > 0) return `◆ CCSR  live ${score} · ${clock(left)} · ${d.files} file${d.files === 1 ? '' : 's'} uncommitted`
+    if (left <= warnMs(sm) && d && d.files > 0) return `◆ CCSR  live ${score} · ${clock(left)} · ${d.files} file${d.files === 1 ? '' : 's'} uncommitted`
     return `◆ CCSR  live ${score} · ${clock(left)}${tier ? ` · ${tier}` : ''}`
   }
   const m = await read($, match)
@@ -4134,11 +9647,12 @@ async function checkDirty($: $) {
   }
 }
 
-async function onScore($: $, c: ScoredCommit) {
+async function onScore($: $, c: ScoredCommit, coder: CoderBlock | null = null) {
   // To the server: the Grind while tracking is on, and a ranked match whenever one is running.
   const ranked = (await read($, link)).ranked?.summary?.status
   if (!c.matchOnly || ranked === 'live' || ranked === 'grace') {
-    await enqueue($, [c])
+    // The coder block (W7-2) rides with the score into the outbox, never into the ledger.
+    await enqueue($, [c], coder ? new Map([[c.pid, coder]]) : undefined)
     void flushOutbox($)
   }
   const counted = (await syncMatch($)) > 0
@@ -4151,6 +9665,8 @@ async function onScore($: $, c: ScoredCommit) {
   if (c.authoredAt >= loadedAt - LIVE_WINDOW) {
     const craft = c.craft === 'clean' ? ' · clean +1' : c.craft === 'sloppy' ? ' · sloppy -1' : ''
     await ambient($, `+${c.points} points · ${c.category}${craft} · ${clean(c.title).slice(0, 60)}${counted ? ' · counts in your match' : ''}`)
+    // W4b: the notices' score trigger, and first_score for the first one on this machine (never for a backfill or a rescore).
+    void noticeScored($, c).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
   }
   await refreshStatus($)
 }
@@ -4166,7 +9682,7 @@ function runScan($: $, force = false): Promise<ScanResult> {
     rescan = { force: force || !!rescan?.force }
     return scanning
   }
-  const job = scanGrind($, force, c => onScore($, c))
+  const job = scanGrind($, force, (c, coder) => onScore($, c, coder))
   scanning = job
   const settle = () => {
     if (scanning === job) scanning = null
@@ -4217,14 +9733,27 @@ async function slowSync($: $) {
   if (m && m.status === 'live' && m.kind === 'practice' && !stopTicker) startTicker($)
   // Another session joined the queue or a match: follow it here too.
   const sh = await rankedShared($)
-  if ((sh.phase === 'queued' || sh.phase === 'offered' || sh.phase === 'live') && !stopRankedPoll) startRankedPoll($)
+  if (sh.phase === 'queued' || sh.phase === 'offered' || sh.phase === 'live') startRankedPoll($)
+  // Between matches with the Match tab on screen (a pane the engine opened by itself, say): the lanes poll.
+  else await idlePoll($)
+  // A loop whose timer was lost (a refused wait, a throw before it re-armed) starts again.
+  await reviveLoops($)
+  // The config, every poll_ms.config (another session's fresh read is taken instead of asking again).
+  if (t - configReadAt >= (await configOf($)).poll.config) void refreshConfig($, 'timer').catch(() => null)
+  // W4b: a toast or a flash due now (a window that opened, a queue that waited long enough), and the pane's countdowns.
+  void noticeAlerts($).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
   await flushOutbox($)
+  // W7-2: model calls waiting in memory go to this machine's records, so another session's scan sees them.
+  if (capturing && stepsPending.length > 0) void writeCalls($)
   await refreshStatus($)
 }
 
 async function openPane($: $, t?: Tab) {
   if (t) await update($, tab, () => t)
-  return $.ui.open({ id: PANE, title: 'CCSR' })
+  const r = await $.ui.open({ id: PANE, title: 'CCSR' })
+  // Opened on the Match tab: the lanes now, without holding up a command's reply.
+  if ((await read($, tab)) === 'match') void showLanes($).catch(err => $.ui.log(`CCSR lanes: ${(err as Error).message}`))
+  return r
 }
 
 async function startMatch($: $, hours: number) {
@@ -4239,18 +9768,39 @@ async function startMatch($: $, hours: number) {
   return m
 }
 
-/** One surface switch. Chat off is the one the server hears about, so the opponent sees "chat off". */
+/** One surface switch. Chat off is the one the server hears about, so the opponent sees "chat off". W6b: so is Challenges. */
 async function setSurface($: $, key: SurfaceKey, value: string) {
   await saveSettings($, { surfaces: { [key]: value } as Partial<Surfaces> })
   if (key === 'chat') await tellChat($)
+  if (key === 'challenges') await switchChallenges($)
+  // W6b: a challenge's message follows the Chat switch, on the server too (it moves the inbox's rev): read it again.
+  if (key === 'chat' && (await challengesLive($))) await pollInboxNow($)
   await refreshStatus($)
 }
 
-/** Full turns every surface on; Quiet keeps the race band in a match and cuts the noise around it. */
+/**
+ * Full turns every surface on; Quiet keeps the race band in a match and cuts the noise around it.
+ * W6b: neither moves the Challenges switch, which opens an inbox to anyone: that stays the player's own call.
+ */
 async function setPreset($: $, preset: 'full' | 'quiet') {
-  await saveSettings($, { surfaces: { ...(preset === 'full' ? FULL : QUIET) } })
+  const { challenges: _kept, ...surfaces } = preset === 'full' ? FULL : QUIET
+  await saveSettings($, { surfaces })
   await tellChat($)
   await refreshStatus($)
+}
+
+/**
+ * W6b: the Challenges switch was pressed: kept as a press the server hasn't confirmed, told, and
+ * the inbox starts (read afresh) or stops with it. Off stops the inbox before the withdrawal, so
+ * its reads never compete with the withdrawal's for W6a's one a second.
+ */
+async function switchChallenges($: $) {
+  const cfg = await serverCfg($)
+  const on = (await read($, settings)).surfaces.challenges !== 'off'
+  if (cfg.token && challengesOf(await configOf($, cfg)).on) await save($, K.challengesPress, { key: keyOf(cfg), on, at: await $.clock.now(), told: null } satisfies ChallengesPress)
+  if (!on) await challengesTick($, true)
+  await tellChallenges($, true)
+  if (on) await challengesTick($, true)
 }
 
 async function tellChat($: $) {
@@ -4284,7 +9834,10 @@ async function recapText($: $): Promise<string | null> {
     const { mine, them } = rankedSides(sm, me)
     const delta = (mine.rating_after ?? mine.rating_before) - mine.rating_before
     const placing = mine.player.placement
-    return `CCSR ${sm.length}h: ${mine.player.handle} ${mine.points}, ${them.player.handle} ${them.points}. ${placing ? `Mud, placing ${placing.played} of ${placing.of}` : `${delta >= 0 ? '+' : ''}${delta} to ${mine.rating_after ?? mine.rating_before}`}.`
+    // W6b: a challenge's is unrated, never +0. Scores and handles only, like the rest.
+    if (sm.kind === 'challenge') return CHALLENGE.recap(lengthLabel(sm.length_min), mine.player.handle, mine.points, them.player.handle, them.points)
+    // This text reaches Claude (/ccsr last): the length in the mod's own words, never a server label.
+    return `CCSR ${lengthLabel(sm.length_min)}: ${mine.player.handle} ${mine.points}, ${them.player.handle} ${them.points}. ${placing ? `Mud, placing ${placing.played} of ${placing.of}` : `${delta >= 0 ? '+' : ''}${delta} to ${mine.rating_after ?? mine.rating_before}`}.`
   }
   const last = (await read($, history))[0]
   if (!last) return null
@@ -4292,9 +9845,11 @@ async function recapText($: $): Promise<string | null> {
   return `CCSR practice ${hoursLabel(last.hours).toLowerCase()}: ${s.handle} ${last.myPoints}, ${last.opp.handle} ${last.oppPoints}.`
 }
 
-async function queueAgain($: $) {
+async function queueAgain($: $, where: 'band' | 'pane') {
+  if ((await configOf($)).practiceOnly) return
   await clearRanked($)
-  await joinQueue($)
+  // The band draws no note and no toggles: a press there that queued nothing opens the Match tab, where both say why.
+  if (!(await joinQueue($)) && where === 'band') await openPane($, 'match')
 }
 
 async function setupSeen($: $) {
@@ -4410,7 +9965,7 @@ function actions($: $): Actions {
     setSurface: (key, value) => go(setSurface($, key, value)),
     askCommit: () => go(askCommit($)),
     copyRecap: surface => go(copyRecap($, surface)),
-    queueAgain: () => go(queueAgain($)),
+    queueAgain: where => go(queueAgain($, where)),
     setupSeen: () => go(setupSeen($)),
     askForfeit: isAsking => go(update($, forfeitAsk, () => isAsking)),
     setPreset: preset => go(setPreset($, preset)),
@@ -4434,7 +9989,7 @@ function actions($: $): Actions {
     setServer: url => go(setServerUrl($, url)),
     queue: () => go(joinQueue($)),
     leaveQueue: () => go(leaveQueue($)),
-    toggleLength: h => go(toggleLength($, h)),
+    toggleLength: min => go(toggleLength($, min)),
     accept: () => go(acceptOffer($)),
     decline: () => go(declineOffer($)),
     rankedForfeit: () => go(forfeitRanked($)),
@@ -4443,6 +9998,64 @@ function actions($: $): Actions {
     setRoom: room => go(setRoom($, room)),
     roomChat: text => go(postRoom($, text)),
     updateMod: surface => go(updateMod($, surface)),
+    chooseBucket: id => go(chooseBucket($, id)),
+    chooseBoard: (which, id) => go(chooseBoard($, which, id)),
+    checklistSignIn: provider => go(checklistSignIn($, provider)),
+    startSignIn: (provider, from) => go(startSignIn($, provider, from)),
+    cancelSignIn: () => go(cancelSignInCard($)),
+    dismissSignIn: () => go(dismissSignInCard($)),
+    againSignIn: () => go(againSignIn($)),
+    joinSignIn: handle => go(joinSignIn($, handle)),
+    switchSignIn: () => go(switchSignIn($)),
+    copySignInCode: surface => go(copySignInCode($, surface)),
+    unlinkProvider: provider => go(unlinkProvider($, provider)),
+    challengeAccept: (id, via) => go(takeChallenge($, id, via)),
+    challengeDecline: id => go(dropChallenge($, id)),
+    challengeMute: id => go(muteSender($, id)),
+    challengeAskReport: id => go(askReport($, id)),
+    challengeReport: (id, reason) => go(reportOne($, id, reason)),
+    challengeStart: kind => go(startChallengeForm($, kind)),
+    challengePick: patch => go(pickChallenge($, patch)),
+    challengeDraft: text => {
+      // The player's own words, kept out of $.state (a module variable): no redraw needed, the box holds what was typed.
+      challengeDraft = text
+    },
+    challengeSend: () => go(sendChallenge($)),
+    challengeCancel: () => go(pickChallenge($, null)),
+    challengeCode: input => go(lookUpCode($, input)),
+    challengeCodeClose: () => go(closeCode($)),
+    challengeCopy: (id, surface) => go(copyChallengeLink($, id, surface)),
+    challengeRematch: (handle, lengthMin) => go(openChallengeForm($, handle, lengthMin)),
+    setModelStats: isOn => go(setModelStats($, isOn)),
+    noticePress: (source, id, index, place, surface) => go(noticePress($, source, id, index, place, surface)),
+    noticeDismiss: (source, id) => go(noticeDismissPress($, source, id)),
+    noticeClose: id => go(noticeClose($, id)),
+    finisherReplay: id => go(replayFinisher($, id)),
+    finisherPreview: () => go(playPreview($)),
+    finisherCallout: callout => go(pickCallout($, callout)),
+    finisherAccent: key => go(pickAccent($, key)),
+    finisherMake: () => go(makeFinisher($)),
+    finisherRestart: () => go(restartFinisher($)),
+    finisherCheck: () => go(checkDraft($)),
+    finisherCopyPrompt: surface => go(copyCustomPrompt($, surface)),
+    finisherFix: () => go(fixDraft($)),
+    finisherSlot: kind => go(pickCustomSlot($, kind)),
+    finisherTitle: text => {
+      // The player's own words, kept out of $.state (a module variable): the box holds what was typed.
+      customTitle = text
+    },
+    finisherSubmit: () => go(submitDraft($)),
+    finisherEquip: (slot, id, matchId) => go(equipArt($, slot, { id }, matchId ?? null)),
+    finisherDelete: id => go(deleteArt($, id)),
+    finisherGallery: patch => go(readGallery($, patch)),
+    finisherGalleryPreview: (id, surface) => go(previewGalleryArt($, id, surface)),
+    finisherCode: text => {
+      customCode = text
+    },
+    finisherEquipCode: () => go(equipTypedCode($)),
+    finisherAskReport: matchId => go(askArtReport($, matchId)),
+    finisherReport: (matchId, reason) => go(reportArt($, matchId, reason)),
+    finisherPlay: which => go(replayFinisher($, which === 'draft' ? DRAFT_PLAY : GALLERY_PLAY)),
   }
 }
 
@@ -4544,6 +10157,8 @@ async function boot($: $, cwd: string) {
   const m = await read($, match)
   if (m && m.status === 'live' && m.kind === 'practice') startTicker($)
   await update($, link, l => ({ ...l, outbox: 0 }))
+  // The switchboard: a fresh copy another session read is taken at once, else it's asked for.
+  void refreshConfig($, 'boot').catch(err => $.ui.log(`CCSR config: ${(err as Error).message}`))
   void refreshAccount($).then(() => flushOutbox($))
   const sh = await rankedShared($)
   if (sh.phase === 'queued' || sh.phase === 'offered' || sh.phase === 'live') startRankedPoll($)
@@ -4551,6 +10166,46 @@ async function boot($: $, cwd: string) {
   $.clock.every(120_000, () => void runScan($).catch(err => $.ui.log(`CCSR scan: ${(err as Error).message}`)))
   scheduleScan($, 2500)
   await refreshStatus($)
+  // W3b: a bucket config lists that GET /me had no standing for (switched on since) reads GET /me again, and a bucket on screen
+  // that config moved gets its lanes. Never awaited: a config read waits on each tick, and $.http.fetch has no timeout, so a
+  // request that never answers would hold every later config read.
+  if (!bucketTicking) {
+    bucketTicking = true
+    onConfigTick(c => void standingsTick($, c).catch(err => $.ui.log(`CCSR standings: ${(err as Error).message}`)))
+    onConfigTick(c => void lanesTick($, c).catch(err => $.ui.log(`CCSR lanes: ${(err as Error).message}`)))
+  }
+  // W5b: the new-install warning rides the config's cadence (GET /me at most every 10 minutes, only while sign-in is on).
+  if (!identityTicking) {
+    identityTicking = true
+    // Not awaited: a config read never waits on GET /me.
+    onConfigTick(() => {
+      void refreshIdentity($, IDENTITY_TICK_MS).catch(() => null)
+      void retryOrphans($).catch(() => null)
+    })
+  }
+  // W6b: the challenge inbox follows config's `challenges` (and with it a sign-in, a sign-out and a server switch, which all read
+  // config): started, and read at once, when challenges come on here; stopped, the box emptied, when they go off. A Challenges
+  // press the server hasn't confirmed goes again after it. Never awaited.
+  if (!challengesTicking) {
+    challengesTicking = true
+    onConfigTick(() => void challengesTick($)
+      .then(() => tellChallenges($))
+      .catch(err => $.ui.log(`CCSR challenges: ${(err as Error).message}`)))
+  }
+  // W7-2: eval capture follows the config held for this account and Model stats; every config read or adoption checks it again.
+  // syncCapture asks the server nothing (the store, the call records, git for the repo key), so the tick may wait on it.
+  if (!captureTicking) {
+    captureTicking = true
+    onConfigTick(() => syncCapture($))
+  }
+  void syncCapture($).catch(err => $.ui.log(`CCSR eval: ${(err as Error).message}`))
+  // W4b: after every config read, the ledger kept small and the toast or flash a new notice may bring; on the config timer and at
+  // boot, the stats post too (under a lease, at most one per 90 s from this store). Never awaited, as above: the post is a request.
+  if (!noticeTicking) {
+    noticeTicking = true
+    onConfigTick((c, why) => void noticeConfigTick($, c, why).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`)))
+  }
+  void noticeEvent($, { on: 'session_start' }).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
 }
 
 async function commandText($: $, args: string, signal?: AbortSignal): Promise<string> {
@@ -4562,7 +10217,8 @@ async function commandText($: $, args: string, signal?: AbortSignal): Promise<st
     const r = await openPane($)
     return r.isPlaced ? 'CCSR pane opened.' : `CCSR pane is waiting: ${r.reason}`
   }
-  if (sub === 'help') return HELP
+  if (sub === 'help') return helpText(await configOf($))
+  if (sub === 'challenge') return challengeCommand($, arg)
   if (sub === 'last') {
     // This text reaches Claude: scores and handles only, never chat or an opponent's titles. The row draws as a scorecard.
     return (await recapText($)) ?? 'No result yet.'
@@ -4641,7 +10297,42 @@ async function commandText($: $, args: string, signal?: AbortSignal): Promise<st
     await setHandle($, arg)
     return `Handle: ${arg}`
   }
-  return HELP
+  return helpText(await configOf($))
+}
+
+/**
+ * `/ccsr challenge [code or link]` (W6b; the site's ccsr.gg/c/<code> page tells players to run
+ * it): with a code, or its link, the pane opens on that challenge, looked up, with Accept; with
+ * none, on the form. Its reply is a transcript row Claude reads, so it names no handle and never
+ * carries a message, whatever the challenge says, and it only says the pane opened when it did:
+ * queued, in a ready check or in a match the box isn't drawn, so it says the challenge waits; a
+ * pane the engine keeps waiting answers as plain `/ccsr` does. While challenges are off nothing
+ * is asked of the server.
+ */
+async function challengeCommand($: $, arg: string) {
+  const cfg = await serverCfg($)
+  const cf = await configOf($, cfg)
+  if (!challengesOf(cf).on) return CHALLENGE.reply.off
+  if (!cfg.token || (await read($, link)).unknownToken) {
+    await openPane($, 'match')
+    return CHALLENGE.reply.signIn
+  }
+  if ((await read($, settings)).surfaces.challenges === 'off') return CHALLENGE.reply.switchedOff
+  const code = arg.trim() ? challengeCode(arg) : null
+  if (arg.trim() && !code) return CHALLENGE.reply.notACode
+  const sh = await rankedShared($)
+  if (boxHidden(sh)) return CHALLENGE.reply.busy
+  if (code) {
+    if (sh.phase === 'done') await clearRanked($)
+    // The lookup draws in the pane when it lands; the reply never waits on the server.
+    void lookUpCode($, arg).catch(err => $.ui.log(`CCSR challenges: ${(err as Error).message}`))
+  } else {
+    if (cf.practiceOnly) return CHALLENGE.paused
+    if (!(await fillChallengeForm($))) return CHALLENGE.sendPaused
+  }
+  const r = await openPane($, 'match')
+  if (!r.isPlaced) return `CCSR pane is waiting: ${r.reason}`
+  return code ? CHALLENGE.reply.opened : CHALLENGE.reply.form
 }
 
 async function calibrateTool($: $, input: Record<string, unknown>) {
@@ -4751,19 +10442,19 @@ async function drawBadge($: $, e: RenderInput<'ToolUse'>, row: RenderElement): P
   )
 }
 
-/** Minutes and seconds left when the bell is 10 minutes or less away, in ranked or practice; null otherwise. */
+/** Minutes and seconds left when the bell is near: within the match's grace in ranked (warnMs), 10 minutes in practice; null otherwise. */
 async function bellLeft($: $): Promise<number | null> {
   const t = await $.clock.now()
   const sh = await rankedShared($)
   const sm = (await read($, link)).ranked?.summary
   if (sh.phase === 'live' && sm?.status === 'live' && sm.deadline) {
     const left = Date.parse(sm.deadline) - t
-    return left > 0 && left <= 10 * 60_000 ? left : null
+    return left > 0 && left <= warnMs(sm) ? left : null
   }
   const m = await read($, match)
   if (m && m.status === 'live') {
     const left = m.deadline - t
-    return left > 0 && left <= 10 * 60_000 ? left : null
+    return left > 0 && left <= WARN_MS ? left : null
   }
   return null
 }
@@ -4808,11 +10499,12 @@ async function drawScorecard($: $, e: RenderInput<'CommandOutput'>): Promise<Ren
   const delta = (mine.rating_after ?? mine.rating_before) - mine.rating_before
   const outcome = rankedOutcome(sm, me)
   const { Box, Text, Svg } = $.ui.resolve(e) as El
+  const word = outcome === 'won' ? 'victory' : outcome === 'lost' ? 'loss' : 'draw'
   if (e.surface === 'terminal')
     return (
       <Box flexDirection="column">
         <Text bold color={ORANGE}>
-          CCSR · ranked {sm.length}h · {outcome === 'won' ? 'victory' : outcome === 'lost' ? 'loss' : 'draw'}
+          {sm.kind === 'challenge' ? CHALLENGE.scoreTitle(lengthLabel(sm.length_min), word) : `CCSR · ranked ${lengthLabel(sm.length_min)} · ${word}`}
         </Text>
         <Text>
           {mine.player.handle} {mine.points} : {them.points} {them.player.handle} · {mine.commits} commits to {them.commits}
@@ -4822,7 +10514,7 @@ async function drawScorecard($: $, e: RenderInput<'CommandOutput'>): Promise<Ren
     )
   return (
     <Svg
-      source={scorecard({ outcome, hours: sm.length, me: mine.player.handle, them: them.player.handle, mine: mine.points, theirs: them.points, commits: { mine: mine.commits, theirs: them.commits }, delta, ratingBefore: mine.rating_before, ratingAfter: mine.rating_after ?? mine.rating_before, placing: placingOfSide(mine) })}
+      source={scorecard({ outcome, hours: sm.length_min / 60, me: mine.player.handle, them: them.player.handle, mine: mine.points, theirs: them.points, commits: { mine: mine.commits, theirs: them.commits }, delta, ratingBefore: mine.rating_before, ratingAfter: mine.rating_after ?? mine.rating_before, placing: placingOfSide(mine), mode: modeWord(sm), ...unratedOf(sm) })}
       alt={rankedResultLine(sm, me)}
     />
   )
@@ -4851,15 +10543,32 @@ async function turnLine($: $, e: RenderInput<'TurnDuration'>): Promise<RenderEle
   )
 }
 
-/** The band: renderBand reads every switch (the ready check ignores them); a survey always wins the slot. */
+/**
+ * The band: renderBand reads every switch (the ready check ignores them); a survey always wins the
+ * slot. W4b: a band notice (notices.ts: Band when idle between matches, Band in matches from the
+ * queue to the result, never over the ready check) stacks above whatever the band draws.
+ */
 async function bandOrPass($: $, e: RenderInput<'AbovePrompt'>) {
   if (e.props.hasSurvey) return null
-  return renderBand($, e, actions($))
+  const a = actions($)
+  const band = await renderBand($, e, a)
+  const notice = await bandNotice($, e, a)
+  if (!notice) return band
+  if (!band) return notice
+  const { Box } = $.ui.resolve(e) as El
+  return (
+    <Box flexDirection="column">
+      {notice}
+      {band}
+    </Box>
+  )
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    // W4b: where this session draws, for a notice's surfaces before the pane has drawn anywhere.
+    sessionSurface = e.surface ?? null
     await boot($, e.cwd)
     return started
   })
@@ -4926,4 +10635,27 @@ export const register: Register = on => {
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => next((await modeFor($, e)) ?? e))
 
   on('ui.render', { component: 'TurnDuration' }, async ($, e, next) => (await turnLine($, e)) ?? next(e))
+
+  // W7-2: eval capture's observers. Each passes what it gets through untouched. turn.step makes
+  // no `$` call and awaits nothing but next: it notes the call in module memory, and the writes
+  // happen on PostToolUse, the scans, slowSync and session.end.
+  on('turn.step', async function* ($, e, next) {
+    const r = yield* next(e)
+    if (capturing) noteStep(e, r)
+    return r
+  })
+
+  on('classic.PostToolUse', async ($, e, next) => {
+    // Noted before the settings hooks run (no `$` call), so a scan right after finds it; written after.
+    const noted = capturing && e.tool_name === 'Bash' && noteBash(e)
+    const out = await next(e)
+    if (noted) await writeCalls($)
+    return out
+  })
+
+  on('session.end', async ($, e, next) => {
+    // The whole chain shares one short bound: the write gets what's left of it, less a margin.
+    if (capturing) await Promise.race([writeCalls($), $.clock.sleep(Math.max(0, Math.min(1000, next.budget.remainingMs - 300)))])
+    return next(e)
+  })
 }

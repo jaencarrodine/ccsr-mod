@@ -1,8 +1,9 @@
 // The CCSR server's shapes (docs/api.md v0.2) and the pure helpers the mod
 // needs to talk to it. No `$` here: register.tsx makes every request.
 
+import { jitterMs } from './config'
 import { clean } from './pure'
-import type { ApiMatchEvent, ApiScoreBody, ScoredCommit } from '../types'
+import type { ApiCoder, ApiMatchEvent, ApiScoreBody, ScoredCommit } from '../types'
 
 /** Until api.ccsr.gg's DNS is live, Settings can point the mod elsewhere. */
 export const DEFAULT_SERVER = 'https://api.ccsr.gg/v1'
@@ -21,8 +22,10 @@ export async function sha256hex(s: string) {
  * A ledger row as the server takes it. Nothing here names the repo or shows
  * code: the repo is a salted hash, the identity a hash of that plus the author
  * time and subject, and the title goes only while the player shares titles.
+ * `coder` (W7-2) is the coder block the scan built while eval capture was on; it rides
+ * the outbox with the body, never the ledger.
  */
-export async function scoreBody(c: ScoredCommit, salt: string, share: boolean): Promise<ApiScoreBody> {
+export async function scoreBody(c: ScoredCommit, salt: string, share: boolean, coder?: ApiCoder | null): Promise<ApiScoreBody> {
   const repo_hash = await sha256hex(`${salt}|repo|${c.repoName}`)
   const identity = await sha256hex(`${repo_hash}|${c.authoredAt}|${c.title.trim()}`)
   const body: ApiScoreBody = {
@@ -43,7 +46,15 @@ export async function scoreBody(c: ScoredCommit, salt: string, share: boolean): 
   }
   const title = clean(c.title).trim().slice(0, 200)
   if (share && title) body.title = title
+  if (coder) body.coder = coder
   return body
+}
+
+/** A body as it goes once eval capture is known off (Model stats off, or the flag gone): no coder block. */
+export function withoutCoder(body: ApiScoreBody): ApiScoreBody {
+  if (!('coder' in body)) return body
+  const { coder: _gone, ...rest } = body
+  return rest
 }
 
 /** Retry later (offline, rate limited, the server broke) or give up (the server refused the score itself). */
@@ -54,6 +65,53 @@ export function retryable(status: number) {
 /** Backoff for the outbox: 2, 4, 8 seconds, then every 15. */
 export function backoffMs(tries: number) {
   return tries < 3 ? 2000 * 2 ** tries : 15_000
+}
+
+/** A poll loop's backoff ceiling: doubling stops here, unless the server asked for longer. */
+export const LOOP_CAP_MS = 60_000
+
+/** The longest Retry-After the mod honours: a broken answer can't park a poll for days. */
+export const RETRY_AFTER_MAX_MS = 600_000
+
+/**
+ * How long the server asked us to wait, in ms: a 429's body `retry_after_ms`
+ * (docs/api.md, "Rate limits"), else its `Retry-After` header in whole
+ * seconds. null when it said nothing usable; held to 0..10 minutes.
+ */
+export function retryAfterMs(json: unknown, header: string | null | undefined): number | null {
+  const body = (json as { retry_after_ms?: unknown } | null)?.retry_after_ms
+  let ms: number | null = null
+  if (typeof body === 'number' && Number.isFinite(body) && body >= 0) ms = body
+  else if (typeof header === 'string' && /^\s*\d+(\.\d+)?\s*$/.test(header)) ms = Number(header) * 1000
+  return ms === null ? null : Math.min(RETRY_AFTER_MAX_MS, Math.round(ms))
+}
+
+/**
+ * The wait before a poll loop's next tick. With no failure behind it, the
+ * poll's own interval. After `failures` answers in a row that call for backing
+ * off (`retryable`: nothing, 408, 429 or 5xx), full jitter over a ceiling that
+ * doubles from the interval up to max(60 s, Retry-After), never shorter than
+ * the interval itself, and never sooner than the server's Retry-After.
+ */
+export function loopWaitMs(base: number, failures: number, retryAfter: number | null, rand: () => number = Math.random) {
+  if (failures <= 0) return base
+  const cap = Math.max(LOOP_CAP_MS, retryAfter ?? 0)
+  const ceiling = Math.min(cap, base * 2 ** Math.min(failures, 20))
+  return Math.max(base, retryAfter ?? 0, jitterMs(ceiling, rand))
+}
+
+/** How long a poll's request may hang before its loop gives up on it and moves on: max(60 s, 3 x the interval). */
+export function watchdogMs(base: number) {
+  return Math.max(60_000, 3 * base)
+}
+
+/**
+ * How long a request the watchdog gave up on keeps counting against its loop,
+ * from when it was sent: max(10 minutes, 10 watchdog periods). Past that it's
+ * taken for dead, so a socket that never answers can't stop a poll for good.
+ */
+export function hungExpiryMs(base: number) {
+  return Math.max(600_000, 10 * watchdogMs(base))
 }
 
 export function errorOf(json: unknown): { code: string; message: string } | null {
