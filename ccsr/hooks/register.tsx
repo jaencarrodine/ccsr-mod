@@ -2364,20 +2364,39 @@ async function adoptHandle($: $, token: string, handle: string) {
   await saveSettings($, { handle })
   const entry = (await readKeyring($)).servers[cfg.url]
   if (entry && entry.handle === cfg.handle) await writeKeyring($, cfg.url, { ...entry, handle })
-  // The boards held mark this player's row by the old handle: read them again.
-  await update($, link, l => ({ ...l, boards: null }))
+  // The boards held mark this player's row by the old handle: read them again. `me` is what the pane's
+  // header, Settings and the Ranked tab's own row draw, and not every caller of GET /me writes it back.
+  await update($, link, l => ({ ...l, boards: null, me: l.me ? { ...l.me, handle } : l.me }))
   // The config is held per server and handle.
   void refreshConfig($, 'signin').catch(() => null)
 }
 
+/** How long a press waits on the account read before it goes on without it. */
+const SYNC_HANDLE_MS = 2000
+
 /**
- * Reads this install's account, so a rename is taken (api() adopts it) before the mod queues,
- * accepts or takes a challenge: from there on it tells its side of the match by handle. The
- * server never renames a player who is queued or in a match, so one read here is enough.
+ * Reads this install's account, so a rename is taken (api() adopts it) before the mod queues or
+ * takes a challenge: from there on it tells its side of the match by handle. The server never
+ * renames a player who is queued or in a match, so one read here is enough. `$.http.fetch` has
+ * no timeout and GET /me can wait on a ladder read under load, so a press waits `waitMs` at most
+ * and goes on; the read still lands, and adopts, behind it.
  */
-async function syncHandle($: $) {
+async function syncHandle($: $, waitMs: number | null = null) {
   if (!(await serverCfg($)).token) return
-  await api($, 'GET', '/me', undefined, { keepNote: true })
+  const read = api($, 'GET', '/me', undefined, { keepNote: true }).then(
+    () => undefined,
+    () => undefined,
+  )
+  if (waitMs === null) return read
+  let cancel = () => {}
+  await Promise.race([
+    read,
+    new Promise<void>(resolve => {
+      const timer = $.clock.after(waitMs, () => resolve())
+      cancel = () => timer.cancel()
+    }),
+  ])
+  cancel()
 }
 
 type SignInReply = { token: string; player: ApiPlayer; salt: string | null; has_recovery_key: boolean; recovery_key?: string }
@@ -4418,7 +4437,7 @@ export async function queueWith($: $, o: { lengthsMin: readonly number[] | null;
     await update($, link, l => ({ ...l, note }))
     return false
   }
-  await syncHandle($)
+  await syncHandle($, SYNC_HANDLE_MS)
   const r = await api($, 'POST', '/queue', target ? { lengths_min: lengths, bucket: target } : { lengths_min: lengths })
   if (await refusedForUpdate($, r)) return false
   if (r.status !== 200) {
@@ -4577,7 +4596,9 @@ async function refreshBucketBoards($: $, id: string, what: { profile?: boolean; 
 async function acceptOffer($: $) {
   const sh = await rankedShared($)
   if (!sh.matchId) return
-  await syncHandle($)
+  // A queue's offer needs no account read: the queue press made one, and the server renames nobody who
+  // is queued. A challenge's ready check reaches the challenger with no press of theirs before it.
+  if ((await read($, link)).queue?.offer?.kind === 'challenge') await syncHandle($, SYNC_HANDLE_MS)
   const r = await api($, 'POST', `/matches/${sh.matchId}/accept`)
   // Below the floor: decline now rather than hold the opponent for the full minute.
   if (await refusedForUpdate($, r)) return declineOffer($)
@@ -5278,7 +5299,7 @@ async function takeChallenge($: $, id: string, via: 'card' | 'band' | 'code') {
   if (!CODE.test(id) || !(await challengesLive($))) return
   const phase = (await rankedShared($)).phase
   if (phase === 'offered' || phase === 'live') return
-  await syncHandle($)
+  await syncHandle($, SYNC_HANDLE_MS)
   const r = await paced($, 'POST', `/challenges/${id}/accept`, { via })
   const offer = r.status === 200 ? (r.json as { offer?: ApiOffer } | null)?.offer : undefined
   if (!offer || typeof offer.match_id !== 'string') {
@@ -6733,15 +6754,17 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
   if (!last || (p.band === 'after' && t - last.scoredAt > 2 * 60_000)) return null
   const sc = await read($, scan)
   const queueBtn = cfg.token && !cf.practiceOnly ? <Button key="band-queue" label="Queue" onPress={() => a.open('match')} /> : null
-  if (rich)
+  if (rich) {
+    // The line is drawn in the strip: the commit's title, or the scan's note while one runs.
+    const line = sc.busy ? sc.note : clean(last.title).slice(0, 60)
     return (
       <Box gap={1} alignItems="center">
-        <Svg source={bandStrip({ kind: 'grind', points: last.points, category: last.category, craft: last.craft, week: wk.points, rank: l.grindRank ?? undefined })} alt={`Last commit +${last.points} ${last.category}. Grind ${wk.points} points this week.`} />
-        <Text wrap="truncate-end">{sc.busy ? sc.note : clean(last.title).slice(0, 60)}</Text>
+        <Svg source={bandStrip({ kind: 'grind', points: last.points, category: last.category, craft: last.craft, week: wk.points, rank: l.grindRank ?? undefined, title: line })} alt={`Last commit +${last.points} ${last.category}. Grind ${wk.points} points this week.${line ? ` ${line}` : ''}`} />
         {queueBtn}
         <Button key="band-open" label="Open" onPress={() => a.open('grind')} />
       </Box>
     )
+  }
   return (
     <Box gap={1} alignItems="center">
       <Text bold color={ORANGE}>

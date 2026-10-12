@@ -1183,19 +1183,20 @@ export function scorecard(a: { outcome: 'won' | 'lost' | 'draw'; hours: number; 
 
 /**
  * Band strips: a 300 by 36 graphic at the left of the band; the line of text and the buttons sit
- * beside it. W6b: a challenge's ready check (`found`, `mode: 'challenge'`) runs `of` seconds (60
+ * beside it. The Grind strip draws its line itself when given a `title` (the commit's title, past
+ * a dashed rule, on two lines at most), and grows up to 480 wide to hold it. W6b: a challenge's ready check (`found`, `mode: 'challenge'`) runs `of` seconds (60
  * if not given), and its result (`rated: false`) says UNRATED where a ranked one has its rating.
  */
 export type Strip =
   | { kind: 'setup' }
-  | { kind: 'grind'; points: number; category: string; craft: Craft; week: number; rank?: number }
+  | { kind: 'grind'; points: number; category: string; craft: Craft; week: number; rank?: number; title?: string }
   | { kind: 'queue'; seconds: number; hours: number[]; rating: number; range: number }
   | { kind: 'found'; me: string; them: string; theirRating: number; seconds: number; mode?: 'ranked' | 'challenge'; of?: number }
   | { kind: 'race'; race: Race; offlineAgo?: string; mode?: string }
   | { kind: 'result'; mode?: string; outcome: 'won' | 'lost' | 'draw'; hours: number; delta: number; ratingBefore: number; ratingAfter: number; mine: number; theirs: number; placing?: Placing & { placedIn?: TierKey }; rated?: false }
 
 export function bandStrip(a: Strip) {
-  const w = 300
+  let w = 300
   const h = 36
   let bg = C.paper
   let s = ''
@@ -1210,8 +1211,25 @@ export function bandStrip(a: Strip) {
       y -= 8
     }
     s += `<rect x="7" y="${y - 1}" width="24" height="3" fill="${C.ink}"/>` + T(38, 23, `+${a.points}`, { s: 17, w: 300, c: C.or })
-    s += T(70, 15, `${a.category.toUpperCase()}${a.craft === 'clean' ? ' · ▲ CLEAN' : a.craft === 'sloppy' ? ' · ▼ SLOPPY' : ''}`, { s: 8, w: 600, ls: 0.6 }) + T(70, 28, `GRIND ${a.week}${a.rank ? ` · #${a.rank}` : ''}`, { s: 8.5, c: C.stone2 })
+    const top = `${a.category.toUpperCase()}${a.craft === 'clean' ? ' · ▲ CLEAN' : a.craft === 'sloppy' ? ' · ▼ SLOPPY' : ''}`
+    const sub = `GRIND ${a.week}${a.rank ? ` · #${a.rank}` : ''}`
+    // The labels start past the points: a second digit (+13, +21) moves them over.
+    const lx = 70 + (String(a.points).length - 1) * 10
+    s += T(lx, 15, top, { s: 8, w: 600, ls: 0.6 }) + T(lx, 28, sub, { s: 8.5, c: C.stone2 })
     alt = `+${a.points} ${a.category}, Grind ${a.week}${a.rank ? `, rank ${a.rank}` : ''}`
+    const title = a.title?.trim()
+    if (title) {
+      // The rule sits past the wider of the two label rows (monospace: 0.6 em a character, plus the top row's spacing).
+      const x = Math.max(150, Math.ceil(lx + Math.max(top.length * 5.4, sub.length * 5.1)) + 10)
+      const max = Math.floor((480 - 10 - (x + 10)) / 5.7)
+      const lines = wrapText(title, max)
+      if (lines.length > 2) lines[1] = `${lines[1]!.slice(0, max - 1)}…`
+      const shown = lines.slice(0, 2)
+      w = Math.max(w, Math.ceil(x + 10 + Math.max(...shown.map(l => l.length)) * 5.7 + 10))
+      s += `<path d="M${x} 7V29" stroke="${C.ink}" stroke-width=".6" stroke-dasharray="2 3"/>`
+      s += shown.length === 1 ? T(x + 10, 21.5, shown[0]!, { s: 9.5 }) : T(x + 10, 15, shown[0]!, { s: 9.5 }) + T(x + 10, 28, shown[1]!, { s: 9.5 })
+      alt += `: ${title}`
+    }
   } else if (a.kind === 'queue') {
     const t = `${Math.floor(a.seconds / 60)}:${String(a.seconds % 60).padStart(2, '0')}`
     s += `<circle cx="16" cy="18" r="6" fill="${C.or}"/><circle cx="16" cy="18" r="10" fill="none" stroke="${C.or}" stroke-dasharray="2 2"/>` + T(32, 25, t, { s: 18, w: 300 }) + T(84, 15, 'IN QUEUE', { s: 8, w: 700, ls: 1 }) + T(84, 28, `${a.rating} ±${a.range}`, { s: 8.5, c: C.stone2 })
