@@ -117,6 +117,8 @@ import { ACCOUNT, EVAL, FULL, LINES, MOD, QUIET, ROASTS, SURFACE_ROWS, SURFACE_W
 import type { SurfaceKey } from './copy'
 // W5b: sign-in with a provider's device flow (`type Provider` comes from W3b's import block, above).
 import { IDENTITY, PROVIDER_NAMES } from './copy'
+import { SHARE_BEAT_MS, leadMs, leadOf, ledByOther, seenCopyOf, seenToTake, shareBody, shareOf, takeLead } from './lead'
+import type { SeenCopy, SeenField } from './lead'
 import { PROVIDERS, safeLink } from './actions'
 import { PROVIDER_HOSTS, cancelSignIn, choose, conflictChoices, dismissSignIn, flowIdOf, IDLE as SIGNIN0, join as joinFlow, linkedLogin, newInstallsVia, onJoin, onPoll, onResolve, onStart, onTick, pollDue, refLinked, signinMode, startSignIn as pressSignIn, tokenlessStart } from './identity'
 import type { Answer as FlowAnswer, EndWhy, FlowRef, Send as FlowSend, SignIn, SignInFrom, Step as SignInStep } from './identity'
@@ -269,6 +271,11 @@ const K = {
   repoLook: 'repoLook',
   // Usage weeks: `{ key: '<server url>|<handle>', anchor, through, tried, failed }`, the account's anchor as the server gave it, the newest week this install has handled, and when a run last began and last failed, so one session runs at a time.
   usage: 'usage',
+  // One ranked poller per machine (lead.ts): who polls the queue and the match now (`{ by, until }`), what that session last read
+  // (the queue state, the lanes and the match page, with a rev), and what any session's account and board reads found, for the rest.
+  rankedLead: 'rankedLead',
+  rankedShare: 'rankedShare',
+  seen: 'seen',
 } as const
 
 type Verdict = Pick<ScoredCommit, 'points' | 'base' | 'craft' | 'category' | 'reason' | 'judge' | 'asked' | 'rubric' | 'scoredAt'>
@@ -2296,6 +2303,48 @@ async function installLabel($: $) {
   return (home && dir.startsWith(home) ? `~${dir.slice(home.length)}` : dir).slice(0, 64)
 }
 
+/** The `at` of the shared account and board reads (`seen`) this session last took or wrote. */
+let seenAt = 0
+
+/**
+ * What a read of this session's found about the account or the boards goes into the store, for
+ * every other session to take instead of asking the server itself (adoptSeen). What another
+ * session left there is taken first, so its part isn't lost under this one's.
+ */
+async function shareSeen($: $, part: Partial<Record<SeenField, unknown>>) {
+  // Every field but the ones this read just answered: those are newer here than in any copy.
+  await adoptSeen($, Object.keys(part) as SeenField[])
+  const key = await configKey($)
+  const cur = seenCopyOf(await storeGet<unknown>($, K.seen, null))
+  const t = await $.clock.now()
+  const next: SeenCopy = { ...(cur && cur.key === key ? cur : {}), ...part, key, at: Math.max(t, (cur?.at ?? 0) + 1), by: owner }
+  seenAt = next.at
+  await save($, K.seen, next)
+}
+
+/**
+ * Takes the account and board reads another session made since this one last looked: no request,
+ * and the status line and the cards follow. `except`: fields this session has just read itself.
+ */
+async function adoptSeen($: $, except: readonly SeenField[] = []) {
+  const copy = seenCopyOf(await storeGet<unknown>($, K.seen, null))
+  const take = seenToTake(copy, await configKey($), seenAt)
+  if (!copy || !take) return
+  seenAt = copy.at
+  for (const f of except) delete take[f]
+  await update($, link, l => ({
+    ...l,
+    ...('me' in take ? { me: take.me as ApiPlayer | null } : {}),
+    ...('account' in take ? { account: take.account as ApiAccount | null } : {}),
+    ...('meBuckets' in take ? { meBuckets: take.meBuckets as unknown[] | null } : {}),
+    ...('ladder' in take ? { ladder: take.ladder as ApiRankedRow[] | null } : {}),
+    ...('myRank' in take ? { myRank: take.myRank as number | null } : {}),
+    ...('grindRank' in take ? { grindRank: take.grindRank as number | null } : {}),
+    ...('grindOf' in take ? { grindOf: take.grindOf as number | null } : {}),
+    ...('recent' in take ? { recent: take.recent as ApiRecentMatch[] | null } : {}),
+  }))
+}
+
 /** The shared ranked state as this session's last slowSync saw it (`live:<match id>`, else the phase): how it tells a match ended in another session. */
 let rankedSeen: string | null = null
 /** The match whose result this session's own poll read (pollMatch), and read the account after: slowSync has nothing to add for it. */
@@ -2336,6 +2385,8 @@ async function refreshAccount($: $) {
     const k = await readKeyring($)
     if (!k.servers[cfg.url]) await writeKeyring($, cfg.url, { handle: j.player.handle, token: cfg.token, recovery_key: cfg.recoveryKey ?? null })
     await loadInstalls($)
+    // For the machine's other sessions: they take this read instead of making their own. Last, so nothing above waits on it.
+    await shareSeen($, { me: j.player, account: j.account ?? null, meBuckets: Array.isArray(kept) ? kept.slice(0, 8) : null })
     return
   }
   if (me.status !== 401) return
@@ -4127,9 +4178,10 @@ async function reviveLoops($: $) {
 // ------------------------------------------------------------------ ranked
 // The queue, the ready check and the live match, by polling (mods can't hold a
 // socket): GET /queue while queued or offered, the match's events while it
-// runs, each at its config interval (2 s by default) on loop(). Every session
-// that sees an active phase polls; the server is the source of truth, so two
-// sessions polling agree. Between matches the same loop reads GET /queue for
+// runs, each at its config interval (2 s by default) on loop(). One session on
+// the machine polls (lead.ts: a lease in the store, taken by a press, a free
+// one by the first tick); what it reads goes into the store as a snapshot, and
+// every other session's loop draws that and asks the server nothing. Between matches the same loop reads GET /queue for
 // its lanes, the lengths offered (W2b), at poll_ms.idle while the Match tab is
 // on screen, and stops off it.
 
@@ -4212,10 +4264,23 @@ function startRankedPoll($: $) {
   stopRankedPoll = loop($, 'ranked', () => rankedEvery($), isCurrent => pollRanked($, isCurrent))
 }
 
-/** A ranked poll now (after a press): the ranked loop's next tick, started if it isn't running. Never a request beside it. */
+/**
+ * A ranked poll now (after a press): the ranked loop's next tick, started if it isn't running. Never
+ * a request beside it. The press makes this session the one that polls (the window in use leads),
+ * and what it holds after the press is newer than any snapshot, so the one in the store is set aside.
+ */
 async function pollRankedNow($: $) {
+  await leadTick($, true)
+  shareRev = shareOf(await storeGet<unknown>($, K.rankedShare, null))?.rev ?? shareRev
   startRankedPoll($)
   await kickLoop($, 'ranked')
+}
+
+/** A press here took the player out of the queue (Leave, Decline): this session's loop stops, and what it holds now is what every session draws. */
+async function quitRanked($: $) {
+  stopPolling()
+  await shareRanked($)
+  await dropLead($)
 }
 
 /** The ranked poll's interval for where the player is: queued, an offer out, a live match, or between matches (the lanes). */
@@ -4230,8 +4295,134 @@ function stopPolling() {
   stopRankedPoll = null
 }
 
-/** One tick of the ranked loop. Only the loop calls it: a press that wants a poll now goes through pollRankedNow. */
+// One poller per machine (lead.ts). The lease and the snapshot are in the store; these are this session's side of them.
+/** The rev of the snapshot this session last applied, wrote or (on a press here) set aside. */
+let shareRev = ''
+/** That snapshot's content (shareBody), and when this session last wrote one: an unchanged one is written again only every SHARE_BEAT_MS. */
+let shareKnown = ''
+let shareAt = 0
+let shareCount = 0
+/** The decided match whose snapshot said it has custom art this session holds no ref for yet (followRanked reads it once, for a pane that shows it). */
+let artWanted: string | null = null
+/** The matches that read was made for, whatever it found: never twice. */
+const artAsked = new Set<string>()
+
+/**
+ * How long a lease taken now lasts: past this session's next tick, its backoff wait included (leadMs).
+ * The interval is the running tick's own (the loop read it as the tick began); a press outside a tick reads it.
+ */
+async function leadMsNow($: $, failed = 0, retryAfter?: number | null) {
+  const st = loops.get('ranked')
+  const every = st?.tick && !st.tick.settled ? st.tick.every : await rankedEvery($)
+  return leadMs(every, (st?.failures ?? 0) + failed, retryAfter === undefined ? (st?.retryAfter ?? null) : retryAfter)
+}
+
+/** Takes or keeps the lease for this tick, and says whether this session leads. `force` (a press here) takes it from whoever has it. */
+async function leadTick($: $, force = false): Promise<boolean> {
+  const t = await $.clock.now()
+  const take = takeLead(leadOf(await storeGet<unknown>($, K.rankedLead, null)), owner, t, await leadMsNow($), force)
+  if (!take.write) return take.lead
+  await save($, K.rankedLead, take.write)
+  // Two sessions that take a free lease in the same moment both write: the store keeps one, and the other follows.
+  return leadOf(await storeGet<unknown>($, K.rankedLead, null))?.by === owner
+}
+
+/** Gives the lease up when it is this session's, so the next session to tick takes it at once instead of waiting it out. */
+async function dropLead($: $) {
+  if (leadOf(await storeGet<unknown>($, K.rankedLead, null))?.by === owner) await save($, K.rankedLead, { by: owner, until: 0 })
+}
+
+/** What this session holds of the queue, the lanes and the match goes into the store for every session, when it moved (or every SHARE_BEAT_MS). */
+async function shareRanked($: $) {
+  const l = await read($, link)
+  // The match as link holds it, so without a decided win's art ref (keepArtRef): another player's art, title and handle never reach
+  // the store. `art` only says there is one, so a session that draws the result reads the match once itself for it (followRanked).
+  const ranked = l.ranked ? { ...l.ranked, art: artRefs.has(l.ranked.id) } : null
+  const body = { key: await configKey($), queue: l.queue, lanes: l.lanes, lanesBucket: l.lanesBucket, ranked }
+  const json = shareBody(body)
+  const t = await $.clock.now()
+  if (json === shareKnown && t - shareAt < SHARE_BEAT_MS) return
+  shareKnown = json
+  shareAt = t
+  shareRev = `${owner}:${t}:${++shareCount}`
+  await save($, K.rankedShare, { rev: shareRev, at: t, by: owner, ...body })
+}
+
+/**
+ * Takes a snapshot another session wrote that this one hasn't seen: its queue state, lanes and
+ * match page become this session's. Every tick begins with it, the leader's too, since a press in
+ * another session (Leave, Dismiss) writes one. The match's summary goes through keepArtRef here as
+ * a page of this session's own would.
+ */
+async function applyShare($: $) {
+  const s = shareOf(await storeGet<unknown>($, K.rankedShare, null))
+  if (!s || s.rev === shareRev || s.by === owner) return
+  shareRev = s.rev
+  if (s.key !== (await configKey($))) return
+  // The match page only when it is the match the store's phase is about: one left from an earlier match draws nothing.
+  const about = (await rankedShared($)).matchId
+  const sent = s.ranked && (s.ranked as { id?: unknown }).id === about ? (s.ranked as RankedMatch & { art?: boolean }) : null
+  let ranked: RankedMatch | null = null
+  if (sent) {
+    const { art, ...page } = sent
+    ranked = page
+    artWanted = art === true && !artAsked.has(sent.id) ? sent.id : null
+    // Decided, and read by the session that leads: it reads the account after it and shares that too (adoptSeen).
+    if (sent.summary?.status === 'finished' || sent.summary?.status === 'void') accountAfter = sent.id
+  }
+  const lanes = s.lanes as ApiLane[] | null
+  await update($, link, l => ({ ...l, queue: s.queue as ApiQueueState | null, ranked, ...(lanes ? { lanes, lanesBucket: s.lanesBucket } : {}) }))
+  const now = await read($, link)
+  shareKnown = shareBody({ key: s.key, queue: now.queue, lanes: now.lanes, lanesBucket: now.lanesBucket, ranked: sent })
+  shareAt = s.at
+}
+
+/**
+ * A tick of a session that isn't the one polling: it asks the server nothing. What the leader read
+ * is already this session's (applyShare); what is left is this session's own. Near the bell it
+ * still looks for uncommitted work in its own repo, and between matches, off the Match tab, its
+ * loop stops as a leader's does.
+ */
+async function followRanked($: $) {
+  const sh = await rankedShared($)
+  const sm = (await read($, link)).ranked?.summary
+  if (sh.phase === 'live' && sm?.status === 'live' && sm.deadline && Date.parse(sm.deadline) - (await $.clock.now()) <= warnMs(sm)) await checkDirty($)
+  // A decided win with custom art: its ref is never in the snapshot, so a session whose pane is up reads the match once for it.
+  if (artWanted && paneSurface && sm && sm.id === artWanted && !artRefs.has(artWanted)) {
+    const id = artWanted
+    artWanted = null
+    artAsked.add(id)
+    for (const old of [...artAsked].slice(0, Math.max(0, artAsked.size - 20))) artAsked.delete(old)
+    const m = await api($, 'GET', `/matches/${id}`, undefined, { keepNote: true })
+    if (m.status === 200) await keepArtRef($, (m.json as { match: ApiMatchSummary }).match)
+  }
+  if ((sh.phase === 'idle' || sh.phase === 'done') && !lanesOnce && !(await lanesWatched($))) stopPolling()
+  await refreshStatus($)
+}
+
+/**
+ * One tick of the ranked loop. Only the loop calls it: a press that wants a poll now goes through
+ * pollRankedNow. One session on the machine polls (the lease); the others draw what it read.
+ */
 async function pollRanked($: $, isCurrent: () => boolean): Promise<Answer | void> {
+  await applyShare($)
+  if (!(await leadTick($))) return followRanked($)
+  const r = await leadRanked($, isCurrent)
+  const stopped = !loops.has('ranked')
+  // A tick given up on publishes nothing, nor one whose lease a press in another session took while its request was out.
+  if (!stopped && !isCurrent()) return r
+  const t = await $.clock.now()
+  if (ledByOther(leadOf(await storeGet<unknown>($, K.rankedLead, null)), owner, t)) return r
+  await shareRanked($)
+  // Nothing left to poll here: the lease goes, so a session with the Match tab on screen takes it at its next tick.
+  if (stopped) await dropLead($)
+  // Backing off: the lease is held through the wait the loop takes next, so no follower takes a turn at a server that is down or shedding.
+  else if (r && retryable(r.status)) await save($, K.rankedLead, { by: owner, until: t + (await leadMsNow($, 1, r.retryAfterMs ?? null)) })
+  return r
+}
+
+/** The leader's tick: the request this player's phase calls for. */
+async function leadRanked($: $, isCurrent: () => boolean): Promise<Answer | void> {
   const sh = await rankedShared($)
   if (sh.phase === 'queued' || sh.phase === 'offered') return pollQueue($, sh, isCurrent)
   if (sh.phase === 'live' && sh.matchId) return pollMatch($, sh.matchId, isCurrent)
@@ -4608,7 +4799,7 @@ async function leaveQueue($: $) {
   }
   await setRanked($, { phase: 'idle', matchId: null })
   await update($, link, l => ({ ...l, queue: null }))
-  stopPolling()
+  await quitRanked($)
   await idlePoll($)
 }
 
@@ -4764,7 +4955,7 @@ async function declineOffer($: $) {
   }
   await setRanked($, { phase: 'idle', matchId: null })
   await update($, link, l => ({ ...l, queue: null }))
-  stopPolling()
+  await quitRanked($)
   await idlePoll($)
   if (challenge && (await challengesLive($))) await pollInboxNow($)
 }
@@ -4794,6 +4985,8 @@ async function sendRankedChat($: $, text: string) {
 async function clearRanked($: $) {
   await setRanked($, { phase: 'idle', matchId: null })
   await update($, link, l => ({ ...l, ranked: null }))
+  // Dismissed here: every session's copy of the match goes with it.
+  await shareRanked($)
   await idlePoll($)
 }
 
@@ -4852,6 +5045,15 @@ async function refreshBoards($: $) {
     grindOf: week.status === 200 ? (week.json as { total: number }).total : l.grindOf,
     recent: me.status === 200 ? ((me.json as { recent_matches?: ApiRecentMatch[] }).recent_matches ?? l.recent) : l.recent,
   }))
+  // For the machine's other sessions: what answered, as this session now holds it.
+  if (board.status === 200 || me.status === 200 || week.status === 200) {
+    const now = await read($, link)
+    await shareSeen($, {
+      ...(board.status === 200 ? { ladder: now.ladder } : {}),
+      ...(me.status === 200 ? { myRank: now.myRank, grindRank: now.grindRank, recent: now.recent } : {}),
+      ...(week.status === 200 ? { grindOf: now.grindOf } : {}),
+    })
+  }
   // W3b: the buckets besides Open on screen, read the same way: the Match tab's (your rank and last matches there; queued or after a match, the server's bucket), the Ranked tab's (and its top 10) and the Grind tab's.
   const list = bucketsOf(await configOf($, cfg))
   if (!bucketRowShown(list)) return
@@ -4896,6 +5098,8 @@ async function selectTab($: $, t: Tab) {
  */
 async function showLanes($: $) {
   paneSeenAt = await $.clock.now()
+  // What another session last read is this one's at once: a result it read, the lanes, with no request.
+  await applyShare($)
   const phase = (await rankedShared($)).phase
   if ((phase === 'idle' || phase === 'done') && (await serverCfg($)).token) await pollRankedNow($)
 }
@@ -10163,6 +10367,8 @@ async function slowSync($: $) {
   const t = await $.clock.now()
   await update($, now, () => t)
   await syncFromStore($)
+  // The account and the boards as another session's read last found them: taken, never asked for again.
+  await adoptSeen($)
   const m = await read($, match)
   if (m && m.status === 'live' && m.kind === 'practice' && !stopTicker) startTicker($)
   // Another session joined the queue or a match: follow it here too.
@@ -10644,6 +10850,12 @@ async function boot($: $, cwd: string) {
   // The switchboard: a fresh copy another session read is taken at once, else it's asked for.
   void refreshConfig($, 'boot').catch(err => $.ui.log(`CCSR config: ${(err as Error).message}`))
   void refreshAccount($).then(() => flushOutbox($))
+  // A session begins with what the machine's other sessions last read: the match or its result, the lanes, the account and boards.
+  // Never awaited: boot goes on as it did, and nothing below waits on the store for it.
+  void applyShare($)
+    .then(() => adoptSeen($))
+    .then(() => refreshStatus($))
+    .catch(err => $.ui.log(`CCSR ranked: ${(err as Error).message}`))
   const sh = await rankedShared($)
   if (sh.phase === 'queued' || sh.phase === 'offered' || sh.phase === 'live') startRankedPoll($)
   $.clock.every(30_000, () => void slowSync($))
@@ -11155,6 +11367,8 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     // The whole chain shares one short bound: the write gets what's left of it, less a margin.
     if (capturing) await Promise.race([writeCalls($), $.clock.sleep(Math.max(0, Math.min(1000, next.budget.remainingMs - 300)))])
+    // One poller per machine: a session that ends hands the lease on, so the next session to tick polls at once.
+    await Promise.race([dropLead($).catch(() => null), $.clock.sleep(Math.max(0, Math.min(300, next.budget.remainingMs - 200)))])
     return next(e)
   })
 }
