@@ -9627,7 +9627,7 @@ async function statusLine($: $): Promise<string | undefined> {
   if (!cfg.token) return short ? '◆ CCSR · not set up' : '◆ CCSR · not set up · /ccsr to start'
   const wk = totals(await read($, ledger), periodStart('week', t), await read($, weekTotals))
   if (short) return `◆ ${placing ? `Mud ${placing.played}/${placing.of}` : (l.me?.rating ?? '')} · Grind ${wk.points}`
-  return `◆ CCSR  ${tier ?? cfg.handle} · ${s.tracking ? `Grind ${wk.points} this week${l.grindRank ? ` · #${l.grindRank}` : ''}` : 'Grind off'}`
+  return `◆ CCSR  ${tier ?? cfg.handle} · ${s.tracking ? `Grind ${wk.points} this week${l.grindRank ? ` · #${l.grindRank}` : ''}` : 'Grind off'} · open with /ccsr`
 }
 
 let lastDirtyAt = 0
