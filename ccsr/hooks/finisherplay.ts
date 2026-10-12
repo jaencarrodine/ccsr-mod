@@ -231,7 +231,7 @@ export type PracticeLike = Pick<Match, 'kind' | 'hours' | 'deadline' | 'status' 
 
 /**
  * A practice match's clutch window in whole minutes: a sixth of its length, rounded, held to 3 to
- * 10, exactly W2a's graceMinFor (server/src/lengths.ts). A replay takes its session's own length,
+ * 10, exactly the server's lastMinutesFor (server/src/lengths.ts; the grace too until 2026-10-12). A replay takes its session's own length,
  * any number of minutes (21 gives 4, never 3.5), so the port's clutchMinFor, which doesn't round,
  * would put the window up to 30 s off the server's rule.
  */

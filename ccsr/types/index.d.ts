@@ -268,7 +268,7 @@ export type ApiMatchSummary = {
   status: ApiMatchStatus
   started_at: string | null
   deadline: string | null
-  /** W2: deadline plus the match's grace (3 minutes at 15m, 10 at 1h); null until the clock starts. */
+  /** W2: deadline plus the match's grace (1 minute at 15m, 2 at 30m, 3 at 1h and 3h); null until the clock starts. The result comes then. */
   grace_ends_at?: string | null
   ended_at: string | null
   sides: [ApiMatchSide, ApiMatchSide]

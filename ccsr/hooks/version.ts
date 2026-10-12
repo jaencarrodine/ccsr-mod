@@ -4,7 +4,7 @@
 // scripts/publish-mod.sh bumps both and refuses to publish when they differ.
 // Pure: no `$` here, so register.tsx can import it.
 
-export const VERSION = '0.5.8'
+export const VERSION = '0.6.0'
 
 /**
  * The oldest Claude Code that runs mods, which Settings > Version names: the

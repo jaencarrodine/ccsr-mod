@@ -49,7 +49,7 @@ export type FinisherInput = {
   cameo: boolean
   /** Combo: min(14, the winner's scored commits). Null falls back to the winner's commits. */
   hits: number | null
-  /** Clutch: the window in minutes (the match's grace). Null falls back to clutchMinFor(length_min). */
+  /** Clutch: the window in minutes (the match's last minutes). Null falls back to clutchMinFor(length_min). */
   clutch_min: number | null
   winner: FinisherSide
   loser: FinisherSide
@@ -536,7 +536,7 @@ export function defaultTitle(kind: string, winnerHandle: string) {
   const k = kindOf(kind)
   return k === 'knockout' ? cleanTitle(`${winnerHandle} WINS.`) : HEADLINES[k]
 }
-/** The clutch window for a length with no grace of its own: a sixth of it, held to 3 to 10 minutes. */
+/** The clutch window for a length when the server gives none: a sixth of it, held to 3 to 10 minutes. */
 export const clutchMinFor = (lengthMin: number) => Math.min(10, Math.max(3, num(lengthMin) / 6))
 /** A length as the graphics print it: 15M, 90M, 1H, 3H. */
 export const lengthLabel = (min: number) => (min > 0 && min % 60 === 0 ? `${min / 60}H` : `${Math.round(min * 10) / 10}M`)
@@ -1322,7 +1322,7 @@ export type PickInput = {
   timeline: readonly PickScore[]
   /** The bell, in ms. */
   deadline: number
-  /** The clutch window: the match's grace, in ms. */
+  /** The clutch window: the match's last minutes, in ms. */
   windowMs: number
   result: string | null
 }

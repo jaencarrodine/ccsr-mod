@@ -955,7 +955,7 @@ export function result(a: { outcome: 'won' | 'lost' | 'draw'; race: Race; delta:
   const Y = (p: number) => base - (p / maxP) * (base - top)
   s += `<line x1="${x0}" x2="${x1}" y1="${base}" y2="${base}" stroke="${C.ink}"/>` + T(204, 190, 'THE WHOLE RACE', { s: 7.5, c: C.stone2, ls: 1.5 })
   s += `<path d="${stepPath(steps(r.them.commits, len), X, Y)}" fill="none" stroke="${C.ink}" stroke-width="1.2"/><path d="${stepPath(steps(r.me.commits, len), X, Y)}" fill="none" stroke="${C.or}" stroke-width="2.2"/>`
-  // The last 10 minutes, from 1h up: under an hour its label would sit on THE WHOLE RACE, and the warnings come at the grace there (3 or 5 minutes).
+  // The last 10 minutes, from 1h up: under an hour its label would sit on THE WHOLE RACE, and the warnings come 3 or 5 minutes out there (a match's last minutes).
   if (len >= 60) s += `<line x1="${f(X(len - 10))}" x2="${f(X(len - 10))}" y1="${top}" y2="${base}" stroke="${C.stone2}" stroke-dasharray="1 3"/>` + T(X(len - 10) - 3, top - 6, '{ last 10 min }', { s: 7.5, c: C.stone2, a: 'end' })
   // The hours, or under an hour the minute marks the live chart had.
   const ends = r.hours >= 1 ? Array.from({ length: Math.floor(r.hours) + 1 }, (_, i) => [i * 60, `${i}h`] as [number, string]) : lengthMarks(r.hours)

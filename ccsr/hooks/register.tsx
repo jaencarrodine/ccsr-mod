@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { Elements, EngineInterface, ModelCompleteResult, RenderElement, RenderInput, Register } from 'claude-code'
+import type { Elements, EngineInterface, ModelCompleteResult, RenderElement, RenderInput, RenderNode, Register } from 'claude-code'
 
 import type { ApiAccount, ApiChatItem, ApiCoder, ApiInstall, ApiLane, ApiLobbyItem, ApiMatchSummary, ApiPlayer, ApiQueueState, ApiRankedRow, ApiRecentMatch, ApiRoom, ApiScoreReply, ApiSeason, BacktestRun, ConfigState, RankedMatch, RankedShared, ChatLine, FeedItem, LinkState, Match, ModSettings, OutboxItem, PastSession, Record3, ScanStatus, SavedAccount, ScoredCommit, ServerConfig, Keyring, Surfaces, Tab, WeekTotals } from '../types'
 import { DEFAULT_SERVER, backoffMs, errorOf, handleProblem, hungExpiryMs, loopWaitMs, mergeEvents, retryAfterMs, retryable, scoreBody, sha256hex, watchdogMs, withoutCoder } from './api'
@@ -38,6 +38,7 @@ import {
   periodStart,
   pickedLengths,
   recentOnSameFiles,
+  resultInMs,
   rng,
   rollCutoff,
   rollUp,
@@ -4812,7 +4813,7 @@ async function pollMatch($: $, id: string, isCurrent: () => boolean, late: 'open
   const s = summary
   if (s.status === 'live' && s.deadline) {
     const left = Date.parse(s.deadline) - t
-    // The warnings follow the match's grace: 10 minutes before the bell at 1h, 3 at 15m; then 1 minute, with the bell.
+    // The warnings follow the match's last minutes (warnMs): 10 before the bell at 1h, 5 at 30m, 3 at 15m; then 1 minute, with the bell.
     const warn = warnMs(s)
     const marks: [number, string][] = warn > 60_000 ? [[warn, MOD.warnAt(Math.round(warn / 60_000))], [60_000, MOD.warn1]] : [[60_000, MOD.warn1]]
     for (const [mark, text] of marks)
@@ -7124,7 +7125,7 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
               </Text>
             )}
             {sm.status === 'grace' ? (
-              <Text color={ORANGE}>{MOD.counting}</Text>
+              <Text color={ORANGE}>{countingLine(sm, t)}</Text>
             ) : offline ? (
               <Text dimColor wrap="truncate-end">
                 {MOD.offline}
@@ -7302,6 +7303,53 @@ function resultWord(m: Match) {
 
 // ------------------------------------------------------------------ pane
 
+// ---------------------------------------------------------------- row spacing
+
+/** What a desktop or a phone draws taller than a line of text. The terminal draws each in one row. */
+const TALL: ReadonlySet<string> = new Set(['Button', 'Input', 'Select'])
+
+type BoxEl = Extract<RenderElement, { type: 'Box' }>
+
+const isBox = (n: RenderNode): n is BoxEl => typeof n !== 'string' && n.type === 'Box'
+const isColumn = (b: BoxEl) => b.props?.flexDirection === 'column' || b.props?.flexDirection === 'column-reverse'
+/** Out of the flow or not drawn: it takes no row of its own. */
+const noRow = (n: RenderNode) => isBox(n) && (n.props?.position === 'absolute' || n.props?.display === 'none')
+
+/** Whether a node's top (or bottom) edge is a control: one itself, a row that holds one, or a column whose first (last) row is. A border is an edge of its own. */
+function tallEdge(n: RenderNode, top: boolean): boolean {
+  if (typeof n === 'string') return false
+  if (TALL.has(n.type)) return true
+  if (!isBox(n) || noRow(n) || n.props?.borderStyle) return false
+  const kids = (n.children ?? []).filter(k => !noRow(k))
+  if (!isColumn(n)) return kids.some(k => tallEdge(k, top))
+  const k = top ? kids[0] : kids[kids.length - 1]
+  return k !== undefined && tallEdge(k, top)
+}
+
+/**
+ * Room around the controls, off the terminal. A desktop or a phone draws a button or an input
+ * taller than a line of text, so in a column with no gap a row of them touches the row above and
+ * the row below. Every such column gets a gap of one, and the rows between two controls (lines of
+ * text, a drawing) are held together in a column of their own, so text stays as tight as it was.
+ * A column that already has a gap, or holds a Box out of the flow, is left as drawn.
+ */
+function roomy(n: RenderNode, Box: El['Box']): RenderNode {
+  if (!isBox(n) || !n.children) return n
+  const kids = n.children.map(k => roomy(k, Box))
+  const p = n.props ?? {}
+  const same = { ...n, children: kids }
+  if (!isColumn(n) || Number(p.gap ?? 0) > 0 || Number(p.rowGap ?? 0) > 0 || kids.some(noRow)) return same
+  const groups: RenderNode[][] = []
+  for (const k of kids) {
+    const last = groups[groups.length - 1]
+    const prev = last?.[last.length - 1]
+    if (last && prev !== undefined && !tallEdge(prev, false) && !tallEdge(k, true)) last.push(k)
+    else groups.push([k])
+  }
+  if (groups.length < 2) return same
+  return { ...n, props: { ...p, gap: 1 }, children: groups.map(g => (g.length === 1 ? (g[0] as RenderNode) : Box({ flexDirection: 'column', children: g }))) }
+}
+
 /** The five tabs in the frame. Backtest opens from the Grind tab ("Score past sessions") and Lab from `/ccsr lab`. */
 const TABS: ['match' | 'ranked' | 'grind' | 'chat' | 'settings', string][] = [
   ['match', 'Match'],
@@ -7348,6 +7396,8 @@ export async function renderPane($: $, e: RenderInput<'Pane'>, a: Actions): Prom
       {body}
     </Box>
   )
+  // The tabs' frame below hugs its buttons on purpose, so only the body gets the room.
+  if (rich) body = roomy(body, Box) as RenderElement
 
   const me = l.me
   const placing = me?.placement ?? null
@@ -8010,7 +8060,12 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
           </Text>
         )}
         {closed && rich && <Text bold>{line}</Text>}
-        {sm.status === 'grace' && <Text color={ORANGE}>{MOD.counting}</Text>}
+        {sm.status === 'grace' && (
+          <Box flexDirection="column">
+            <Text color={ORANGE}>{countingLine(sm, t)}</Text>
+            <Text dimColor>{MOD.countingRule}</Text>
+          </Box>
+        )}
         {hot && them.points > mine.points && (
           <Text bold color={ORANGE}>
             {LINES.behind(them.points - mine.points)}
@@ -10396,6 +10451,12 @@ function mmss(ms: number) {
   return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`
 }
 
+/** The line after the bell, until the result: what is still happening, and how long until the result when the server gave the grace's end. */
+function countingLine(sm: { grace_ends_at?: string | null }, t: number) {
+  const left = resultInMs(sm, t)
+  return left === null ? MOD.counting : left <= 0 ? MOD.deciding : MOD.countingIn(mmss(left))
+}
+
 /** The status line for where the player is (docs/ui-spec.md, States): full, short, or off. */
 async function statusLine($: $): Promise<string | undefined> {
   const s = await read($, settings)
@@ -10426,7 +10487,12 @@ async function statusLine($: $): Promise<string | undefined> {
     const sm = l.ranked.summary
     const { mine, them } = rankedSides(sm, cfg.handle ?? '')
     const score = `${mine.points}-${them.points}`
-    if (sm.status === 'grace') return short ? `◆ counting ${score}` : `◆ CCSR  bell · counting · ${score}`
+    if (sm.status === 'grace') {
+      // Counting after the bell: the time until the result when the server gave the grace's end, else the old word.
+      const result = resultInMs(sm, t)
+      if (!result) return short ? `◆ counting ${score}` : `◆ CCSR  bell · counting · ${score}`
+      return short ? `◆ result ${mmss(result)} · ${score}` : `◆ CCSR  bell · result in ${mmss(result)} · ${score}`
+    }
     if (l.online === false) return short ? `◆ offline · ${l.outbox} waiting` : `◆ CCSR  offline · ${l.outbox} score${l.outbox === 1 ? '' : 's'} waiting`
     const left = sm.deadline ? Date.parse(sm.deadline) - t : 0
     if (short) return `◆ ${score} · ${clock(left)}`
@@ -11378,7 +11444,7 @@ async function drawBadge($: $, e: RenderInput<'ToolUse'>, row: RenderElement): P
   )
 }
 
-/** Minutes and seconds left when the bell is near: within the match's grace in ranked (warnMs), 10 minutes in practice; null otherwise. */
+/** Minutes and seconds left when the bell is near: within the match's last minutes in ranked (warnMs), 10 minutes in practice; null otherwise. */
 async function bellLeft($: $): Promise<number | null> {
   const t = await $.clock.now()
   const sh = await rankedShared($)

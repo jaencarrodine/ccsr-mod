@@ -201,7 +201,7 @@ export const LENGTH_MAX = 1440
 export const LENGTHS_MAX = 8
 /** The longest length label the mod draws; the server's own cap is 12 too. */
 export const LENGTH_LABEL_MAX = 12
-/** The warning before the bell when the server doesn't say how long the match's grace is, and practice's always. */
+/** The warning before the bell for a match whose length isn't known, and practice's always. */
 export const WARN_MS = 10 * 60_000
 
 const isMinutes = (x: unknown): x is number => typeof x === 'number' && Number.isInteger(x) && x >= LENGTH_MIN && x <= LENGTH_MAX
@@ -313,17 +313,34 @@ export function toggledLengths(picked: readonly number[] | null, min: number, la
 }
 
 /**
- * How long before the bell a ranked match warns: its grace (grace_ends_at minus the
- * deadline: 3 minutes at 15m, 5 at 30m, 10 at 1h and 3h), in whole minutes, held to
- * 1 to 10. WARN_MS when the server doesn't say. The toast, the band and status line's
- * last minutes, the working line and the uncommitted-files check all follow it.
+ * A match's last minutes, in whole minutes: a sixth of its length, held to 3 to 10 (3 at 15m, 5 at
+ * 30m, 10 at 1h and 3h). The server's lastMinutesFor (server/src/lengths.ts, its clutch window);
+ * web/scripts/hot-window.test.mjs holds the two and the site's to each other.
  */
-export function warnMs(s: { deadline: string | null; grace_ends_at?: string | null } | null | undefined) {
-  const d = s?.deadline ? Date.parse(s.deadline) : NaN
+export function lastMinutesFor(lengthMin: number) {
+  return Math.min(10, Math.max(3, Math.round(lengthMin / 6)))
+}
+
+/**
+ * How long before the bell a ranked match warns: its last minutes (lastMinutesFor its length),
+ * WARN_MS when the summary has no length. The toast, the band and status line's last minutes,
+ * the working line and the uncommitted-files check all follow it. Until 2026-10-12 this was
+ * the match's grace (grace_ends_at minus the deadline); the grace is 1 to 3 minutes now, too
+ * short a warning, so the length alone decides it.
+ */
+export function warnMs(s: { length_min?: number | null } | null | undefined) {
+  const min = s?.length_min
+  return typeof min === 'number' && Number.isFinite(min) && min > 0 ? lastMinutesFor(min) * 60_000 : WARN_MS
+}
+
+/**
+ * Milliseconds until a match's result, while it counts after the bell: the server decides it at
+ * `grace_ends_at`. Null when the summary doesn't say (no date, or one that doesn't parse); 0 once
+ * the time has passed and the result is being worked out.
+ */
+export function resultInMs(s: { grace_ends_at?: string | null } | null | undefined, now: number) {
   const g = s?.grace_ends_at ? Date.parse(s.grace_ends_at) : NaN
-  const ms = g - d
-  if (!Number.isFinite(ms) || ms <= 0) return WARN_MS
-  return Math.min(WARN_MS, Math.max(60_000, Math.round(ms / 60_000) * 60_000))
+  return Number.isFinite(g) ? Math.max(0, g - now) : null
 }
 
 // ------------------------------------------------------------------ scale and craft

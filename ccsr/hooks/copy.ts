@@ -100,7 +100,14 @@ export const MOD = {
   lead: (who: string, a: number, b: number) => `${who} took the lead, ${a}-${b}.`,
   offline: "Can't reach ccsr.gg. Scores wait here and send when it's back.",
   notice: 'Counts in your match.',
-  counting: 'Bell. Scoring commits made before it.',
+  /** After the bell, until the result: your Claude may still be scoring a commit made before it. With no clock from the server. */
+  counting: 'Bell. Still scoring commits made before it.',
+  /** The same, with the time until the result (the match's grace: 1 minute at 15m, 2 at 30m, 3 at 1h and 3h). */
+  countingIn: (left: string) => `Bell. Still scoring commits made before it. Result in ${left}.`,
+  /** The grace is over and the result hasn't been read yet (a few seconds). */
+  deciding: 'Bell. Working out the result.',
+  /** Under it, in the pane. */
+  countingRule: "Commits made after the bell don't count in this match.",
   // Settings, Resync (2026-10-12): the way out of a state the mod doesn't leave by itself.
   resyncTitle: 'Stuck or out of date?',
   resyncLead: 'Resync reads your account, queue and match from the server again.',
@@ -146,7 +153,7 @@ export const MOD = {
   /** A Queue, Leave or Decline press, or the lanes read a Queue waits for, that didn't reach the server, or one it refused with no message of its own. */
   noServer: "Can't reach the server.",
   answered: (status: number) => `The server answered ${status}.`,
-  /** The warning before the bell, at the match's grace: 10 minutes at 1h, 3 at 15m; one minute has its own line. */
+  /** The warning before the bell, at the match's last minutes: 10 at 1h, 5 at 30m, 3 at 15m; one minute has its own line. */
   warnAt: (min: number) => (min === 1 ? '1 minute to the bell. Only commits score.' : `${min} minutes to the bell. Only commits score.`),
 }
 
