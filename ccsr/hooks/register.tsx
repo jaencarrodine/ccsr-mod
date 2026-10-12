@@ -2327,19 +2327,25 @@ async function saveQuiet($: $, key: string, value: unknown): Promise<boolean> {
 
 /** The `at` of the shared account and board reads (`seen`) this session last took or wrote. */
 let seenAt = 0
+/** When the account this session holds was read from the server (its own GET /me, or the `meAt` of the copy it took): an older one is never taken over it. */
+let meHeldAt = 0
 
 /**
  * What a read of this session's found about the account or the boards goes into the store, for
  * every other session to take instead of asking the server itself (adoptSeen). What another
  * session left there is taken first, so its part isn't lost under this one's.
  */
-async function shareSeen($: $, part: Partial<Record<SeenField, unknown>>) {
+async function shareSeen($: $, part: Partial<Record<SeenField, unknown>>, isAccount = false) {
   // Every field but the ones this read just answered: those are newer here than in any copy.
   await adoptSeen($, Object.keys(part) as SeenField[])
   const key = await configKey($)
   const cur = seenCopyOf(await storeGet<unknown>($, K.seen, null))
   const t = await $.clock.now()
-  const next: SeenCopy = { ...(cur && cur.key === key ? cur : {}), ...part, key, at: Math.max(t, (cur?.at ?? 0) + 1), by: owner }
+  const kept = cur && cur.key === key ? cur : null
+  const at = Math.max(t, (cur?.at ?? 0) + 1)
+  // `meAt` moves only with an account read: a board read merged over the store's copy carries that copy's account, as old as it was.
+  const next: SeenCopy = { ...(kept ?? {}), ...part, key, at, by: owner, ...(isAccount ? { meAt: at } : kept?.meAt !== undefined ? { meAt: kept.meAt } : {}) }
+  if (isAccount) meHeldAt = Math.max(meHeldAt, at)
   // Counted as this session's only once it is in the store: a write that failed is another session's to make, or the next read's.
   if (await saveQuiet($, K.seen, next)) seenAt = next.at
 }
@@ -2350,11 +2356,17 @@ async function shareSeen($: $, part: Partial<Record<SeenField, unknown>>) {
  */
 async function adoptSeen($: $, except: readonly SeenField[] = []) {
   const copy = seenCopyOf(await storeGet<unknown>($, K.seen, null))
-  const take = seenToTake(copy, await configKey($), seenAt)
-  if (!copy || !take) return
-  seenAt = copy.at
-  // The account as another session read it after the result this session was waiting on: nothing is owed any more.
-  if (accountOwed && 'me' in take && copy.at >= accountOwed.since) accountOwed = null
+  // The account fields come only with an account read newer than the one held here (seenToTake's meSince).
+  const take = seenToTake(copy, await configKey($), seenAt, meHeldAt)
+  if (!copy) return
+  if (copy.at > seenAt) seenAt = copy.at
+  if (!take) return
+  if ('me' in take) {
+    meHeldAt = copy.meAt ?? meHeldAt
+    // The account as another session read it after the result this session was waiting on: nothing is owed any more. By the
+    // account read's own stamp, never the copy's: a board read written after a failed account read carries the old account.
+    if (accountOwed && meHeldAt >= accountOwed.since) accountOwed = null
+  }
   for (const f of except) delete take[f]
   await update($, link, l => ({
     ...l,
@@ -2422,7 +2434,7 @@ async function refreshAccount($: $) {
     if (!k.servers[cfg.url]) await writeKeyring($, cfg.url, { handle: j.player.handle, token: cfg.token, recovery_key: cfg.recoveryKey ?? null })
     await loadInstalls($)
     // For the machine's other sessions: they take this read instead of making their own. Last, so nothing above waits on it.
-    await shareSeen($, { me: j.player, account: j.account ?? null, meBuckets: Array.isArray(kept) ? kept.slice(0, 8) : null })
+    await shareSeen($, { me: j.player, account: j.account ?? null, meBuckets: Array.isArray(kept) ? kept.slice(0, 8) : null }, true)
     return
   }
   if (me.status !== 401) return
@@ -4424,7 +4436,7 @@ async function applyShare($: $) {
     // a copy newer than this snapshot is taken: slowSync asks itself if none comes (the leader's one read may have failed).
     if ((sent.summary?.status === 'finished' || sent.summary?.status === 'void') && accountAfter !== sent.id) {
       accountAfter = sent.id
-      if (seenAt < s.at) accountOwed = { id: sent.id, since: s.at, tries: 0 }
+      if (meHeldAt < s.at) accountOwed = { id: sent.id, since: s.at, tries: 0 }
     }
   }
   const lanes = s.lanes as ApiLane[] | null
@@ -4723,7 +4735,8 @@ async function pollMatch($: $, id: string, isCurrent: () => boolean, late: 'open
   if (s.status === 'finished' || s.status === 'void') {
     // What every other session draws goes out before the phase does, and before the toast and the result's sound (which is awaited
     // to its end, up to two seconds): a follower that found done with no result to draw yet sat between the two writes.
-    await shareRanked($)
+    // Unless a press in another window took the lease while this read was out: that window's queue or match is the one to draw.
+    if (!ledByOther((await leadRead($)).lead, owner, t)) await shareRanked($)
     // A late read leaves the store alone: it already said done, and since then another session may have dismissed the result or queued again.
     if (!late) await setRanked($, { phase: 'done', matchId: id })
     // Decided: the loop's next tick reads the lanes (for Queue again) if the Match tab is on screen, else stops.

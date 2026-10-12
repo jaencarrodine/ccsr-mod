@@ -93,14 +93,23 @@ export function shareBody(s: Pick<Share, 'key' | 'queue' | 'lanes' | 'lanesBucke
   return JSON.stringify({ key: s.key, queue: s.queue ?? null, lanes: s.lanes ?? null, lanesBucket: s.lanesBucket ?? null, ranked })
 }
 
-/** The account and board reads one session made, for the others: only the fields a read answered are there. */
-export type SeenCopy = { key: string; at: number; by: string } & Partial<Record<SeenField, unknown>>
+/**
+ * The account and board reads one session made, for the others: only the fields a read answered
+ * are there. `at` moves on every write. `meAt` is the account read's own stamp: when the account
+ * fields (ACCOUNT_FIELDS) were read from the server. Every write merges its part over what the
+ * store holds, so a board read carries the account another read left, under a newer `at`; only
+ * `meAt` says how old that account is.
+ */
+export type SeenCopy = { key: string; at: number; by: string; meAt?: number } & Partial<Record<SeenField, unknown>>
 export const SEEN_FIELDS = ['me', 'account', 'meBuckets', 'ladder', 'myRank', 'grindRank', 'grindOf', 'recent'] as const
 export type SeenField = (typeof SEEN_FIELDS)[number]
+/** What one GET /me answers: taken together, and only from an account read newer than the one a session holds. */
+export const ACCOUNT_FIELDS: readonly SeenField[] = ['me', 'account', 'meBuckets']
 
 export function seenCopyOf(raw: unknown): SeenCopy | null {
   if (!isObject(raw) || typeof raw.key !== 'string' || typeof raw.by !== 'string' || typeof raw.at !== 'number') return null
   const out: SeenCopy = { key: raw.key, at: raw.at, by: raw.by }
+  if (typeof raw.meAt === 'number' && Number.isFinite(raw.meAt)) out.meAt = raw.meAt
   for (const f of SEEN_FIELDS) if (raw[f] !== undefined) out[f] = raw[f]
   return out
 }
@@ -109,11 +118,14 @@ export function seenCopyOf(raw: unknown): SeenCopy | null {
  * The fields of `seen` written since this session last looked (`since`: the `at` of the copy it last
  * took or wrote), for this account; null when there is nothing to take. A session takes what is
  * there before it writes its own part, so one session's account read and another's board read
- * both reach a third.
+ * both reach a third. The account fields come only from an account read newer than the one this
+ * session holds (`meSince`): a copy with no `meAt` (a mod from before it) or an older one keeps
+ * its board fields and loses its account, which may be older than what is on screen here.
  */
-export function seenToTake(seen: SeenCopy | null, key: string, since: number): Partial<Record<SeenField, unknown>> | null {
+export function seenToTake(seen: SeenCopy | null, key: string, since: number, meSince = 0): Partial<Record<SeenField, unknown>> | null {
   if (!seen || seen.key !== key || seen.at <= since) return null
+  const fresh = (seen.meAt ?? 0) > meSince
   const out: Partial<Record<SeenField, unknown>> = {}
-  for (const f of SEEN_FIELDS) if (seen[f] !== undefined) out[f] = seen[f]
+  for (const f of SEEN_FIELDS) if (seen[f] !== undefined && (fresh || !ACCOUNT_FIELDS.includes(f))) out[f] = seen[f]
   return Object.keys(out).length ? out : null
 }
