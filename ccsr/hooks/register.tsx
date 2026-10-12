@@ -3,7 +3,7 @@ import type { Elements, EngineInterface, ModelCompleteResult, RenderElement, Ren
 
 import type { ApiAccount, ApiChatItem, ApiCoder, ApiInstall, ApiLane, ApiLobbyItem, ApiMatchSummary, ApiPlayer, ApiQueueState, ApiRankedRow, ApiRecentMatch, ApiRoom, ApiScoreReply, ApiSeason, BacktestRun, ConfigState, RankedMatch, RankedShared, ChatLine, FeedItem, LinkState, Match, ModSettings, OutboxItem, PastSession, Record3, ScanStatus, SavedAccount, ScoredCommit, ServerConfig, Keyring, Surfaces, Tab, WeekTotals } from '../types'
 import { DEFAULT_SERVER, backoffMs, errorOf, handleProblem, hungExpiryMs, loopWaitMs, mergeEvents, retryAfterMs, retryable, scoreBody, sha256hex, watchdogMs, withoutCoder } from './api'
-import { CONFIG0, REREAD_JITTER_MS, configPath, headerReread, jitterMs, parseConfig } from './config'
+import { CONFIG0, REREAD_JITTER_MS, configPath, headerReread, jitterMs, lineOf, parseConfig, signupsOf } from './config'
 import type { ModConfig, Surface } from './config'
 import { CLAUDE_FLOOR, UPDATE_ARGV, UPDATE_COMMAND, VERSION, standing } from './version'
 import {
@@ -20,6 +20,7 @@ import {
   clean,
   digestText,
   elo,
+  fitCardLine,
   hash,
   idKey,
   isNoise,
@@ -30,6 +31,8 @@ import {
   lengthsFromStore,
   minutesOf,
   myPace,
+  numberOneOf,
+  numberOneOn,
   oppAt,
   parseVerdict,
   periodStart,
@@ -43,8 +46,9 @@ import {
   toggledLengths,
   totals,
   warnMs,
+  xProfile,
 } from './pure'
-import type { RecentCommit } from './pure'
+import type { NumberOneOwn, RecentCommit } from './pure'
 // W3b: config's buckets, the checklist's install link, and the words the mod draws around them.
 import { installAppUrlOk } from './actions'
 import type { Provider } from './actions'
@@ -122,6 +126,8 @@ import type { Call, Client, CoderBlock, Effort } from './coder'
 // W7-3: the transcript fallback (dark, behind config's eval_backfill).
 import { BACKGROUND_MS, FILES_PER_SCAN, SESSIONS_MAX, TWINS_MAX, backfillOn, callsFromTranscript, isSubagentFile, mergeTranscripts, projectDirOf, readPlan, subfolderPrefixOf, transcriptsDirOf } from './transcripts'
 import type { TranscriptCall, TranscriptFile } from './transcripts'
+// The watch list: the repos a commit can land in, found from the Bash hook and Claude Code's own transcripts.
+import { LOOK_EVERY_MS, LOOK_MINUTES, LOOK_SCRIPT, LOOK_STRIKES, SEED_DAYS, SEED_FLIGHT_MS, SEED_RETRY_MS, SEED_SCRIPT, dirsFromLook, gitDirs, isCommitCommand, isTempDir, isTransientLookFailure } from './repos'
 // W10b: finishers: the drawings (finishers.ts, a verbatim copy of mod-lab's), how the mod plays them (finisherplay.ts), and their words.
 import { accentOf, buildFinisher, finisherWords, freeze, withCounter } from './finishers'
 import type { FinisherDrawing, FinisherInput } from './finishers'
@@ -256,6 +262,8 @@ const K = {
   orphans: 'orphans',
   // W7-2: Model stats as GET /me last said it, `{ key: '<server url>|<handle>', on }`, so a session offline plays by it.
   modelStats: 'modelStats',
+  // The watch list's look at Claude Code's transcripts: `{ seeded, tried, failed, at }`, when this install's seed ran, when an attempt last began, when one last failed, and when any session here last looked, so one session looks at a time.
+  repoLook: 'repoLook',
 } as const
 
 type Verdict = Pick<ScoredCommit, 'points' | 'base' | 'craft' | 'category' | 'reason' | 'judge' | 'asked' | 'rubric' | 'scoredAt'>
@@ -452,8 +460,9 @@ async function addRepo($: $, root: string) {
   if (!repos.includes(root)) {
     repos.push(root)
     await save($, K.repos, repos)
-    // A new repo's older commits since tracking started still need scoring once.
-    await save($, K.rebuild, true)
+    // No rebuild: a repo no session has listed gets a full listing on the next scan anyway, scored from the tracking start or the
+    // roll-up cutoff, whichever is later. A rebuild lists every repo from the tracking start, below the cutoff, where rows have
+    // already rolled into week totals: it would judge them again and count their weeks twice. Only migrate, which clears the weeks, rebuilds.
   }
   return repos
 }
@@ -461,6 +470,162 @@ async function addRepo($: $, root: string) {
 async function dropRepo($: $, root: string) {
   const repos = (await getRepos($)).filter(r => r !== root)
   await save($, K.repos, repos)
+}
+
+// ------------------------------------------------------------------ the watch list (repos.ts)
+// The Grind scores commits in the repos on its list. A session adds the repo it runs in (boot,
+// turn.complete); these add the rest, so a commit counts wherever it lands from install on:
+// the repo a Bash commit ran in (followCommit), the repos of the projects of the last
+// SEED_DAYS days (the seed, once per install), and the folders and commits in the transcripts
+// written in the last minutes (the look, every two minutes, by one session per machine): a
+// session open since before the install has no hooks, and its transcript still says where it
+// commits. Tracking starts at install all the same: a repo that joins is scored from then on.
+
+/** A folder's repo as this session last asked git: a miss is asked again after ten minutes (a `git init` since). */
+const dirRoots = new Map<string, { root: string | null; at: number }>()
+
+async function homeDir($: $) {
+  return (await $.env.get('HOME').catch(() => undefined)) || (await $.env.get('USERPROFILE').catch(() => undefined)) || null
+}
+
+/**
+ * Folders join the Grind's repos as the repos they are in (a worktree as its main tree).
+ * Passed over: a temp folder, a folder that is gone or in no repo, a repo already listed.
+ * Answers how many joined. Like addRepo it sets no rebuild: the next scan lists a new repo in
+ * full, from the tracking start or the roll-up cutoff, whichever is later.
+ */
+async function watchDirs($: $, dirs: readonly string[]) {
+  if (dirs.length === 0) return 0
+  const tmp = await $.env.get('TMPDIR').catch(() => undefined)
+  const t = await $.clock.now()
+  const roots = new Set<string>()
+  for (const dir of dirs) {
+    if (isTempDir(dir, tmp)) continue
+    let hit = dirRoots.get(dir)
+    if (!hit || (hit.root === null && t - hit.at > 600_000)) {
+      hit = { root: await rootFor($, dir), at: t }
+      if (dirRoots.size >= 500) dirRoots.clear()
+      dirRoots.set(dir, hit)
+    }
+    if (hit.root && !isTempDir(hit.root, tmp)) roots.add(hit.root)
+  }
+  if (roots.size === 0) return 0
+  const repos = await getRepos($)
+  const fresh = [...roots].filter(r => !repos.includes(r))
+  if (fresh.length === 0) return 0
+  await save($, K.repos, [...repos, ...fresh])
+  return fresh.length
+}
+
+/**
+ * A Bash commit's repos join the list: the session's own, and any the command reached with `cd`
+ * or `git -C`. `cwd` is where the shell was before the command ran: Claude Code keeps a `cd`
+ * inside the allowed folders, so read afterwards, a relative `cd` would be followed twice.
+ */
+async function followCommit($: $, command: string, cwd: string | null) {
+  return watchDirs($, gitDirs(command, cwd, await homeDir($)))
+}
+
+/** Where Claude Code keeps this config dir's transcripts, or null with no home directory and no absolute CLAUDE_CONFIG_DIR. */
+async function projectsDir($: $) {
+  const home = (await homeDir($)) ?? ''
+  const configDir = await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)
+  return home || /^(\/|[A-Za-z]:[\\/])/.test((configDir ?? '').trim()) ? transcriptsDirOf({ CLAUDE_CONFIG_DIR: configDir }, home) : null
+}
+
+type RepoLook = { seeded?: number; tried?: number; failed?: number; at?: number }
+
+/** Looks and seeds that failed in a row in this session. At LOOK_STRIKES it stops trying until the next session. */
+let lookFails = 0
+
+/** Merges into the store's `repoLook` as it is now (another session may have written since); null takes a key out. */
+async function patchLook($: $, patch: { [K in keyof RepoLook]?: number | null }) {
+  const next: Record<string, number> = { ...(await storeGet<RepoLook>($, K.repoLook, {})) }
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null || v === undefined) delete next[k]
+    else next[k] = v
+  }
+  await save($, K.repoLook, next)
+}
+
+/** One of the two scripts over the transcripts folder; throws when `sh` can't start, runs out of time or exits badly. */
+async function runLookScript($: $, script: string, base: string, arg: number, timeoutMs: number) {
+  const r = await $.process.run(['sh', '-c', script, 'sh', base, String(arg)], { timeoutMs })
+  if (r.exitCode !== 0) throw new Error(`sh exited ${r.exitCode}`)
+  return r.stdout
+}
+
+/**
+ * A look or a seed failed: one line in the debug log (never the transcript: this can happen on
+ * every machine with no `sh`) and a strike. Answers whether it is worth another try here; when
+ * it isn't, this session stops looking.
+ */
+function lookFailed($: $, what: string, err: unknown) {
+  const message = clean(String((err as Error | undefined)?.message ?? err))
+  const again = isTransientLookFailure(message)
+  lookFails = again ? lookFails + 1 : LOOK_STRIKES
+  $.ui.log(`CCSR repos: ${what} failed${lookFails >= LOOK_STRIKES ? ', no more tries this session' : ''}: ${message}`, { to: 'debug' })
+  return again
+}
+
+/**
+ * The seed (once per install) and the look: the folders Claude Code's transcripts name join
+ * the list. Each has its own try, and the seed's repos join and `seeded` is saved before the
+ * look runs, so a look that fails never throws a seed away.
+ * - The look: one session per machine, at most every LOOK_EVERY_MS; the rest pass. A session
+ *   whose look fails hands the slot back, so one that can't look never holds it.
+ * - The seed: `tried` holds it only while an attempt is in flight (SEED_FLIGHT_MS), so a
+ *   session that ends mid-seed costs minutes; a seed that ran and failed waits SEED_RETRY_MS.
+ * - A session that can't start `sh` at all (Windows, a host with no processes) hands both
+ *   back and stops; so does one after LOOK_STRIKES failures in a row.
+ * Answers how many repos joined. Never throws.
+ */
+async function lookForRepos($: $): Promise<number> {
+  if (lookFails >= LOOK_STRIKES) return 0
+  let joined = 0
+  try {
+    const t = await $.clock.now()
+    const held = await storeGet<RepoLook>($, K.repoLook, {})
+    const seedDue = !held.seeded && t - (held.tried ?? 0) >= SEED_FLIGHT_MS && t - (held.failed ?? 0) >= SEED_RETRY_MS
+    const lookDue = t - (held.at ?? 0) >= LOOK_EVERY_MS
+    if (!seedDue && !lookDue) return 0
+    const base = await projectsDir($)
+    if (!base) return 0
+    const home = await homeDir($)
+    if (seedDue) {
+      await patchLook($, { tried: t })
+      try {
+        const out = await runLookScript($, SEED_SCRIPT, base, SEED_DAYS, 120_000)
+        joined += await watchDirs($, dirsFromLook(out, home))
+        await patchLook($, { seeded: t })
+        lookFails = 0
+      } catch (err) {
+        // It ran and failed: the machine waits SEED_RETRY_MS. It couldn't start: the attempt is handed back for a session that can.
+        await patchLook($, lookFailed($, 'the seed', err) ? { failed: t } : { tried: held.tried ?? null })
+      }
+    }
+    if (lookDue && lookFails < LOOK_STRIKES) {
+      await patchLook($, { at: t })
+      try {
+        const out = await runLookScript($, LOOK_SCRIPT, base, LOOK_MINUTES, 60_000)
+        joined += await watchDirs($, dirsFromLook(out, home))
+        lookFails = 0
+      } catch (err) {
+        lookFailed($, 'the look', err)
+        await patchLook($, { at: held.at ?? null })
+      }
+    }
+  } catch (err) {
+    $.ui.log(`CCSR repos: ${clean(String((err as Error | undefined)?.message ?? err))}`, { to: 'debug' })
+  }
+  return joined
+}
+
+/** A look, and a scan for the repos it found. Never awaited: a slow disk holds up no scan and no session start. */
+function lookAround($: $) {
+  void lookForRepos($).then(joined => {
+    if (joined > 0) scheduleScan($)
+  })
 }
 
 /** A soft lock so two sessions don't pay to judge the same commit; stale after two minutes. */
@@ -1054,10 +1219,20 @@ async function scanGrind($: $, force: boolean, notify?: (c: ScoredCommit, coder:
             if (notify) await notify(scored, coder)
           }
         }
-        // Commits no longer reachable from any ref (a local squash, a reset) leave the ledger.
-        if (full && reach.ok && !incomplete) {
+        // Commits no longer reachable from any ref (a local squash, a reset) leave the ledger. Rows are kept by the folder's last
+        // name, so another watched repo of the same name (a second clone, a fork) may hold them: a row leaves only when none of
+        // them reaches it, and stays while one of them can't be asked.
+        const elsewhere: Set<string>[] = []
+        let asked = full && reach.ok && !incomplete
+        if (asked)
+          for (const other of (await getRepos($)).filter(r => r !== root && repoName(r) === name)) {
+            const there = await reachable($, other, evidenceFrom).catch(() => null)
+            if (!there?.ok) asked = false
+            else elsewhere.push(there.set)
+          }
+        if (asked) {
           await ledgerApply($, rows => {
-            const next = rows.filter(x => !(x.repoName === name && x.authoredAt >= evidenceFrom && !reach.set.has(x.sha) && !protectedShas.has(x.sha)))
+            const next = rows.filter(x => !(x.repoName === name && x.authoredAt >= evidenceFrom && !reach.set.has(x.sha) && !elsewhere.some(s => s.has(x.sha)) && !protectedShas.has(x.sha)))
             result.removed += rows.length - next.length
             return next.length === rows.length ? rows : next
           })
@@ -1251,17 +1426,6 @@ async function backtestSession($: $, s: PastSession, signal?: AbortSignal): Prom
   }
   await setRun($, run)
   return run
-}
-
-/** Every repo a past session in the window touched, so the Grind can backfill. */
-async function reposFromSessions($: $, list: PastSession[], from: number) {
-  const roots = new Set<string>()
-  for (const s of list) {
-    if (s.endAt < from) continue
-    const root = await rootFor($, s.cwd)
-    if (root) roots.add(root)
-  }
-  return [...roots]
 }
 
 // ================================================================== MATCH
@@ -1796,6 +1960,12 @@ async function api($: $, method: string, path: string, body?: unknown, as: { url
   } catch {
     json = null
   }
+  // Staff can rename an account (scripts/handle.sh give), and the handle is the server's to say: every
+  // read of this install's own account carries it, whoever asked (boot, the standings, the sign-in rows).
+  if (method === 'GET' && path === '/me' && res.status === 200 && cfg.token && !as.url && as.token === undefined) {
+    const handle = (json as { player?: { handle?: unknown } } | null)?.player?.handle
+    if (typeof handle === 'string' && handle !== cfg.handle && !handleProblem(handle)) await adoptHandle($, cfg.token, handle)
+  }
   // A proxy's error page means the server itself isn't answering. The server's own 503 (no_season,
   // try_again) comes with its error JSON: it was reached, so the mod stays online and its loop backs off.
   const reached = res.status < 502 || res.status > 504 || errorOf(json) !== null
@@ -2177,6 +2347,37 @@ async function linkFromKeyring($: $) {
   if (r.status !== 201) return
   await signedIn($, r.json as SignInReply, entry.recovery_key ?? null)
   await update($, link, l => ({ ...l, note: ACCOUNT.autoLinked((r.json as SignInReply).player.handle) }))
+}
+
+/**
+ * The server answered GET /me with another handle than this install holds: staff renamed the
+ * account. Take it everywhere the old one is kept (the sign-in, Settings, the keyring), or the
+ * profile read asks for a handle nobody has and a match can't tell this side from the other.
+ * api() calls this on every read of the account; syncHandle makes one before anything that tells
+ * a match's sides apart. `token` is the one that /me was asked with: a sign-in that landed
+ * meanwhile keeps its own handle.
+ */
+async function adoptHandle($: $, token: string, handle: string) {
+  const cfg = await serverCfg($)
+  if (cfg.token !== token || cfg.handle === handle) return
+  await save($, K.server, { ...cfg, handle })
+  await saveSettings($, { handle })
+  const entry = (await readKeyring($)).servers[cfg.url]
+  if (entry && entry.handle === cfg.handle) await writeKeyring($, cfg.url, { ...entry, handle })
+  // The boards held mark this player's row by the old handle: read them again.
+  await update($, link, l => ({ ...l, boards: null }))
+  // The config is held per server and handle.
+  void refreshConfig($, 'signin').catch(() => null)
+}
+
+/**
+ * Reads this install's account, so a rename is taken (api() adopts it) before the mod queues,
+ * accepts or takes a challenge: from there on it tells its side of the match by handle. The
+ * server never renames a player who is queued or in a match, so one read here is enough.
+ */
+async function syncHandle($: $) {
+  if (!(await serverCfg($)).token) return
+  await api($, 'GET', '/me', undefined, { keepNote: true })
 }
 
 type SignInReply = { token: string; player: ApiPlayer; salt: string | null; has_recovery_key: boolean; recovery_key?: string }
@@ -2776,7 +2977,7 @@ async function signInCardView($: $, e: RenderInput<'Pane'>, els: El, a: Actions,
       </Box>,
       ui.copied && <Text dimColor>{IDENTITY.copied}</Text>,
       <Text dimColor wrap="wrap">
-        {IDENTITY.privacy(name)}
+        {(signupsOf((await configOf($)).raw).email ? IDENTITY.privacyEmail : IDENTITY.privacy)(name)}
       </Text>,
     )
   } else if (s.phase === 'unlinked') {
@@ -4178,7 +4379,9 @@ export async function queueWith($: $, o: { lengthsMin: readonly number[] | null;
   // Ranked is paused for this player (queue.practice_only): the server would answer 403 ranked_paused.
   const cf = await configOf($)
   if (cf.practiceOnly) {
-    await update($, link, l => ({ ...l, note: MOD.rankedPaused }))
+    // W11: an account still in the line reads as paused too; the note says which it is.
+    const line = lineOf(cf.raw)
+    await update($, link, l => ({ ...l, note: line.waiting ? MOD.inLine(line.ahead) : MOD.rankedPaused }))
     return false
   }
   // The ready check or the match is on screen: the server would answer 409 in_match.
@@ -4215,6 +4418,7 @@ export async function queueWith($: $, o: { lengthsMin: readonly number[] | null;
     await update($, link, l => ({ ...l, note }))
     return false
   }
+  await syncHandle($)
   const r = await api($, 'POST', '/queue', target ? { lengths_min: lengths, bucket: target } : { lengths_min: lengths })
   if (await refusedForUpdate($, r)) return false
   if (r.status !== 200) {
@@ -4373,6 +4577,7 @@ async function refreshBucketBoards($: $, id: string, what: { profile?: boolean; 
 async function acceptOffer($: $) {
   const sh = await rankedShared($)
   if (!sh.matchId) return
+  await syncHandle($)
   const r = await api($, 'POST', `/matches/${sh.matchId}/accept`)
   // Below the floor: decline now rather than hold the opponent for the full minute.
   if (await refusedForUpdate($, r)) return declineOffer($)
@@ -5073,6 +5278,7 @@ async function takeChallenge($: $, id: string, via: 'card' | 'band' | 'code') {
   if (!CODE.test(id) || !(await challengesLive($))) return
   const phase = (await rankedShared($)).phase
   if (phase === 'offered' || phase === 'live') return
+  await syncHandle($)
   const r = await paced($, 'POST', `/challenges/${id}/accept`, { via })
   const offer = r.status === 200 ? (r.json as { offer?: ApiOffer } | null)?.offer : undefined
   if (!offer || typeof offer.match_id !== 'string') {
@@ -5380,13 +5586,42 @@ function recordMoment(e: NoticeEvent, at: number, start = at) {
   return true
 }
 
+/** The wait before each try of a write a draw set off (writeAfterDraw): the first at once, each later one after the refusal before it. */
+const DRAW_WAITS_MS = [0, 50, 150, 400, 1000, 2000]
+
+/** The host's refusal of a state write made while a draw is still being dispatched. */
+const drawRefused = (err: unknown) => /while ui\.render is being dispatched/.test(String((err as Error | undefined)?.message))
+
+/**
+ * A state write a draw set off, made once that draw is over. To the host a timer a draw starts is
+ * still that draw (it carries the draw's scope), so its write is refused until the draw has
+ * answered, however short the timer: a zero-delay one fires mid-draw in a live session. So the
+ * write is tried from a timer, and again after each of DRAW_WAITS_MS while it is refused for that.
+ * Rejects with the last refusal, or with any other error at once.
+ */
+function writeAfterDraw($: $, write: () => Promise<unknown>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const go = (i: number) => {
+      $.clock.after(DRAW_WAITS_MS[i] ?? 0, () => {
+        write().then(
+          () => resolve(),
+          err => (drawRefused(err) && i + 1 < DRAW_WAITS_MS.length ? go(i + 1) : reject(err)),
+        )
+      })
+    }
+    go(0)
+  })
+}
+
 /**
  * After a moment: what draws notices draws again (noticeRev), then the toast and flash check.
- * Never from a render, where the write is refused (drawing is pure): renderPane runs it from a
- * timer. A refused or failed write is logged and the check runs anyway.
+ * From a render (`inDraw`, renderPane's pane_open) the write waits for the draw to be over
+ * (writeAfterDraw), since a write made during one is refused (drawing is pure). A refused or
+ * failed write is logged and the check runs anyway.
  */
-async function noticesMoved($: $) {
-  await update($, noticeRev, n => n + 1).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+async function noticesMoved($: $, inDraw = false) {
+  const bump = () => update($, noticeRev, n => n + 1)
+  await (inDraw ? writeAfterDraw($, bump) : bump()).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
   await noticeAlerts($)
 }
 
@@ -5916,7 +6151,6 @@ export type Actions = {
   setTab: (t: Tab) => void
   setPeriod: (p: 'week' | 'month' | 'all') => void
   scanNow: () => void
-  backfillWeek: () => void
   loadSessions: (days: number) => void
   backtest: (id: string) => void
   backtestAll: () => void
@@ -6562,10 +6796,10 @@ export async function renderPane($: $, e: RenderInput<'Pane'>, a: Actions): Prom
   // Where this install last drew, for GET /config?surface= (the server keeps it for targeting).
   paneSurface = e.surface
   // W4b: the pane's first draw after a minute without one is the notices' pane_open. The moment is kept now, so this draw's slots
-  // see it; the redraw and the toast and flash check run from a timer, another event, since a state write made while a render is
-  // being dispatched is refused (drawing is pure).
+  // see it; the redraw and the toast and flash check run once this draw is over (noticesMoved's inDraw), since a state write made
+  // while a render is being dispatched is refused (drawing is pure), a zero-delay timer's included.
   if (paneSeenAt - paneDrawnAt > PANE_GAP_MS && recordMoment({ on: 'pane_open' }, paneSeenAt))
-    $.clock.after(0, () => void noticesMoved($).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`)))
+    void noticesMoved($, true).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
   paneDrawnAt = paneSeenAt
 
   let body: RenderElement
@@ -6718,7 +6952,6 @@ async function grindTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: nu
       )}
       <Box gap={1} flexWrap="wrap" alignItems="center">
         <Button key="scan" label={sc.busy ? 'Scanning...' : 'Scan now'} variant="primary" onPress={() => a.scanNow()} />
-        <Button key="backfill" label="Score this week" onPress={() => a.backfillWeek()} />
         <Button key="past-sessions" label="Score past sessions" onPress={() => a.setTab('backtest')} />
         <Text dimColor wrap="truncate-end">
           {s.tracking ? `Tracking since ${when(since)}` : 'Tracking is off'} · {sc.note || 'not scanned yet'}
@@ -6739,7 +6972,7 @@ async function grindTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: nu
       )}
       {inPeriod.length === 0 ? (
         <Text dimColor>
-          Nothing scored {label} yet. Commit something in a repo you use Claude Code in, or press "Score this week" to score your commits since Monday.
+          Nothing scored {label} yet. Commits count from install, in any repo you use Claude Code in.
         </Text>
       ) : (
         <Box flexDirection="column">
@@ -6850,11 +7083,16 @@ async function recoveryBanner($: $, e: RenderInput<'Pane'>, els: El, a: Actions)
 /** The ways in: pick a new handle, link with a code from another install, or a recovery key. */
 async function joinBlock($: $, e: RenderInput<'Pane'>, els: El, a: Actions, prefix: string): Promise<RenderElement | null> {
   if (e.surface === 'mobile') return null
-  const { Box, Button, Input } = els
+  const { Box, Button, Input, Text } = els
   const mode = await read($, joinMode)
+  // W11: while the server takes no handle without a GitHub sign-in (and the button is on the card,
+  // signInEntry), the handle box gives way to the line that says so: the handle is picked after signing in.
+  const cf = await configOf($)
+  const viaGitHub = signupsOf(cf.raw).githubRequired && providersOn(cf).length > 0
   return (
     <Box flexDirection="column" gap={1}>
-      {mode === 'new' && <Input key={`${prefix}join`} label="Handle" placeholder="2 to 20 of a-z, 0-9 and _" submitLabel="Join" onSubmit={v => a.signup(v)} />}
+      {mode === 'new' && viaGitHub && <Text wrap="wrap">{MOD.githubFirst}</Text>}
+      {mode === 'new' && !viaGitHub && <Input key={`${prefix}join`} label="Handle" placeholder="2 to 20 of a-z, 0-9 and _" submitLabel="Join" onSubmit={v => a.signup(v)} />}
       {mode === 'link' && <Input key={`${prefix}link`} label={ACCOUNT.codeLabel} placeholder={ACCOUNT.codePlaceholder} submitLabel={ACCOUNT.codeSubmit} onSubmit={v => a.joinWithCode(v)} />}
       {mode === 'recover' && <Input key={`${prefix}recover`} label={ACCOUNT.keyLabel} placeholder={ACCOUNT.keyPlaceholder} submitLabel={ACCOUNT.keySubmit} onSubmit={v => a.recoverWith(v)} />}
       <Box gap={1}>
@@ -6922,6 +7160,11 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
     return (
       <Box flexDirection="column" gap={1}>
         {rich ? <Svg source={setupHero({ placementMatches: 3 })} alt={`${LINES.handle} Everyone starts in the mud.`} /> : <Text bold>{LINES.handle}</Text>}
+        {signupsOf((await configOf($)).raw).line && (
+          <Text color={ORANGE} wrap="wrap">
+            {MOD.lineOpen}
+          </Text>
+        )}
         {await joinBlock($, e, els, a, 'match-')}
         {await signInEntry($, e, els, a, 'first_run')}
         {l.note && (
@@ -7021,13 +7264,19 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
             <Button key="ranked-update" label="Update" variant="primary" onPress={x => a.updateMod(x.surface)} />
           ) : cf.practiceOnly ? (
             // Ranked is paused for this player (queue.practice_only): the line takes Queue's place.
+            // W11: for an account still waiting its turn, where it stands, in the same place.
             <Text color={ORANGE} wrap="wrap">
-              {MOD.rankedPaused}
+              {lineOf(cf.raw).waiting ? MOD.inLine(lineOf(cf.raw).ahead) : MOD.rankedPaused}
             </Text>
           ) : blocked ? null : (
             <Button key="ranked-queue" label="Queue" variant="primary" onPress={() => a.queue()} />
           )}
         </Box>
+        {!gated && cf.practiceOnly && lineOf(cf.raw).waiting && (
+          <Text dimColor wrap="wrap">
+            {MOD.inLineMore}
+          </Text>
+        )}
         {gated && l.release && (
           <Text color={ORANGE} wrap="wrap">
             {MOD.updateNeeded(l.release.min, VERSION)}
@@ -7659,12 +7908,14 @@ async function rankedTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Pro
   const list = bucketsOf(conf)
   // W5b: while config has GitHub sign-in on, a handle with GitHub linked carries the ladder badge, on every bucket's board.
   const badges = providersOn(conf).includes('github')
+  // While config's number_one.custom is on, the #1 card draws what its player set (their row's `number_one`), on every bucket's board.
+  const custom = numberOneOn(conf.raw)
   const pick = bucketRowShown(list) ? pickBucket(list, (await read($, boardPick)).ranked) : null
   if (pick && pick.id !== OPEN) {
     const v = viewIn(l, pick.id)
-    return boardRow(els, list, pick, a, v.me && v.ladder ? serverRanked(els, rich, v, badges) : <Text dimColor>{BUCKET.loading}</Text>)
+    return boardRow(els, list, pick, a, v.me && v.ladder ? serverRanked(els, rich, v, badges, custom) : <Text dimColor>{BUCKET.loading}</Text>)
   }
-  if (l.me && l.ladder) return boardRow(els, list, pick, a, serverRanked(els, rich, l, badges))
+  if (l.me && l.ladder) return boardRow(els, list, pick, a, serverRanked(els, rich, l, badges, custom))
   const r = await read($, rating)
   const rec = await read($, record)
   const s = await read($, settings)
@@ -7739,8 +7990,9 @@ function boardRow(els: El, list: readonly Bucket[], pick: Bucket | null, a: Acti
 /**
  * The Ranked tab from the server: your card (Mud while placing), the frieze, the top 10 and your
  * row. `githubBadges` (W5b, config's sign-in on): a handle with GitHub linked carries the badge.
+ * `custom` (config's number_one.custom): the #1 card draws the line and X tag on the top row.
  */
-function serverRanked(els: El, rich: boolean, l: LinkState, githubBadges = false) {
+function serverRanked(els: El, rich: boolean, l: LinkState, githubBadges = false, custom = false) {
   const { Box, Text, Svg } = els
   const me = l.me as ApiPlayer
   const placing = me.placement ?? undefined
@@ -7750,7 +8002,7 @@ function serverRanked(els: El, rich: boolean, l: LinkState, githubBadges = false
   const top = l.ladder?.[0]
   return (
     <Box flexDirection="column" gap={1}>
-      {top && numberOneCard(els, rich, { handle: top.player.handle, rating: top.player.rating, wins: top.w, losses: top.l })}
+      {top && numberOneCard(els, rich, { handle: top.player.handle, rating: top.player.rating, wins: top.w, losses: top.l }, custom ? numberOneOf(top) : null)}
       {rich && <Svg source={ratingCard({ rating: me.rating, rank: l.myRank ?? undefined, wins: me.record.w, losses: me.record.l, placing })} alt={placing ? `Mud, placing ${placing.played} of ${placing.of}.` : `${me.tier} ${me.rating}${l.myRank ? `, #${l.myRank}` : ''}, ${me.record.w}-${me.record.l}.`} />}
       {rich && <Svg source={tierFrieze({ handle: me.handle, rating: me.rating, placing })} alt={placing ? 'Tiers. You are placing in Mud.' : `Tiers. You are ${me.tier} at ${me.rating}.`} />}
       {rich && ladderRows.length > 0 ? (
@@ -7780,11 +8032,31 @@ function serverRanked(els: El, rich: boolean, l: LinkState, githubBadges = false
 
 let roastIndex = 2
 
-/** The #1 card (copy.md): the #1 player's coin and stat line, and one roast from the pool, a new one each visit to Ranked. */
-function numberOneCard(els: El, rich: boolean, top: { handle: string; rating: number; wins: number; losses: number }) {
-  const { Box, Text, Svg } = els
-  const roast = (ROASTS[roastIndex % ROASTS.length] ?? '').replace(/\{handle\}/g, top.handle)
-  if (rich) return <Svg source={numberOne({ ...top, roast })} alt={`${LINES.numberOne}: ${top.handle}, ${top.rating}. ${roast}`} />
+/** Where the #1 card's X tag may go: a profile on x.com, nowhere else. */
+const X_HOSTS: readonly string[] = ['x.com']
+
+/**
+ * The #1 card (copy.md): the #1 player's coin and stat line, and one line under them. That line
+ * is one roast from the pool, a new one each visit to Ranked, unless `own` (config's
+ * number_one.custom, and what the server sends on their row) carries the line they set. Their X
+ * tag, when it carries one, is a link under the card.
+ */
+function numberOneCard(els: El, rich: boolean, top: { handle: string; rating: number; wins: number; losses: number }, own: NumberOneOwn | null = null) {
+  const { Box, Text, Svg, Link } = els
+  const roast = own?.line ?? (ROASTS[roastIndex % ROASTS.length] ?? '').replace(/\{handle\}/g, top.handle)
+  const href = own?.x ? xProfile(own.x) : null
+  const tag = own?.x && safeLink(href, X_HOSTS) ? <Link key="number-one-x" href={href} label={LINES.onX(own.x)} /> : null
+  if (rich) {
+    // The drawing holds three short lines; the alt keeps the line whole.
+    const card = <Svg source={numberOne({ ...top, roast: own?.line ? fitCardLine(own.line) : roast })} alt={`${LINES.numberOne}: ${top.handle}, ${top.rating}. ${roast}`} />
+    if (!tag) return card
+    return (
+      <Box flexDirection="column">
+        {card}
+        {tag}
+      </Box>
+    )
+  }
   return (
     <Box flexDirection="column">
       <Text dimColor>{LINES.numberOne.toUpperCase()}</Text>
@@ -7792,6 +8064,7 @@ function numberOneCard(els: El, rich: boolean, top: { handle: string; rating: nu
         {top.handle} · {tierOf(top.rating)} · {top.rating} Elo · {top.wins}-{top.losses}
       </Text>
       <Text>{roast}</Text>
+      {tag}
     </Box>
   )
 }
@@ -9520,7 +9793,6 @@ const HELP = `CCSR commands:
 /ccsr                    open the CCSR pane
 /ccsr grind              this week, month and all time
 /ccsr scan               look for new commits now
-/ccsr backfill           score this week's commits since Monday
 /ccsr backtest [days]    score your past sessions (default 7 days)
 /ccsr match 1h|3h|sprint practice match against a bot
 /ccsr forfeit            give up the live match
@@ -9665,7 +9937,7 @@ async function onScore($: $, c: ScoredCommit, coder: CoderBlock | null = null) {
   if (c.authoredAt >= loadedAt - LIVE_WINDOW) {
     const craft = c.craft === 'clean' ? ' · clean +1' : c.craft === 'sloppy' ? ' · sloppy -1' : ''
     await ambient($, `+${c.points} points · ${c.category}${craft} · ${clean(c.title).slice(0, 60)}${counted ? ' · counts in your match' : ''}`)
-    // W4b: the notices' score trigger, and first_score for the first one on this machine (never for a backfill or a rescore).
+    // W4b: the notices' score trigger, and first_score for the first one on this machine (never for a rescore).
     void noticeScored($, c).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
   }
   await refreshStatus($)
@@ -9751,6 +10023,8 @@ async function slowSync($: $) {
 async function openPane($: $, t?: Tab) {
   if (t) await update($, tab, () => t)
   const r = await $.ui.open({ id: PANE, title: 'CCSR' })
+  // A rename since this session's last account read shows from here on (never awaited by the reply).
+  void syncHandle($).catch(err => $.ui.log(`CCSR account: ${(err as Error).message}`))
   // Opened on the Match tab: the lanes now, without holding up a command's reply.
   if ((await read($, tab)) === 'match') void showLanes($).catch(err => $.ui.log(`CCSR lanes: ${(err as Error).message}`))
   return r
@@ -9856,31 +10130,6 @@ async function setupSeen($: $) {
   await saveSettings($, { setupSeen: true })
 }
 
-async function backfill($: $) {
-  const t = await $.clock.now()
-  const monday = periodStart('week', t)
-  const since = Math.min(await storeGet($, K.since, t), monday)
-  await save($, K.since, since)
-  await update($, trackingSince, () => since)
-  const list = await discoverSessions($, 8)
-  for (const root of await reposFromSessions($, list, monday)) await addRepo($, root)
-  await settleScans()
-  rescan = null
-  const before = loadedAt
-  loadedAt = Number.MAX_SAFE_INTEGER // no toast per commit during a backfill
-  try {
-    const r = await runScan($, true)
-    const pts = r.added.reduce((n, c) => n + c.points, 0)
-    $.ui.toast(
-      `Scored this week: ${r.added.length} new commits, ${pts} points${r.errors.length ? ` · ${r.errors.length} problem${r.errors.length === 1 ? '' : 's'}, see the Grind tab` : ''}`,
-      { timeoutMs: 6000 },
-    )
-    return r
-  } finally {
-    loadedAt = before
-  }
-}
-
 async function backtestAll($: $) {
   const list = await read($, sessions)
   const limit = await read($, btLimit)
@@ -9949,7 +10198,6 @@ function actions($: $): Actions {
     setTab: t => go(selectTab($, t)),
     setPeriod: p => go(update($, period, () => p)),
     scanNow: () => go(runScan($, true)),
-    backfillWeek: () => go(backfill($)),
     loadSessions: days => go(discoverSessions($, days)),
     backtest: id => go(backtestOne($, id)),
     backtestAll: () => go(backtestAll($)),
@@ -10114,10 +10362,13 @@ async function lab($: $, what: string, surface: string) {
 async function boot($: $, cwd: string) {
   loadedAt = await $.clock.now()
   owner = await $.session.id()
+  // The watch list's memory is this session's: what a folder's repo was, and how often a look failed.
+  dirRoots.clear()
+  lookFails = 0
   await $.command.register({
     name: 'ccsr',
     description: 'Claude Code Ship Race: open the pane, Grind, backtests, practice matches',
-    argumentHint: '[grind|scan|backfill|backtest|match 1h|forfeit|quiet|help]',
+    argumentHint: '[grind|scan|backtest|match 1h|forfeit|quiet|help]',
   })
   try {
     const migrated = await loadAll($)
@@ -10163,8 +10414,14 @@ async function boot($: $, cwd: string) {
   const sh = await rankedShared($)
   if (sh.phase === 'queued' || sh.phase === 'offered' || sh.phase === 'live') startRankedPoll($)
   $.clock.every(30_000, () => void slowSync($))
-  $.clock.every(120_000, () => void runScan($).catch(err => $.ui.log(`CCSR scan: ${(err as Error).message}`)))
+  // Every two minutes: the scan, and a look for repos the sessions here haven't opened (one session per machine takes it).
+  $.clock.every(120_000, () => {
+    void runScan($).catch(err => $.ui.log(`CCSR scan: ${(err as Error).message}`))
+    lookAround($)
+  })
   scheduleScan($, 2500)
+  // The seed on this install's first session, and a first look.
+  lookAround($)
   await refreshStatus($)
   // W3b: a bucket config lists that GET /me had no standing for (switched on since) reads GET /me again, and a bucket on screen
   // that config moved gets its lanes. Never awaited: a config read waits on each tick, and $.http.fetch has no timeout, so a
@@ -10250,10 +10507,6 @@ async function commandText($: $, args: string, signal?: AbortSignal): Promise<st
   if (sub === 'scan') {
     const r = await runScan($, true)
     return `Scanned: ${r.added.length} new commit${r.added.length === 1 ? '' : 's'}${r.errors.length ? `; problems: ${r.errors.slice(0, 3).join('; ')}` : ''}`
-  }
-  if (sub === 'backfill') {
-    const r = await backfill($)
-    return `Scored since Monday: ${r.added.length} new commits, ${r.added.reduce((n, c) => n + c.points, 0)} points.`
   }
   if (sub === 'backtest') {
     // Titles stay in the pane: this text reaches Claude, and session titles are other projects' prompts.
@@ -10591,12 +10844,21 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const isCommit = /\bgit\b[^\n]*\bcommit\b/.test(String(e.command))
+    const isCommit = isCommitCommand(String(e.command))
+    // Where the shell is before the command runs, for followCommit below.
+    const cwdBefore = isCommit ? await $.session.cwd().catch(() => null) : null
     if (isCommit) await beforeCommit($, e.tool_use_id)
     const ran = await next(e)
     if (isCommit) {
       if (ran.result) await afterCommit($, e.tool_use_id, String((ran.result as { stdout?: string }).stdout ?? ''))
       scheduleScan($, 800)
+      // The commit may have landed in another repo (`cd ../api && git commit`, `git -C`): it joins the list and is scanned too.
+      // Never awaited: the Bash call's answer doesn't wait on git.
+      void followCommit($, String(e.command), cwdBefore)
+        .then(joined => {
+          if (joined > 0) scheduleScan($, 800)
+        })
+        .catch(err => $.ui.log(`CCSR repos: ${clean(String((err as Error | undefined)?.message ?? err))}`, { to: 'debug' }))
     }
     return ran
   })

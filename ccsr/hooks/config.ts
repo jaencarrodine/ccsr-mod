@@ -105,6 +105,28 @@ export function parseConfig(body: unknown): ModConfig {
 }
 
 /**
+ * Config's `line` (W11): whether this account still waits in the line, and about how many are
+ * ahead of it. Read off `raw`, like every later section: a missing or odd one is not waiting, so
+ * a server from before the line (or a config never read) changes nothing.
+ */
+export function lineOf(raw: Readonly<Record<string, unknown>>): { waiting: boolean; ahead: number } {
+  const l = isObject(raw.line) ? raw.line : {}
+  const waiting = l.waiting === true
+  const n = typeof l.ahead === 'number' && Number.isFinite(l.ahead) ? Math.floor(l.ahead) : 0
+  return { waiting, ahead: waiting ? Math.min(9_999_999, Math.max(0, n)) : 0 }
+}
+
+/**
+ * Config's `signups` (W11): what the join card needs before there is an account. `githubRequired`:
+ * the server takes no handle without a GitHub sign-in. `line`: a new account takes its handle and
+ * waits. `email`: a GitHub signup keeps the account's email, so the card says so. Unknown is off.
+ */
+export function signupsOf(raw: Readonly<Record<string, unknown>>): { githubRequired: boolean; line: boolean; email: boolean } {
+  const s = isObject(raw.signups) ? raw.signups : {}
+  return { githubRequired: s.github_required === true, line: s.line === true, email: s.email === true }
+}
+
+/**
  * Whether an answer's `x-ccsr-config` header calls for a re-read: it names a
  * version other than the one held, and the last read began at least
  * REREAD_SPACING_MS ago. No header (a server before v0.5) never does. The

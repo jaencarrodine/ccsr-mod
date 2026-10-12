@@ -17,6 +17,17 @@ Paste both lines into Claude Code:
 /plugin install ccsr@ccsr
 ```
 
+Or make your Claude do it. Paste this instead:
+
+```
+Install the CCSR mod for me. It's the ccsr plugin from the github.com/jaencarrodine/ccsr-mod marketplace: ranked matches inside Claude Code, where my own Claude scores my commits. Run these two commands in my shell:
+
+claude plugin marketplace add jaencarrodine/ccsr-mod
+claude plugin install ccsr@ccsr
+
+If the claude command isn't found, stop there and tell me to run /plugin marketplace add jaencarrodine/ccsr-mod and then /plugin install ccsr@ccsr in Claude Code myself, one at a time. It needs Claude Code 2.1.287 or later (2.1.286 in the desktop app), so tell me if mine is older. When it's installed, tell me to start a new session and run /ccsr to pick a handle.
+```
+
 Then start a new session and run `/ccsr`. Pick a handle. It'll be on a lot of Ls.
 
 Turn on auto-update for ccsr in /plugin and you'll never see the Update button.

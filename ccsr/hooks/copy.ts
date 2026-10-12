@@ -5,6 +5,7 @@
 import type { Surfaces } from '../types'
 import { PROVIDERS } from './actions'
 import { captureOn } from './coder'
+import { signupsOf } from './config'
 import type { ModConfig } from './config'
 import { signinMode } from './identity'
 import { challengeCfg } from './challenges'
@@ -31,6 +32,7 @@ export const LINES = {
   multibox: 'Multiboxing is legal. The sweats already knew.',
   farDown: (rank: number) => `Rank ${rank}. Somebody has to hold the ladder up.`,
   numberOne: '#1 Claude Code ranked player (world)',
+  onX: (handle: string) => `@${handle} on X`,
   reportBug: 'Tag or DM',
   win: (d: number) => `Victory. +${d}. Co-Authored-By: Claude.`,
   loss: ['Great CLAUDE.md though.', 'Same Claude. Different idiot.', "It wasn't the model.", 'Gorgeous plan mode output though.', 'Your Claude is asking for a transfer.'],
@@ -114,6 +116,12 @@ export const MOD = {
     version ? `CCSR needs Claude Code ${terminal} or later (${desktop} in the desktop app). You're on Claude Code ${version}.` : `CCSR needs Claude Code ${terminal} or later (${desktop} in the desktop app).`,
   // Kill switches: ranked paused (practice only) and chat paused.
   rankedPaused: 'Ranked is paused for now. Practice is still open.',
+  // The line (docs/copy.md, "W11: the line", the mod's lines): in Queue's place while this account waits its turn.
+  inLine: (ahead: number) => (ahead > 0 ? `You're in line. About ${ahead} ahead of you.` : "You're next in line."),
+  inLineMore: "Your handle is yours. Ranked opens here when it's your turn. Practice and the Grind are open now.",
+  // The join card: the server takes no handle without a GitHub sign-in, and new accounts wait.
+  githubFirst: 'Sign in with GitHub to claim a handle.',
+  lineOpen: "CCSR is full right now. Claim your handle and you're in line.",
   chatPaused: 'Chat is paused for now.',
   roomPaused: (room: string) => `${room} is paused for now.`,
   // Why you left the queue (QueueState.cancelled.reason): the known ones, and one line for any other.
@@ -196,7 +204,9 @@ const SENDS =
 export function privacyLines(cfg: ModConfig, rubric: string): string[] {
   const lines = [LINES.privacy, `${SENDS} Rubric ${rubric}.`]
   // W5b: sign-in, while config turns a provider on for this player.
-  for (const p of PROVIDERS) if (signinMode(cfg.raw, p) !== 'off') lines.push(IDENTITY.sends(PROVIDER_NAMES[p] ?? p))
+  // W11: with signups.email on, the line says a new handle's email is kept too.
+  const email = signupsOf(cfg.raw).email
+  for (const p of PROVIDERS) if (signinMode(cfg.raw, p) !== 'off') lines.push((email ? IDENTITY.sendsEmail : IDENTITY.sends)(PROVIDER_NAMES[p] ?? p))
   // W6b: challenges, while config turns them on for this player.
   if (challengeCfg(cfg.raw.challenges).on) lines.push(CHALLENGE.sends)
   // W7-2: while eval capture is on for this player, what Model stats adds, in its own words.
@@ -447,6 +457,9 @@ export const IDENTITY = {
   copyCode: 'Copy code',
   copied: 'Copied the code.',
   privacy: (provider: string) => `CCSR reads your ${provider} id and login and keeps no ${provider} token. Signing in can't read your repos.`,
+  // W11: while config's signups.email is on, a new handle made through sign-in keeps the account's email.
+  privacyEmail: (provider: string) =>
+    `CCSR reads your ${provider} id and login, and for a new handle your email address, to email you once when it's your turn to play. It keeps no ${provider} token, and signing in can't read your repos.`,
   cancel: 'Cancel',
   busy: 'One moment.',
   // A fresh install whose account has no handle yet: pick one.
@@ -496,6 +509,9 @@ export const IDENTITY = {
   unnamed: 'unnamed',
   // Settings, What leaves your machine (privacyLines), while sign-in is on.
   sends: (provider: string) => `Signing in with ${provider} shares your ${provider} id and login with CCSR. No ${provider} token is kept, and sign-in can't read your repos.`,
+  // W11: the same line while config's signups.email is on.
+  sendsEmail: (provider: string) =>
+    `Signing in with ${provider} shares your ${provider} id and login with CCSR, and for a new handle your email address, used once to say it's your turn. No ${provider} token is kept, and sign-in can't read your repos.`,
 }
 
 // ------------------------------------------------------------------ the surface switches (docs/ui-spec.md, Settings)

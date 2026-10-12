@@ -382,7 +382,8 @@ export type RankedMatch = {
 }
 
 
-export type ApiRankedRow = { rank: number; player: ApiPlayerRef; w: number; l: number; d: number; matches_played: number }
+/** `number_one`: what the player ranked 1 set for the #1 card (`{ line, x }`), when the server sends it. Read only through pure.ts numberOneOf. */
+export type ApiRankedRow = { rank: number; player: ApiPlayerRef; w: number; l: number; d: number; matches_played: number; number_one?: unknown }
 export type ApiRoom = 'world' | 'mud' | 'iron' | 'bronze' | 'silver' | 'gold' | 'platinum' | 'diamond' | 'master'
 export type ApiLobbyItem =
   | { seq: number; kind: 'chat'; at: string; room: ApiRoom; player: ApiPlayerRef; rank: number | null; text: string }

@@ -108,6 +108,88 @@ export function elo(mine: number, theirs: number, result: 0 | 0.5 | 1, played: n
   return Math.round(mine + k * (result - expected))
 }
 
+// ------------------------------------------------------------------ the #1 card's own words
+
+/**
+ * The most a #1 player's own line may be, as served. Wide on purpose: the mod freezes and the
+ * server's bound is the policy. `fitCardLine` cuts what the drawn card can't hold.
+ */
+export const NUMBER_ONE_LINE_MAX = 140
+/** The drawn card holds this many lines of this many characters under the name (olympia's numberOne). */
+export const CARD_LINES = 3
+export const CARD_LINE = 30
+/** An X handle as X allows one, with no @. */
+const X_HANDLE = /^[A-Za-z0-9_]{1,15}$/
+
+/** What the #1 player set for their card: each null when unset or unreadable. */
+export type NumberOneOwn = { line: string | null; x: string | null }
+
+/** Config's `number_one.custom`: the #1 card draws what its player set. Only `true` turns it on. */
+export function numberOneOn(raw: Readonly<Record<string, unknown>>) {
+  const o = raw.number_one
+  return typeof o === 'object' && o !== null && !Array.isArray(o) && (o as Record<string, unknown>).custom === true
+}
+
+/**
+ * What a Ranked row says its player set for the #1 card (`number_one: { line, x }`, docs/api.md),
+ * read only off the row ranked 1. `line` is one clean line of 1 to NUMBER_ONE_LINE_MAX characters;
+ * `x` is an X handle, with or without its @. Anything else is null, and null for both is no
+ * custom card at all: the pool's line shows, as before.
+ */
+export function numberOneOf(row: unknown): NumberOneOwn | null {
+  if (typeof row !== 'object' || row === null || Array.isArray(row)) return null
+  const r = row as Record<string, unknown>
+  const o = r.number_one
+  if (r.rank !== 1 || typeof o !== 'object' || o === null || Array.isArray(o)) return null
+  const src = o as Record<string, unknown>
+  // A line break or a tab reads as a space, then cleanServer drops what can't be drawn.
+  const text = typeof src.line === 'string' ? cleanServer(src.line.replace(/\s+/g, ' ')).replace(/ +/g, ' ').trim() : ''
+  const line = text.length >= 1 && text.length <= NUMBER_ONE_LINE_MAX ? text : null
+  const handle = typeof src.x === 'string' ? src.x.replace(/^@/, '') : ''
+  const x = X_HANDLE.test(handle) ? handle : null
+  return line === null && x === null ? null : { line, x }
+}
+
+/** The longest start of `s` that is at most `max` long and ends on a whole character. */
+function cutTo(s: string, max: number) {
+  let out = ''
+  for (const ch of s) {
+    if (out.length + ch.length > max) break
+    out += ch
+  }
+  return out
+}
+
+/**
+ * A line as the drawn #1 card can hold it: CARD_LINES lines of at most CARD_LINE characters,
+ * wrapped on words the way olympia's numberOne wraps (so it lays this out unchanged), a longer
+ * word broken across lines, and what is left over cut with three dots.
+ */
+export function fitCardLine(line: string) {
+  const words: string[] = []
+  for (let w of line.split(' ').filter(Boolean)) {
+    while (w.length > CARD_LINE) {
+      const head = cutTo(w, CARD_LINE)
+      words.push(head)
+      w = w.slice(head.length)
+    }
+    if (w) words.push(w)
+  }
+  const lines: string[] = []
+  for (const w of words) {
+    const last = lines.length - 1
+    if (last >= 0 && `${lines[last]} ${w}`.length <= CARD_LINE) lines[last] = `${lines[last]} ${w}`
+    else lines.push(w)
+  }
+  if (lines.length > CARD_LINES) lines.splice(CARD_LINES - 1, lines.length, `${cutTo(lines[CARD_LINES - 1] as string, CARD_LINE - 3).trimEnd()}...`)
+  return lines.join(' ')
+}
+
+/** An X handle's profile page. The handle is `numberOneOf`'s, so the link is safe to draw. */
+export function xProfile(handle: string) {
+  return `https://x.com/${handle}`
+}
+
 // ------------------------------------------------------------------ match lengths (W2b)
 // Ranked lengths are minutes (API v0.5). The server says which are offered to you
 // (GET /queue's `lanes`); the mod never names a length it hasn't been offered, and
