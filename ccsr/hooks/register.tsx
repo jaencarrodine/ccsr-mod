@@ -191,6 +191,8 @@ const CHALLENGE_UI0: ChallengeUi = { rev: 0, incoming: null, outgoing: null, for
 const challengeUi = atom({ plugin: 'ccsr', key: 'challengeUi' } as const, CHALLENGE_UI0)
 /** W4b: moves whenever this session's notices change (module variables, in "notices" below), so the pane, the band and the status line draw again. */
 const noticeRev = atom({ plugin: 'ccsr', key: 'noticeRev' } as const, 0)
+// When the pane last drew, across reloads: written by paneTick, read by boot, never by a draw.
+const paneAt = atom({ plugin: 'ccsr', key: 'paneAt' } as const, 0)
 /** Which way in the first-run card shows: a new handle, a link code, or a recovery key. */
 const joinMode = atom({ plugin: 'ccsr', key: 'joinMode' } as const, 'new' as 'new' | 'link' | 'recover')
 /** The server's config for this server and handle (GET /config): CONFIG0, 0.3.0's behaviour, until a read lands. Read it through configOf. */
@@ -5850,9 +5852,17 @@ let noticeFlash: { full: string; short: string; until: number } | null = null
 let noticeOpened: { id: string; place: Place } | null = null
 /** Where this session started drawing, for a toast's or a flash's surfaces before the pane draws. */
 let sessionSurface: string | null = null
-/** When the pane last drew, for pane_open (a draw after PANE_GAP_MS without one). */
+/** When the pane last drew, for pane_open (a draw after PANE_GAP_MS without one). Boot takes it from `paneAt`, so a reload isn't the pane opening. */
 let paneDrawnAt = 0
 const PANE_GAP_MS = 60_000
+/** A draw kept a pane_open moment: paneTick does the rest, since a draw may write no state and start no timer that may. */
+let paneOpened = false
+/** What `paneAt` was last written as. */
+let paneKeptAt = 0
+/** The boot's tick for what a draw may not do. */
+const PANE_TICK_MS = 1000
+/** `paneAt` is written when the pane has drawn this much later than it says. */
+const PANE_KEEP_MS = 10_000
 /** Config's notices, parsed once per config read: the list, and the read it came from. */
 let noticesMemo: { key: string; list: Notice[] } = { key: '', list: [] }
 /** Every store write the notices make runs in order, each on a fresh read (another session may have written meanwhile). */
@@ -5943,43 +5953,33 @@ function recordMoment(e: NoticeEvent, at: number, start = at) {
   return true
 }
 
-/** The wait before each try of a write a draw set off (writeAfterDraw): the first at once, each later one after the refusal before it. */
-const DRAW_WAITS_MS = [0, 50, 150, 400, 1000, 2000]
-
-/** The host's refusal of a state write made while a draw is still being dispatched. */
-const drawRefused = (err: unknown) => /while ui\.render is being dispatched/.test(String((err as Error | undefined)?.message))
-
 /**
- * A state write a draw set off, made once that draw is over. To the host a timer a draw starts is
- * still that draw (it carries the draw's scope), so its write is refused until the draw has
- * answered, however short the timer: a zero-delay one fires mid-draw in a live session. So the
- * write is tried from a timer, and again after each of DRAW_WAITS_MS while it is refused for that.
- * Rejects with the last refusal, or with any other error at once.
+ * After a moment: what draws notices draws again (noticeRev), then the toast and flash check.
+ * Never from a draw: a state write is refused while a render hook draws, and to the host a timer a
+ * draw starts is still that draw, however long it waits (on a live host the retries of 0.5.x's
+ * writeAfterDraw were all refused, and the pane said "state.set: denied"). The pane's pane_open
+ * goes through paneTick instead. A failed write is logged and the check runs anyway.
  */
-function writeAfterDraw($: $, write: () => Promise<unknown>): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const go = (i: number) => {
-      $.clock.after(DRAW_WAITS_MS[i] ?? 0, () => {
-        write().then(
-          () => resolve(),
-          err => (drawRefused(err) && i + 1 < DRAW_WAITS_MS.length ? go(i + 1) : reject(err)),
-        )
-      })
-    }
-    go(0)
-  })
+async function noticesMoved($: $) {
+  await update($, noticeRev, n => n + 1).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+  await noticeAlerts($)
 }
 
 /**
- * After a moment: what draws notices draws again (noticeRev), then the toast and flash check.
- * From a render (`inDraw`, renderPane's pane_open) the write waits for the draw to be over
- * (writeAfterDraw), since a write made during one is refused (drawing is pure). A refused or
- * failed write is logged and the check runs anyway.
+ * Once a second, from a timer the boot set (an event of its own, so it may write state): what a
+ * draw of the pane left to do. A pane_open moment the draw kept gets its redraw and its toast and
+ * flash check, within the second; and `paneAt` follows the pane's last draw, so the next load of
+ * this module knows the pane was already up.
  */
-async function noticesMoved($: $, inDraw = false) {
-  const bump = () => update($, noticeRev, n => n + 1)
-  await (inDraw ? writeAfterDraw($, bump) : bump()).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
-  await noticeAlerts($)
+async function paneTick($: $) {
+  if (paneOpened) {
+    paneOpened = false
+    await noticesMoved($)
+  }
+  if (paneSeenAt - paneKeptAt >= PANE_KEEP_MS) {
+    paneKeptAt = paneSeenAt
+    await update($, paneAt, () => paneSeenAt)
+  }
 }
 
 /**
@@ -7156,10 +7156,8 @@ export async function renderPane($: $, e: RenderInput<'Pane'>, a: Actions): Prom
   // Where this install last drew, for GET /config?surface= (the server keeps it for targeting).
   paneSurface = e.surface
   // W4b: the pane's first draw after a minute without one is the notices' pane_open. The moment is kept now, so this draw's slots
-  // see it; the redraw and the toast and flash check run once this draw is over (noticesMoved's inDraw), since a state write made
-  // while a render is being dispatched is refused (drawing is pure), a zero-delay timer's included.
-  if (paneSeenAt - paneDrawnAt > PANE_GAP_MS && recordMoment({ on: 'pane_open' }, paneSeenAt))
-    void noticesMoved($, true).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+  // see it; the redraw and the toast and flash check are paneTick's, within a second: a draw writes no state and starts no timer.
+  if (paneSeenAt - paneDrawnAt > PANE_GAP_MS && recordMoment({ on: 'pane_open' }, paneSeenAt)) paneOpened = true
   paneDrawnAt = paneSeenAt
 
   let body: RenderElement
@@ -10798,31 +10796,79 @@ async function lab($: $, what: string, surface: string) {
   if (what.startsWith('select:')) return note(`Select picked: ${what.slice(7)}`)
 }
 
+/**
+ * One step of the boot, on its own: a step that throws is logged and the boot goes on, so no
+ * failure up here leaves a load of this module without what comes after it.
+ */
+async function bootStep($: $, name: string, fn: () => Promise<unknown>) {
+  try {
+    await fn()
+  } catch (err) {
+    try {
+      $.ui.log(`CCSR boot (${name}): ${clean(String((err as Error | undefined)?.message ?? err))}`)
+    } catch {
+      // Nowhere to say it.
+    }
+  }
+}
+
 async function boot($: $, cwd: string) {
   loadedAt = await $.clock.now()
-  owner = await $.session.id()
+  // A load after the first (a mod update, a reload: the desktop app reloads the plugin in every open session at once) finds the
+  // pane and the band already on screen, drawn by the module that is gone. Their buttons call that module's closures, which
+  // nothing holds any more, so every press is dropped until something draws them again; and nothing did, until a state write
+  // happened to land. So the first thing a load does is draw them again: asked of the engine, and by a state write they read.
+  try {
+    $.ui.invalidate('ui.render')
+  } catch {
+    // An engine without it: the state write below draws them.
+  }
+  await bootStep($, 'redraw', () => update($, now, () => loadedAt))
+  // The timers next, before anything that can be slow or fail: a reload cancels the old module's, and a boot that stalls or
+  // throws further down used to leave a load that drew but never ticked. Every 30 seconds the shared values; every two minutes
+  // the scan, and a look for repos the sessions here haven't opened (one session per machine takes it); every second, what a
+  // draw of the pane left to do (paneTick).
+  $.clock.every(30_000, () => void slowSync($))
+  $.clock.every(120_000, () => {
+    void runScan($).catch(err => $.ui.log(`CCSR scan: ${(err as Error).message}`))
+    lookAround($)
+  })
+  $.clock.every(PANE_TICK_MS, () => void paneTick($).catch(err => $.ui.log(`CCSR pane: ${(err as Error).message}`)))
+  // Where the pane last drew, as the module before this one left it: a pane that was up through the reload hasn't just opened.
+  await bootStep($, 'pane', async () => {
+    paneKeptAt = (await read($, paneAt)) || 0
+    paneDrawnAt = Math.max(paneDrawnAt, paneKeptAt)
+  })
+  await bootStep($, 'session', async () => {
+    owner = await $.session.id()
+  })
   // The watch list's memory is this session's: what a folder's repo was, and how often a look failed.
   dirRoots.clear()
   lookFails = 0
-  await $.command.register({
-    name: 'ccsr',
-    description: 'Claude Code Ship Race: open the pane, Grind, backtests, practice matches',
-    argumentHint: '[grind|scan|backtest|match 1h|forfeit|quiet|help]',
-  })
+  await bootStep($, 'command', () =>
+    $.command.register({
+      name: 'ccsr',
+      description: 'Claude Code Ship Race: open the pane, Grind, backtests, practice matches',
+      argumentHint: '[grind|scan|backtest|match 1h|forfeit|quiet|help]',
+    }),
+  )
   try {
     const migrated = await loadAll($)
     if (migrated) await ambient($, `CCSR updated: rubric ${RUBRIC}. Your Grind is being rescored from git.`, 'note', 8000)
   } catch (err) {
     $.ui.toast(`CCSR could not load its data: ${clean((err as Error).message)}`, { timeoutMs: 8000 })
   }
-  await update($, scan, cur => ({ ...SCAN0, ...cur, busy: false, problems: cur.problems ?? [] }))
-  await update($, backtests, all =>
-    Object.fromEntries(Object.entries(all).map(([k, r]) => [k, r.status === 'running' ? { ...r, status: 'error' as const, note: 'Interrupted by a reload, press Rescore' } : r])),
+  await bootStep($, 'scan state', () => update($, scan, cur => ({ ...SCAN0, ...cur, busy: false, problems: cur.problems ?? [] })))
+  await bootStep($, 'backtests', () =>
+    update($, backtests, all =>
+      Object.fromEntries(Object.entries(all).map(([k, r]) => [k, r.status === 'running' ? { ...r, status: 'error' as const, note: 'Interrupted by a reload, press Rescore' } : r])),
+    ),
   )
-  await update($, now, () => loadedAt)
-  const repo = await $.session.repo()
-  const root = await repoRoot($, repo?.root ?? cwd)
-  if (root) await addRepo($, root)
+  await bootStep($, 'repo', async () => {
+    const repo = await $.session.repo()
+    const root = await repoRoot($, repo?.root ?? cwd)
+    if (root) await addRepo($, root)
+  })
   // A developer tool (it spends the player's usage when Claude calls it): only with CCSR_DEV=1, never in a player's tool list.
   let isDev = false
   try {
@@ -10830,7 +10876,7 @@ async function boot($: $, cwd: string) {
   } catch {
     isDev = false
   }
-  if (isDev) await $.tool.register({
+  if (isDev) await bootStep($, 'tool', () => $.tool.register({
     name: 'calibrate',
     description:
       "CCSR developer tool: scores the player's recent commits several times each with the current judge model and rubric (no cache) and returns the spread, the points distribution, how often the craft mark fires, and per-commit runs. With pairs, also compares GitHub squash merges against the sum of their branch commits. Spends the player's Claude usage: about count x runs model calls.",
@@ -10843,31 +10889,31 @@ async function boot($: $, cwd: string) {
         pairs: { type: 'boolean', description: 'Also compare squash merges with their branch commits (default true)' },
       },
     },
+  }))
+  await bootStep($, 'practice', async () => {
+    const m = await read($, match)
+    if (m && m.status === 'live' && m.kind === 'practice') startTicker($)
   })
-  const m = await read($, match)
-  if (m && m.status === 'live' && m.kind === 'practice') startTicker($)
-  await update($, link, l => ({ ...l, outbox: 0 }))
+  await bootStep($, 'outbox count', () => update($, link, l => ({ ...l, outbox: 0 })))
   // The switchboard: a fresh copy another session read is taken at once, else it's asked for.
   void refreshConfig($, 'boot').catch(err => $.ui.log(`CCSR config: ${(err as Error).message}`))
-  void refreshAccount($).then(() => flushOutbox($))
+  void refreshAccount($)
+    .then(() => flushOutbox($))
+    .catch(err => $.ui.log(`CCSR account: ${(err as Error).message}`))
   // A session begins with what the machine's other sessions last read: the match or its result, the lanes, the account and boards.
   // Never awaited: boot goes on as it did, and nothing below waits on the store for it.
   void applyShare($)
     .then(() => adoptSeen($))
     .then(() => refreshStatus($))
     .catch(err => $.ui.log(`CCSR ranked: ${(err as Error).message}`))
-  const sh = await rankedShared($)
-  if (sh.phase === 'queued' || sh.phase === 'offered' || sh.phase === 'live') startRankedPoll($)
-  $.clock.every(30_000, () => void slowSync($))
-  // Every two minutes: the scan, and a look for repos the sessions here haven't opened (one session per machine takes it).
-  $.clock.every(120_000, () => {
-    void runScan($).catch(err => $.ui.log(`CCSR scan: ${(err as Error).message}`))
-    lookAround($)
+  await bootStep($, 'ranked', async () => {
+    const sh = await rankedShared($)
+    if (sh.phase === 'queued' || sh.phase === 'offered' || sh.phase === 'live') startRankedPoll($)
   })
   scheduleScan($, 2500)
   // The seed on this install's first session, and a first look.
   lookAround($)
-  await refreshStatus($)
+  await bootStep($, 'status', () => refreshStatus($))
   // W3b: a bucket config lists that GET /me had no standing for (switched on since) reads GET /me again, and a bucket on screen
   // that config moved gets its lanes. Never awaited: a config read waits on each tick, and $.http.fetch has no timeout, so a
   // request that never answers would hold every later config read.

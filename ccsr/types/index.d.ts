@@ -597,6 +597,11 @@ declare module 'claude-code' {
       signinUi: { note: string; copied: boolean; unlinkAsk: boolean }
       /** W4b: moves when this session's notices change (a trigger, a press, a dismissal, a flash), so what draws them draws again. */
       noticeRev: number
+      /**
+       * When the pane last drew, kept by the boot's tick (never by a draw, and never read by one): a
+       * reload empties the module, and without this the first draw after it would pass for the pane opening.
+       */
+      paneAt: number
       /** W10b: moves when a finisher starts, replays or settles on its last frame, so the result redraws on time. Which ones played lives in the store (`finisherSeen`). */
       finisherRev: number
       /** W10b: the Finishers view (FinisherUi). */
