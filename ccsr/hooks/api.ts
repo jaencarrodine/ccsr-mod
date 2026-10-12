@@ -127,5 +127,5 @@ export function mergeEvents(have: ApiMatchEvent[], fresh: ApiMatchEvent[]) {
 }
 
 export function handleProblem(h: string): string | null {
-  return /^[a-z0-9_]{2,20}$/.test(h) ? null : '2 to 20 of a-z, 0-9 and _.'
+  return /^[a-z0-9_]{2,20}$/.test(h) ? null : 'Invalid handle. Use 2 to 20 of a-z, 0-9 and _.'
 }

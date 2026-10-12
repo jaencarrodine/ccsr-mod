@@ -12,6 +12,7 @@ import { challengeCfg } from './challenges'
 // W4b: the Notices setting for stored switches (notices.ts reads QUIET from here; both are used only inside functions).
 import { noticeSettingFrom } from './notices'
 import { backfillOn } from './transcripts'
+import { usageOn } from './usage'
 // W10e: custom finishers' privacy line follows config's `finishers.custom.create`.
 import { customOf } from './finishers-custom'
 
@@ -100,6 +101,11 @@ export const MOD = {
   offline: "Can't reach ccsr.gg. Scores wait here and send when it's back.",
   notice: 'Counts in your match.',
   counting: 'Bell. Scoring commits made before it.',
+  // Settings, Resync (2026-10-12): the way out of a state the mod doesn't leave by itself.
+  resyncTitle: 'Stuck or out of date?',
+  resyncLead: 'Resync reads your account, queue and match from the server again.',
+  resync: 'Resync',
+  resynced: 'Resynced with the server.',
   notRanked: 'Not ranked until placed.',
   locked: 'Rooms above your tier are locked.',
   practice: 'Practice against a bot. Your commits score for real; the rating is practice only.',
@@ -213,6 +219,8 @@ export function privacyLines(cfg: ModConfig, rubric: string): string[] {
   if (captureOn(cfg.raw)) lines.push(EVAL.privacy)
   // W7-3: while the transcript fallback is on too, that the mod looks in Claude Code's logs here, and what it keeps from them.
   if (captureOn(cfg.raw) && backfillOn(cfg.raw)) lines.push(EVAL.logs)
+  // Usage weeks: while eval_usage is on too, that the mod adds up Claude Code's logs here by week, and what it sends of them.
+  if (captureOn(cfg.raw) && usageOn(cfg.raw)) lines.push(EVAL.usage)
   // W4b: a server with notices (W4a) gets their counts back: ids and counts, never their words.
   if (Array.isArray(cfg.raw.notices)) lines.push(NOTICE.privacy)
   // W10e: while making finishers is on for this player, what a submitted finisher sends.
@@ -360,6 +368,9 @@ export const EVAL = {
     'With Model stats on, each scored commit also sends the coding model, the effort, main session or subagent, the client and its version, and four token counts. Never a session id, a path, a command or a repo name.',
   /** W7-3: the transcript fallback, while config's eval_backfill is on too (dark, QA only). */
   logs: "With Model stats on, a scored commit with no call record takes its model from Claude Code's logs on this machine. From them the mod keeps only ids, times, the model, main session or subagent, the client and its version, and token counts. Never a prompt, a reply or code.",
+  /** Usage weeks, while config's eval_usage is on too. */
+  usage:
+    "With Model stats on, the mod also adds up your Claude Code use by week, from four weeks before you joined, and sends only the totals: the days it could read, the days you used it, and four token counts. It reads Claude Code's logs on this machine for them. Never a prompt, a reply, code, a model or a repo.",
 }
 
 // ------------------------------------------------------------------ notices
@@ -478,7 +489,7 @@ export const IDENTITY = {
   outbox: "Scores from this handle are still sending. Switch once they're sent.",
   inMatch: "You're in a match. Switch handles once it's over.",
   offline: "Can't reach the server. Try again when it's back.",
-  badHandle: 'Handles are 2 to 20 of a-z, 0-9 and _.',
+  badHandle: 'Invalid handle. Use 2 to 20 of a-z, 0-9 and _.',
   handleTaken: 'That handle is taken.',
   refused: 'The server refused that.',
   // Done.

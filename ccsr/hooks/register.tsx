@@ -126,6 +126,9 @@ import type { Call, Client, CoderBlock, Effort } from './coder'
 // W7-3: the transcript fallback (dark, behind config's eval_backfill).
 import { BACKGROUND_MS, FILES_PER_SCAN, SESSIONS_MAX, TWINS_MAX, backfillOn, callsFromTranscript, isSubagentFile, mergeTranscripts, projectDirOf, readPlan, subfolderPrefixOf, transcriptsDirOf } from './transcripts'
 import type { TranscriptCall, TranscriptFile } from './transcripts'
+// Usage weeks (the usage lift study): dark, behind config's eval_usage.
+import { USAGE_SCRIPT, USAGE_STRIKES, USAGE_TIMEOUT_MS, isTransientUsageFailure, readUsage, usageAnswer, usageBody, usageDue, usageOn, usagePlan, usageState, usageWeeks } from './usage'
+import type { UsageState, UsageWeek } from './usage'
 // The watch list: the repos a commit can land in, found from the Bash hook and Claude Code's own transcripts.
 import { LOOK_EVERY_MS, LOOK_MINUTES, LOOK_SCRIPT, LOOK_STRIKES, SEED_DAYS, SEED_FLIGHT_MS, SEED_RETRY_MS, SEED_SCRIPT, dirsFromLook, gitDirs, isCommitCommand, isTempDir, isTransientLookFailure } from './repos'
 // W10b: finishers: the drawings (finishers.ts, a verbatim copy of mod-lab's), how the mod plays them (finisherplay.ts), and their words.
@@ -264,6 +267,8 @@ const K = {
   modelStats: 'modelStats',
   // The watch list's look at Claude Code's transcripts: `{ seeded, tried, failed, at }`, when this install's seed ran, when an attempt last began, when one last failed, and when any session here last looked, so one session looks at a time.
   repoLook: 'repoLook',
+  // Usage weeks: `{ key: '<server url>|<handle>', anchor, through, tried, failed }`, the account's anchor as the server gave it, the newest week this install has handled, and when a run last began and last failed, so one session runs at a time.
+  usage: 'usage',
 } as const
 
 type Verdict = Pick<ScoredCommit, 'points' | 'base' | 'craft' | 'category' | 'reason' | 'judge' | 'asked' | 'rubric' | 'scoredAt'>
@@ -317,6 +322,12 @@ let slotTorn = false
 let callsForgotten = false
 /** W7-3: the transcript fallback runs here: capture is on and config's eval_backfill is too. Set with `capturing`, in syncCapture. */
 let backfilling = false
+/** Usage weeks: a run is going in this session. */
+let usageRunning = false
+/** Usage weeks: runs and posts that failed in a row in this session. At USAGE_STRIKES it stops trying until the next session. */
+let usageFails = 0
+/** Whether boot registered usageTick on the config tick (once, after syncCapture's). */
+let usageTicking = false
 
 async function storeGet<T>($: $, key: string, fallback: T): Promise<T> {
   const v = (await $.store.get(key)) as T | undefined
@@ -2285,6 +2296,11 @@ async function installLabel($: $) {
   return (home && dir.startsWith(home) ? `~${dir.slice(home.length)}` : dir).slice(0, 64)
 }
 
+/** The shared ranked state as this session's last slowSync saw it (`live:<match id>`, else the phase): how it tells a match ended in another session. */
+let rankedSeen: string | null = null
+/** The match whose result this session's own poll read (pollMatch), and read the account after: slowSync has nothing to add for it. */
+let accountAfter: string | null = null
+
 /**
  * Who we are and the season's judge, from the server, into this session's
  * link. With no token, the keyring may sign this install in on its own.
@@ -3589,6 +3605,84 @@ async function madeHere($: $, root: string): Promise<Set<string>> {
   return out
 }
 
+// ------------------------------------------------------------------ usage weeks (usage.ts)
+// Dark: only while capture is on here (signed in, config's eval_capture, Model stats not off)
+// and config's eval_usage is. Once per install, then once a week: `sh` adds up Claude Code's
+// own transcripts under this config dir by week, counted from the anchor the server holds for
+// the account (its first install), and the totals go to POST /usage: for the four weeks before
+// the anchor and each week since, the days the transcripts cover, the days with a call and four
+// token counts. Nothing else is read from a transcript, and nothing the script prints but
+// those sums reaches the mod. One session per machine runs it at a time (the store's `usage`),
+// a failure waits six hours, and a machine with no `sh` never sends a row. Never awaited by a
+// tick: the script may run for minutes, and the post is a request.
+
+/**
+ * One pass: nothing unless a week is waiting. The anchor is asked for once, then the script
+ * runs over the weeks not handled yet, and their rows are posted. A week is handled once it is
+ * posted, or once it has no day the transcripts cover (no row to send). Never throws.
+ */
+async function usageTick($: $) {
+  if (usageRunning || usageFails >= USAGE_STRIKES || !capturing) return
+  usageRunning = true
+  try {
+    const cfg = await serverCfg($)
+    if (!cfg.token || !usageOn((await read($, config)).raw)) return
+    const key = keyOf(cfg)
+    let s: UsageState = usageState(await storeGet<unknown>($, K.usage, null), key)
+    const began = await $.clock.now()
+    if (!usageDue(s, began)) return
+    s = { ...s, tried: began }
+    await save($, K.usage, s)
+    try {
+      if (s.anchor === null) {
+        const r = await api($, 'GET', '/usage', undefined, { keepNote: true })
+        const got = r.status === 200 ? usageAnswer(r.json) : null
+        if (!got) throw new Error(`GET /usage answered ${r.status}`)
+        // The newest week the server holds for this install is handled, whatever this store says (a store wiped since).
+        s = { ...s, anchor: got.anchor, through: got.through === null ? s.through : Math.max(got.through, s.through ?? got.through) }
+        await save($, K.usage, s)
+      }
+      const anchor = s.anchor as number
+      const plan = usagePlan({ anchor, through: s.through, now: await $.clock.now() })
+      if (plan) {
+        let rows: UsageWeek[] = []
+        if (plan.readDays > 0) {
+          const base = await projectsDir($)
+          if (!base) throw new Error('no transcripts folder')
+          const r = await $.process.run(['sh', '-c', USAGE_SCRIPT, 'sh', base, String(plan.readDays), String(plan.coverDays)], { timeoutMs: USAGE_TIMEOUT_MS })
+          if (r.exitCode !== 0) throw new Error(`sh exited ${r.exitCode}`)
+          const got = r.isStdoutTruncated ? null : readUsage(r.stdout)
+          if (!got) throw new Error('output not whole')
+          rows = usageWeeks(got, { anchor, first: plan.first, last: plan.last, now: await $.clock.now() })
+        }
+        // Capture went off while the script ran (Model stats off, the flag off, signed out): nothing is sent, and the weeks wait.
+        if (!capturing || keyOf(await serverCfg($)) !== key) {
+          await save($, K.usage, { ...s, tried: 0 })
+          return
+        }
+        if (rows.length > 0) {
+          const r = await api($, 'POST', '/usage', usageBody(rows), { keepNote: true })
+          if (r.status !== 200) throw new Error(`POST /usage answered ${r.status}`)
+        }
+        s = { ...s, through: plan.last }
+      }
+      await save($, K.usage, { ...s, tried: 0, failed: 0 })
+      usageFails = 0
+    } catch (err) {
+      const message = clean(String((err as Error | undefined)?.message ?? err))
+      // The server's answer and a script that ran badly are worth another try in six hours; a session that can't start `sh` hands the slot back and stops.
+      const again = isTransientUsageFailure(message) || / answered \d+$/.test(message)
+      usageFails = again ? usageFails + 1 : USAGE_STRIKES
+      $.ui.log(`CCSR usage: failed${usageFails >= USAGE_STRIKES ? ', no more tries this session' : ''}: ${message}`, { to: 'debug' })
+      await save($, K.usage, { ...s, tried: 0, failed: again ? began : s.failed })
+    }
+  } catch (err) {
+    $.ui.log(`CCSR usage: ${clean(String((err as Error | undefined)?.message ?? err))}`, { to: 'debug' })
+  } finally {
+    usageRunning = false
+  }
+}
+
 // ------------------------------------------------------------------ the transcript fallback (W7-3)
 // Dark: only while config's eval_backfill is on and capture is (`backfilling`, set in
 // syncCapture). A new score whose live block is none, or that has no block, looks for its
@@ -4141,6 +4235,14 @@ async function pollRanked($: $, isCurrent: () => boolean): Promise<Answer | void
   const sh = await rankedShared($)
   if (sh.phase === 'queued' || sh.phase === 'offered') return pollQueue($, sh, isCurrent)
   if (sh.phase === 'live' && sh.matchId) return pollMatch($, sh.matchId, isCurrent)
+  // Decided by another session's poll (or before this session began): the store says done, and this session has no result to draw.
+  const late = sh.phase === 'done' && sh.matchId ? await resultMissing($, sh.matchId) : null
+  if (late && sh.matchId) {
+    const r = await pollMatch($, sh.matchId, isCurrent, late)
+    // No such match on this server (a server switch, or one the server no longer keeps): nothing will ever draw it, so the phase goes back to idle.
+    if (r.status === 404 && isCurrent() && (await rankedShared($)).matchId === sh.matchId) await clearRanked($)
+    return r
+  }
   // Between matches: the lanes, while the Match tab is on screen, or once for a press. W3b: the lanes of the bucket on screen.
   const once = lanesOnce
   lanesOnce = false
@@ -4148,6 +4250,23 @@ async function pollRanked($: $, isCurrent: () => boolean): Promise<Answer | void
   // A press that came during this tick wants the lanes: its kick has the next tick follow at once, and that one reads them.
   if (lanesOnce) return
   stopPolling()
+}
+
+/**
+ * Whether this session lacks the result of match `id`, which the store says is decided, and how.
+ * The phase is the store's, shared by every session on the machine; the match itself (`link`) is
+ * each session's own. So the session whose poll reads the result first sets the phase to done, and
+ * no other session read the match again:
+ *   - `open`: this session's copy stopped at live or grace, and its pane, band and status line drew
+ *     the bell ("0:00:00 to the bell", "Bell. Scoring commits made before it.") for good;
+ *   - `none`: a session begun after the result (or one that never followed the match) has no copy,
+ *     and its Match tab drew "Checking with the server." until some session dismissed the result.
+ * Either way one more read takes the result here too (pollRanked). null when this session has it.
+ */
+async function resultMissing($: $, id: string): Promise<'open' | 'none' | null> {
+  const r = (await read($, link)).ranked
+  if (!r || r.id !== id || !r.summary) return 'none'
+  return r.summary.status === 'finished' || r.summary.status === 'void' ? null : 'open'
 }
 
 /**
@@ -4309,11 +4428,21 @@ async function enterLive($: $, sent: ApiMatchSummary, isCurrent?: () => boolean)
   else await pollRankedNow($)
 }
 
-async function pollMatch($: $, id: string, isCurrent: () => boolean): Promise<Answer> {
+/**
+ * One page of the match. `late` (pollRanked, resultMissing): another session's poll already decided
+ * it and rang the result, so this one plays no sound and leaves the phase alone. A session that was
+ * following the match (`open`) still toasts the result in its own window; one that never was
+ * (`none`) only draws it, since the result may be hours old.
+ */
+async function pollMatch($: $, id: string, isCurrent: () => boolean, late: 'open' | 'none' | null = null): Promise<Answer> {
   const cur = (await read($, link)).ranked
   const cursor = cur && cur.id === id ? cur.cursor : 0
   const r = await api($, 'GET', `/matches/${id}/events?cursor=${cursor}`)
   if (r.status !== 200 || !isCurrent()) return r
+  // Asked with a cursor this session's copy no longer has (Resync set it back to 0 while this read was out): merged, it would
+  // move the cursor past the reset and the feed would lose everything before it for the rest of the match. The next read is from 0.
+  const held = (await read($, link)).ranked
+  if (held && held.id === id && held.cursor !== cursor) return r
   const page = r.json as { events: RankedMatch['events']; cursor: number; match: ApiMatchSummary; notices?: unknown }
   const t = await $.clock.now()
   // W10e: a decided win's custom art ref goes in module memory (and its art is fetched for this pane), never the link atom.
@@ -4339,17 +4468,20 @@ async function pollMatch($: $, id: string, isCurrent: () => boolean): Promise<An
     if (left <= warn) await checkDirty($)
   }
   if (s.status === 'finished' || s.status === 'void') {
-    await setRanked($, { phase: 'done', matchId: id })
+    // A late read leaves the store alone: it already said done, and since then another session may have dismissed the result or queued again.
+    if (!late) await setRanked($, { phase: 'done', matchId: id })
     // Decided: the loop's next tick reads the lanes (for Queue again) if the Match tab is on screen, else stops.
+    if (late === 'none') rankedWarned.add(`${id}:result`)
     if (!rankedWarned.has(`${id}:result`)) {
       rankedWarned.add(`${id}:result`)
       const me = (await serverCfg($)).handle ?? ''
       await ambient($, rankedResultLine(s, me), 'match', 10_000)
       const o = rankedOutcome(s, me)
-      if (s.status !== 'void' && o !== 'draw') await ring($, o === 'won' ? 'win' : 'loss')
+      if (!late && s.status !== 'void' && o !== 'draw') await ring($, o === 'won' ? 'win' : 'loss')
       // W4b: the notices' result trigger, then placed, or tier up or down (before GET /me is read again below).
       void noticeMatchEnd($, s, me).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
     }
+    accountAfter = id
     void refreshAccount($).then(() => refreshBoards($))
   }
   await refreshStatus($)
@@ -6192,7 +6324,6 @@ export type Actions = {
   setupSeen: () => void
   askForfeit: (isAsking: boolean) => void
   setPreset: (preset: 'full' | 'quiet') => void
-  setHandle: (h: string) => void
   setTracking: (isOn: boolean) => void
   setShare: (isOn: boolean) => void
   setModel: (m: string) => void
@@ -6296,6 +6427,8 @@ export type Actions = {
   finisherReport: (matchId: string, reason: ReportReason) => void
   /** W10e: Play on the draft's preview or a gallery row's. */
   finisherPlay: (which: 'draft' | 'gallery') => void
+  /** Settings' Resync (2026-10-12): this session and the store's ranked state start again from the server. */
+  resync: () => void
 }
 
 export const ORANGE = '#FF6A2A'
@@ -8423,7 +8556,6 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
   return (
     <Box flexDirection="column" gap={1}>
       {server}
-      {e.surface !== 'mobile' && <Input key="handle" label="Handle" value={s.handle} submitLabel="Save" onSubmit={v => a.setHandle(v)} />}
       <Box gap={1} alignItems="center">
         <Text>Grind tracking</Text>
         <Button key="track-on" label="On" variant={s.tracking ? 'primary' : 'secondary'} onPress={() => a.setTracking(true)} />
@@ -8511,6 +8643,11 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
           {l.updateNote}
         </Text>
       )}
+      <Text bold>{MOD.resyncTitle}</Text>
+      <Box gap={1} alignItems="center" flexWrap="wrap">
+        <Text wrap="wrap">{MOD.resyncLead}</Text>
+        <Button key="settings-resync" label={MOD.resync} onPress={() => a.resync()} />
+      </Box>
       <Text bold>Report a bug</Text>
       <Box gap={1} alignItems="center" flexWrap="wrap">
         <Text>Tag or DM</Text>
@@ -9824,7 +9961,6 @@ const HELP = `CCSR commands:
 /ccsr band on|off        the bar above the prompt
 /ccsr quiet on|off       Quiet: the race band in a match, the noise around it off
 /ccsr last               your last result as a scorecard
-/ccsr handle <name>      set your handle
 /ccsr status             one line of where you stand
 Chat lives in the pane only, so it never reaches Claude.`
 
@@ -10031,6 +10167,17 @@ async function slowSync($: $) {
   if (sh.phase === 'queued' || sh.phase === 'offered' || sh.phase === 'live') startRankedPoll($)
   // Between matches with the Match tab on screen (a pane the engine opened by itself, say): the lanes poll.
   else await idlePoll($)
+  // The account (rating, tier, the placement count, the record) is this session's own copy too, and only the session whose poll
+  // read a result asked for it again: every other one drew "placing 0 of 3" until it was restarted. So a session that sees the
+  // store leave a match it didn't read the result of reads its account and boards once. Never on a timer: GET /me is not a cheap read.
+  const rk = sh.phase === 'live' && sh.matchId ? `live:${sh.matchId}` : sh.phase
+  const was = rankedSeen?.startsWith('live:') ? rankedSeen.slice(5) : null
+  rankedSeen = rk
+  if (was !== null && `live:${was}` !== rk && was !== accountAfter && (await serverCfg($)).token)
+    void refreshAccount($)
+      .then(() => refreshBoards($))
+      .then(() => refreshStatus($))
+      .catch(() => null)
   // A loop whose timer was lost (a refused wait, a throw before it re-armed) starts again.
   await reviveLoops($)
   // The config, every poll_ms.config (another session's fresh read is taken instead of asking again).
@@ -10041,6 +10188,73 @@ async function slowSync($: $) {
   // W7-2: model calls waiting in memory go to this machine's records, so another session's scan sees them.
   if (capturing && stepsPending.length > 0) void writeCalls($)
   await refreshStatus($)
+}
+
+/**
+ * Settings' Resync: this session, and the store's ranked state, start again from what the server
+ * says. The way out of a state nothing else gets a player out of: a phase the store kept for a
+ * match that is over or was never on this server, a copy that stopped moving. Nothing is touched
+ * without a usable answer: only a 200, or a 404 for the stored match, changes anything, so a
+ * server that can't be reached, is failing (5xx) or is shedding (429) never costs a player the
+ * match they are in (the mod has no other way to find it again). A match still running is kept,
+ * its page read again from the start; a ready check still open is left as it is; a queue the
+ * server still has comes back with the queue read; a result still on screen is dismissed.
+ */
+async function resync($: $) {
+  await syncFromStore($)
+  const signedIn = !!(await serverCfg($)).token
+  const sh = await rankedShared($)
+  // Signed out there is no account or match to ask about: the season is the read that says the server answers.
+  const m = await api($, 'GET', !signedIn ? '/season' : sh.matchId ? `/matches/${sh.matchId}` : '/me')
+  if (!reachedOf(m)) {
+    $.ui.toast(IDENTITY.offline)
+    return
+  }
+  if (m.status !== 200 && !(signedIn && sh.matchId && m.status === 404)) {
+    $.ui.toast(failLine(m))
+    return
+  }
+  if (!signedIn) {
+    // The keyring may sign this install in (refreshAccount, with no token).
+    await refreshAccount($)
+    await refreshStatus($)
+    $.ui.toast(MOD.resynced)
+    return
+  }
+  const summary = sh.matchId && m.status === 200 ? (m.json as { match: ApiMatchSummary }).match : null
+  // A ready check still open: the phase and its match stay as they are (going idle and back would show the match-found toast
+  // and ring its chime again), and the queue read below brings the offer as the server has it now.
+  if (sh.phase === 'offered' && summary && summary.id === sh.matchId && summary.status === 'offered') {
+    await pollRankedNow($)
+    await refreshAccount($)
+    await refreshBoards($)
+    void refreshConfig($, 'timer').catch(() => null)
+    await flushOutbox($)
+    await reviveLoops($)
+    await refreshStatus($)
+    $.ui.toast(MOD.resynced)
+    return
+  }
+  // This session's own copies go: each is read again below.
+  await update($, link, l => ({ ...l, ranked: null, queue: null, lanes: null, lanesBucket: null, note: '' }))
+  await update($, forfeitAsk, () => false)
+  if (summary && (summary.status === 'live' || summary.status === 'grace')) {
+    const kept = await keepArtRef($, summary)
+    await setRanked($, { phase: 'live', matchId: kept.id })
+    await update($, link, l => ({ ...l, ranked: { id: kept.id, summary: kept, events: [], cursor: 0, polledAt: 0 } }))
+  } else {
+    // Idle, as far as this machine knows: the ranked loop's next read is the queue's, whatever tab is on screen.
+    await setRanked($, { phase: 'idle', matchId: null })
+    lanesOnce = true
+  }
+  await pollRankedNow($)
+  await refreshAccount($)
+  await refreshBoards($)
+  void refreshConfig($, 'timer').catch(() => null)
+  await flushOutbox($)
+  await reviveLoops($)
+  await refreshStatus($)
+  $.ui.toast(MOD.resynced)
 }
 
 async function openPane($: $, t?: Tab) {
@@ -10206,13 +10420,6 @@ async function forfeit($: $) {
   await refreshStatus($)
 }
 
-async function setHandle($: $, h: string) {
-  const name = h.trim().toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 20)
-  if (name.length < 2) return $.ui.toast('Handles are 2 to 20 of a-z, 0-9 and _.')
-  await saveSettings($, { handle: name })
-  $.ui.toast(`Handle set: ${name}`)
-}
-
 function actions($: $): Actions {
   const go = (p: Promise<unknown>) => {
     p.catch(err => $.ui.toast(`CCSR: ${clean((err as Error).message)}`))
@@ -10240,7 +10447,6 @@ function actions($: $): Actions {
     setupSeen: () => go(setupSeen($)),
     askForfeit: isAsking => go(update($, forfeitAsk, () => isAsking)),
     setPreset: preset => go(setPreset($, preset)),
-    setHandle: h => go(setHandle($, h)),
     setTracking: isOn => go(saveSettings($, { tracking: isOn }).then(() => refreshStatus($))),
     setShare: isOn => go(saveSettings($, { share: isOn })),
     setModel: m => go(saveSettings($, { model: m })),
@@ -10327,6 +10533,7 @@ function actions($: $): Actions {
     finisherAskReport: matchId => go(askArtReport($, matchId)),
     finisherReport: (matchId, reason) => go(reportArt($, matchId, reason)),
     finisherPlay: which => go(replayFinisher($, which === 'draft' ? DRAFT_PLAY : GALLERY_PLAY)),
+    resync: () => go(resync($)),
   }
 }
 
@@ -10478,7 +10685,15 @@ async function boot($: $, cwd: string) {
     captureTicking = true
     onConfigTick(() => syncCapture($))
   }
-  void syncCapture($).catch(err => $.ui.log(`CCSR eval: ${(err as Error).message}`))
+  // Usage weeks ride capture: after syncCapture on every config tick, and once at boot. Never awaited: the script may run for
+  // minutes and the post is a request. usageTick never throws.
+  if (!usageTicking) {
+    usageTicking = true
+    onConfigTick(() => void usageTick($))
+  }
+  void syncCapture($)
+    .catch(err => $.ui.log(`CCSR eval: ${(err as Error).message}`))
+    .then(() => usageTick($))
   // W4b: after every config read, the ledger kept small and the toast or flash a new notice may bring; on the config timer and at
   // boot, the stats post too (under a lease, at most one per 90 s from this store). Never awaited, as above: the post is a request.
   if (!noticeTicking) {
@@ -10568,10 +10783,6 @@ async function commandText($: $, args: string, signal?: AbortSignal): Promise<st
     else await saveSettings($, sub === 'tracking' ? { tracking: isOn } : { share: isOn })
     await refreshStatus($)
     return `${sub === 'tracking' ? 'Grind tracking' : sub === 'share' ? 'Commit titles' : sub === 'band' ? 'Band' : 'Quiet'} ${arg}.${sub === 'quiet' && isOn ? ' The band stays during a match; the match-found check always shows.' : ''}`
-  }
-  if (sub === 'handle') {
-    await setHandle($, arg)
-    return `Handle: ${arg}`
   }
   return helpText(await configOf($))
 }
