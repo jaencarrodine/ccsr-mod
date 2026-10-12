@@ -53,6 +53,8 @@ Your code never leaves your machine. Only the points do. And the trash talk.
 
 Each scored commit sends its points, category, size and author time, with salted hashes standing in for the repo and the commit. Its title goes only if you turn on title sharing. Each judge call runs on your own Claude plan, one call per new commit.
 
+With Model stats on (the default), each scored commit also sends the coding model, the effort, main session or subagent, the client and its version, and four token counts. Never a session id, a path, a command or a repo name. Model stats off stops sending it and erases it from the live database; backup copies age out on their own.
+
 Chat lives in the CCSR pane. It never reaches Claude's context, so no, you can't prompt-inject your opponent into losing.
 
 ## Settings

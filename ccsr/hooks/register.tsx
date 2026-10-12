@@ -2305,6 +2305,26 @@ async function installLabel($: $) {
   return (home && dir.startsWith(home) ? `~${dir.slice(home.length)}` : dir).slice(0, 64)
 }
 
+/**
+ * A write of the lease, the snapshot or the shared reads. The store's own failure (its lock, when
+ * many sessions write at once: "Lock file is already being held"; a full disk) is logged for
+ * debugging and never toasted: each of these is written again by a later tick, and save()'s toast
+ * came back on every one. Says whether it landed.
+ */
+async function saveQuiet($: $, key: string, value: unknown): Promise<boolean> {
+  try {
+    await $.store.set(key, value)
+    return true
+  } catch (err) {
+    try {
+      $.ui.log(`CCSR store (${key}): ${clean(String((err as Error | undefined)?.message ?? err))}`, { to: 'debug' })
+    } catch {
+      // Nowhere to say it.
+    }
+    return false
+  }
+}
+
 /** The `at` of the shared account and board reads (`seen`) this session last took or wrote. */
 let seenAt = 0
 
@@ -2320,8 +2340,8 @@ async function shareSeen($: $, part: Partial<Record<SeenField, unknown>>) {
   const cur = seenCopyOf(await storeGet<unknown>($, K.seen, null))
   const t = await $.clock.now()
   const next: SeenCopy = { ...(cur && cur.key === key ? cur : {}), ...part, key, at: Math.max(t, (cur?.at ?? 0) + 1), by: owner }
-  seenAt = next.at
-  await save($, K.seen, next)
+  // Counted as this session's only once it is in the store: a write that failed is another session's to make, or the next read's.
+  if (await saveQuiet($, K.seen, next)) seenAt = next.at
 }
 
 /**
@@ -2333,6 +2353,8 @@ async function adoptSeen($: $, except: readonly SeenField[] = []) {
   const take = seenToTake(copy, await configKey($), seenAt)
   if (!copy || !take) return
   seenAt = copy.at
+  // The account as another session read it after the result this session was waiting on: nothing is owed any more.
+  if (accountOwed && 'me' in take && copy.at >= accountOwed.since) accountOwed = null
   for (const f of except) delete take[f]
   await update($, link, l => ({
     ...l,
@@ -2351,6 +2373,16 @@ async function adoptSeen($: $, except: readonly SeenField[] = []) {
 let rankedSeen: string | null = null
 /** The match whose result this session's own poll read (pollMatch), and read the account after: slowSync has nothing to add for it. */
 let accountAfter: string | null = null
+/**
+ * The account read a decided match still owes this session: asked for by its own poll, or left to
+ * the leader's (a follower takes the leader's copy from `seen`). `since` is when the result was
+ * read. It is settled by an account read of this session's that answers, or by a copy taken from
+ * `seen` that is newer than `since`; until then slowSync asks again a minute on, a few times, so
+ * one failed read (a 5xx right after the result) doesn't leave every session on the old rating.
+ */
+let accountOwed: { id: string; since: number; tries: number } | null = null
+const ACCOUNT_OWED_MS = 60_000
+const ACCOUNT_OWED_TRIES = 5
 
 /**
  * Who we are and the season's judge, from the server, into this session's
@@ -2367,6 +2399,8 @@ async function refreshAccount($: $) {
   const askedAt = await $.clock.now()
   const me = await api($, 'GET', '/me')
   if (me.status === 200) {
+    // Asked after the result it was owed for: settled.
+    if (accountOwed && askedAt >= accountOwed.since) accountOwed = null
     // W3b: where you stand in each bucket on for you (W3a), read through standingFor; a server before W3a sends none.
     const kept = (me.json as { buckets?: unknown } | null)?.buckets
     await update($, link, l => ({ ...l, meBuckets: Array.isArray(kept) ? kept.slice(0, 8) : null }))
@@ -4322,16 +4356,31 @@ async function leadMsNow($: $, failed = 0, retryAfter?: number | null) {
 /** Takes or keeps the lease for this tick, and says whether this session leads. `force` (a press here) takes it from whoever has it. */
 async function leadTick($: $, force = false): Promise<boolean> {
   const t = await $.clock.now()
-  const take = takeLead(leadOf(await storeGet<unknown>($, K.rankedLead, null)), owner, t, await leadMsNow($), force)
+  const held = await leadRead($)
+  // The lease can't be read: lead. It fails open throughout: two pollers for a tick beat none for as long as the store is in trouble.
+  if (!held.ok) return true
+  const take = takeLead(held.lead, owner, t, await leadMsNow($), force)
   if (!take.write) return take.lead
-  await save($, K.rankedLead, take.write)
+  // The write didn't land (the store's lock, under many sessions): this session leads this tick anyway. Read back as another
+  // session's, a dead leader's lease would never be replaced, and a live match would have no poller at all.
+  if (!(await saveQuiet($, K.rankedLead, take.write))) return true
   // Two sessions that take a free lease in the same moment both write: the store keeps one, and the other follows.
-  return leadOf(await storeGet<unknown>($, K.rankedLead, null))?.by === owner
+  const now = await leadRead($)
+  return !now.ok || now.lead?.by === owner
+}
+
+/** The lease as the store has it; `ok` false when the store couldn't be read. */
+async function leadRead($: $): Promise<{ ok: boolean; lead: ReturnType<typeof leadOf> }> {
+  try {
+    return { ok: true, lead: leadOf(await storeGet<unknown>($, K.rankedLead, null)) }
+  } catch {
+    return { ok: false, lead: null }
+  }
 }
 
 /** Gives the lease up when it is this session's, so the next session to tick takes it at once instead of waiting it out. */
 async function dropLead($: $) {
-  if (leadOf(await storeGet<unknown>($, K.rankedLead, null))?.by === owner) await save($, K.rankedLead, { by: owner, until: 0 })
+  if ((await leadRead($)).lead?.by === owner) await saveQuiet($, K.rankedLead, { by: owner, until: 0 })
 }
 
 /** What this session holds of the queue, the lanes and the match goes into the store for every session, when it moved (or every SHARE_BEAT_MS). */
@@ -4344,10 +4393,12 @@ async function shareRanked($: $) {
   const json = shareBody(body)
   const t = await $.clock.now()
   if (json === shareKnown && t - shareAt < SHARE_BEAT_MS) return
+  const rev = `${owner}:${t}:${++shareCount}`
+  // Recorded as written only once it is: a write that failed (the store's lock) is made again by the next call, not taken for done.
+  if (!(await saveQuiet($, K.rankedShare, { rev, at: t, by: owner, ...body }))) return
   shareKnown = json
   shareAt = t
-  shareRev = `${owner}:${t}:${++shareCount}`
-  await save($, K.rankedShare, { rev: shareRev, at: t, by: owner, ...body })
+  shareRev = rev
 }
 
 /**
@@ -4369,8 +4420,12 @@ async function applyShare($: $) {
     const { art, ...page } = sent
     ranked = page
     artWanted = art === true && !artAsked.has(sent.id) ? sent.id : null
-    // Decided, and read by the session that leads: it reads the account after it and shares that too (adoptSeen).
-    if (sent.summary?.status === 'finished' || sent.summary?.status === 'void') accountAfter = sent.id
+    // Decided, and read by the session that leads: it reads the account after it and shares that too (adoptSeen). Owed here until
+    // a copy newer than this snapshot is taken: slowSync asks itself if none comes (the leader's one read may have failed).
+    if ((sent.summary?.status === 'finished' || sent.summary?.status === 'void') && accountAfter !== sent.id) {
+      accountAfter = sent.id
+      if (seenAt < s.at) accountOwed = { id: sent.id, since: s.at, tries: 0 }
+    }
   }
   const lanes = s.lanes as ApiLane[] | null
   await update($, link, l => ({ ...l, queue: s.queue as ApiQueueState | null, ranked, ...(lanes ? { lanes, lanesBucket: s.lanesBucket } : {}) }))
@@ -4398,7 +4453,12 @@ async function followRanked($: $) {
     const m = await api($, 'GET', `/matches/${id}`, undefined, { keepNote: true })
     if (m.status === 200) await keepArtRef($, (m.json as { match: ApiMatchSummary }).match)
   }
-  if ((sh.phase === 'idle' || sh.phase === 'done') && !lanesOnce && !(await lanesWatched($))) stopPolling()
+  // Decided, and this session has no result to draw yet: the loop goes on. The leader writes the phase and the snapshot apart, and a
+  // tick that lands between them used to stop here for good, with the bell on screen (PR 73's bug, for a follower). The snapshot is
+  // taken when it lands; and if it never does (the leader died at the result, its write failed, or it is a mod from before
+  // snapshots), the lease runs out, this session takes it and reads the result itself (leadRanked's late read).
+  const owed = sh.phase === 'done' && sh.matchId ? await resultMissing($, sh.matchId) : null
+  if ((sh.phase === 'idle' || sh.phase === 'done') && !owed && !lanesOnce && !(await lanesWatched($))) stopPolling()
   await refreshStatus($)
 }
 
@@ -4414,12 +4474,12 @@ async function pollRanked($: $, isCurrent: () => boolean): Promise<Answer | void
   // A tick given up on publishes nothing, nor one whose lease a press in another session took while its request was out.
   if (!stopped && !isCurrent()) return r
   const t = await $.clock.now()
-  if (ledByOther(leadOf(await storeGet<unknown>($, K.rankedLead, null)), owner, t)) return r
+  if (ledByOther((await leadRead($)).lead, owner, t)) return r
   await shareRanked($)
   // Nothing left to poll here: the lease goes, so a session with the Match tab on screen takes it at its next tick.
   if (stopped) await dropLead($)
   // Backing off: the lease is held through the wait the loop takes next, so no follower takes a turn at a server that is down or shedding.
-  else if (r && retryable(r.status)) await save($, K.rankedLead, { by: owner, until: t + (await leadMsNow($, 1, r.retryAfterMs ?? null)) })
+  else if (r && retryable(r.status)) await saveQuiet($, K.rankedLead, { by: owner, until: t + (await leadMsNow($, 1, r.retryAfterMs ?? null)) })
   return r
 }
 
@@ -4661,6 +4721,9 @@ async function pollMatch($: $, id: string, isCurrent: () => boolean, late: 'open
     if (left <= warn) await checkDirty($)
   }
   if (s.status === 'finished' || s.status === 'void') {
+    // What every other session draws goes out before the phase does, and before the toast and the result's sound (which is awaited
+    // to its end, up to two seconds): a follower that found done with no result to draw yet sat between the two writes.
+    await shareRanked($)
     // A late read leaves the store alone: it already said done, and since then another session may have dismissed the result or queued again.
     if (!late) await setRanked($, { phase: 'done', matchId: id })
     // Decided: the loop's next tick reads the lanes (for Queue again) if the Match tab is on screen, else stops.
@@ -4674,8 +4737,12 @@ async function pollMatch($: $, id: string, isCurrent: () => boolean, late: 'open
       // W4b: the notices' result trigger, then placed, or tier up or down (before GET /me is read again below).
       void noticeMatchEnd($, s, me).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
     }
+    // The account after the result: owed until a read answers (refreshAccount settles it), so one failed read is asked again by slowSync.
+    if (accountAfter !== id) accountOwed = { id, since: t, tries: 0 }
     accountAfter = id
-    void refreshAccount($).then(() => refreshBoards($))
+    void refreshAccount($)
+      .then(() => refreshBoards($))
+      .catch(() => null)
   }
   await refreshStatus($)
   return r
@@ -10385,6 +10452,15 @@ async function slowSync($: $) {
       .then(() => refreshBoards($))
       .then(() => refreshStatus($))
       .catch(() => null)
+  // The account a result still owes this session (accountOwed): no read of its own answered and no newer copy came from the session
+  // that read the result. Asked for a minute on, and again each minute a few times: the status line and the cards follow.
+  else if (accountOwed && t - accountOwed.since >= ACCOUNT_OWED_MS && (await serverCfg($)).token) {
+    accountOwed = accountOwed.tries + 1 >= ACCOUNT_OWED_TRIES ? null : { ...accountOwed, since: t, tries: accountOwed.tries + 1 }
+    void refreshAccount($)
+      .then(() => refreshBoards($))
+      .then(() => refreshStatus($))
+      .catch(() => null)
+  }
   // A loop whose timer was lost (a refused wait, a throw before it re-armed) starts again.
   await reviveLoops($)
   // The config, every poll_ms.config (another session's fresh read is taken instead of asking again).
