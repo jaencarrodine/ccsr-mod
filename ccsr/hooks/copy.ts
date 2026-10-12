@@ -570,7 +570,7 @@ export const SURFACE_WHAT: Record<SurfaceKey, string> = {
   bandMatch: 'The band while queued, racing and for the result. The ready check still shows.',
   bandChat: 'The newest chat line beside the score. Chat stays in the pane.',
   toasts: 'Match only keeps opponent found, the 10 and 1 minute warnings, the result and going offline. Off keeps opponent found only.',
-  sounds: 'The chime, the bell at 1:00 and the result sting.',
+  sounds: 'The chime, the clock at 1:00 and the result sting.',
   notices: 'Banners, cards and lines from CCSR, like a new season or an outage. Important only keeps warnings and outages. Off keeps outages, in the Match tab.',
   status: 'Short is the score and clock only, about 20 characters.',
   mode: 'The CCSR badge at the right of the prompt footer.',

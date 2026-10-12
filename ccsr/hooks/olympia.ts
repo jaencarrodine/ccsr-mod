@@ -390,16 +390,39 @@ export function tierBadge(key: TierKey, size = 64) {
 
 // ------------------------------------------------------------------ pane chrome
 
-/** The pane header: the CCSR mark, wordmark, one status line, your tier badge, a meander. */
-export function banner(a: { sub: string; tier?: TierKey }) {
+/**
+ * A line cut to a width: the type steps down to `min` first, then the text ends in an ellipsis.
+ * Fonts don't load inside Svg, so the width is the ui-monospace fallback's, 0.61 em a character.
+ */
+function fit(t: string, w: number, s: number, min = s) {
+  const ch = [...t]
+  const at = (size: number) => ch.length * size * 0.61
+  if (at(s) <= w) return { t, s }
+  const sz = Math.max(min, Math.floor((w / at(1)) * 10) / 10)
+  if (at(sz) <= w) return { t, s: sz }
+  return { t: ch.slice(0, Math.max(1, Math.floor(w / (min * 0.61)) - 1)).join('') + '…', s: min }
+}
+
+/**
+ * The pane header: the CCSR mark, wordmark, your handle over one status line, your tier badge, a
+ * meander. With no handle the status line stands alone. Nothing on the right crosses the wordmark:
+ * each line is cut to the room it has (fit), so a 20 character handle or a five figure Grind still fits.
+ */
+export function banner(a: { sub: string; handle?: string; tier?: TierKey }) {
   const h = 86
   let s = `<g transform="translate(16 14)"><circle cx="20" cy="20" r="19" fill="${C.ink}" stroke="${C.bone}" stroke-width=".8"/><circle cx="20" cy="20" r="15.6" fill="none" stroke="${C.bone}" stroke-width=".9" stroke-dasharray="1.6 1.6"/><rect x="11" y="11.2" width="18" height="2.2" fill="${C.bone}"/><circle cx="13.6" cy="15.6" r="2.3" fill="none" stroke="${C.bone}" stroke-width="1"/><circle cx="26.4" cy="15.6" r="2.3" fill="none" stroke="${C.bone}" stroke-width="1"/><rect x="15.2" y="14.6" width="9.6" height="13" fill="${C.or}"/><path d="M17.6 15.2v12M20 15.2v12M22.4 15.2v12" stroke="${C.ink}" stroke-width=".8"/><rect x="13.4" y="27.6" width="13.2" height="2" fill="${C.bone}"/></g>`
   s += T(66, 36, 'CCSR', { s: 24, w: 700, c: C.bone, ls: 2 }) + T(66, 51, 'CLAUDE CODE SHIP RACE', { s: 8, c: C.stone, ls: 2 })
   const right = a.tier ? 406 : 464
-  s += T(right, 30, a.sub, { s: 10.5, c: C.bone2, a: 'end' }) + T(right, 46, '{ ccsr.gg }', { s: 8.5, c: C.stone, a: 'end' })
+  // CCSR ends at 132 and the lines beside it start past 142; { ccsr.gg } sits beside the tagline, which ends at 209.
+  const line = (y: number, t: string, s: number, min: number, o: TextOpts) => {
+    const x = fit(t, right - 142, s, min)
+    return T(right, y, x.t, { ...o, s: x.s, a: 'end' })
+  }
+  if (a.handle) s += line(22, a.handle, 11.5, 9, { w: 600, c: C.bone }) + line(36, a.sub, 9.5, 8, { c: C.bone2 }) + T(right, 51, '{ ccsr.gg }', { s: 8.5, c: C.stone, a: 'end' })
+  else s += line(30, a.sub, 10.5, 8, { c: C.bone2 }) + T(right, 46, '{ ccsr.gg }', { s: 8.5, c: C.stone, a: 'end' })
   if (a.tier) s += badgeAt(a.tier, 420, 8, 40)
   s += `<rect x="0" y="${h - 16}" width="${W}" height="16" fill="${C.ink}"/>${meander(4, h - 15, W - 8, C.or)}`
-  return svg(W, h, `CCSR. ${a.sub}`, s, C.ink2)
+  return svg(W, h, `CCSR. ${a.handle ? `${a.handle} · ` : ''}${a.sub}`, s, C.ink2)
 }
 
 export type Tab = 'match' | 'ranked' | 'grind' | 'chat' | 'settings'

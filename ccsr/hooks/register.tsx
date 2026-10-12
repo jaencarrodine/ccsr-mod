@@ -6978,15 +6978,18 @@ export async function renderPane($: $, e: RenderInput<'Pane'>, a: Actions): Prom
 
   const me = l.me
   const placing = me?.placement ?? null
-  const who = me ? `${me.handle} · ${placing ? `Mud, placing ${placing.played} of ${placing.of}` : `${me.tier} ${me.rating}`}` : `${s.handle} · ${tierOf(r)} ${r} practice`
-  const sub = `${who} · Grind ${wk.points}${l.grindRank ? ` · #${l.grindRank}` : ''}`
+  const handle = me ? me.handle : s.handle
+  const standing = me ? (placing ? `Mud, placing ${placing.played} of ${placing.of}` : `${me.tier} ${me.rating}`) : `${tierOf(r)} ${r} practice`
+  // The banner draws the handle on its own line over the rest; the alt and the terminal's line read as one.
+  const line = `${standing} · Grind ${wk.points}${l.grindRank ? ` · #${l.grindRank}` : ''}`
+  const sub = `${handle} · ${line}`
   const tierK: TierKey = me ? (placing ? 'mud' : (me.tier.toLowerCase() as TierKey)) : tierKey(r)
   // W10b: the Finishers view opens from Settings, so Settings stays lit over it.
   const framed = cur === 'backtest' ? 'grind' : cur === 'lab' || cur === 'finishers' ? 'settings' : cur
   return (
     <Box flexDirection="column" gap={1}>
       {rich ? (
-        <Svg source={banner({ sub, tier: tierK })} alt={`CCSR. ${sub}`} />
+        <Svg source={banner({ handle, sub: line, tier: tierK })} alt={`CCSR. ${sub}`} />
       ) : (
         <Box gap={1}>
           <Text bold color={ORANGE}>
