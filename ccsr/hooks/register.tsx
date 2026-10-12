@@ -128,8 +128,8 @@ import type { Call, Client, CoderBlock, Effort } from './coder'
 // W7-3: the transcript fallback (dark, behind config's eval_backfill).
 import { BACKGROUND_MS, FILES_PER_SCAN, SESSIONS_MAX, TWINS_MAX, backfillOn, callsFromTranscript, isSubagentFile, mergeTranscripts, projectDirOf, readPlan, subfolderPrefixOf, transcriptsDirOf } from './transcripts'
 import type { TranscriptCall, TranscriptFile } from './transcripts'
-// Usage weeks (the usage lift study): dark, behind config's eval_usage.
-import { USAGE_SCRIPT, USAGE_STRIKES, USAGE_TIMEOUT_MS, isTransientUsageFailure, readUsage, usageAnswer, usageBody, usageDue, usageOn, usagePlan, usageState, usageWeeks } from './usage'
+// Usage weeks (the usage lift study): dark, behind config's eval_weeks.
+import { USAGE_SCRIPT, USAGE_STRIKES, USAGE_TIMEOUT_MS, afterPost, coverDays, holdWeeks, isTransientUsageFailure, readUsage, retentionDays, usageAnswer, usageBody, usageDue, usageOn, usagePlan, usageState, usageWeeks } from './usage'
 import type { UsageState, UsageWeek } from './usage'
 // The watch list: the repos a commit can land in, found from the Bash hook and Claude Code's own transcripts.
 import { LOOK_EVERY_MS, LOOK_MINUTES, LOOK_SCRIPT, LOOK_STRIKES, SEED_DAYS, SEED_FLIGHT_MS, SEED_RETRY_MS, SEED_SCRIPT, dirsFromLook, gitDirs, isCommitCommand, isTempDir, isTransientLookFailure } from './repos'
@@ -271,7 +271,7 @@ const K = {
   modelStats: 'modelStats',
   // The watch list's look at Claude Code's transcripts: `{ seeded, tried, failed, at }`, when this install's seed ran, when an attempt last began, when one last failed, and when any session here last looked, so one session looks at a time.
   repoLook: 'repoLook',
-  // Usage weeks: `{ key: '<server url>|<handle>', anchor, through, tried, failed }`, the account's anchor as the server gave it, the newest week this install has handled, and when a run last began and last failed, so one session runs at a time.
+  // Usage weeks: `{ key: '<server url>|<handle>', anchor, through, held, again, tried, failed }`: the account's anchor as the server gave it, the newest week this install has read, the weeks read and not sent yet (weekly totals only, waiting for the account's first finished match), a week being sent once more, and when a run last began and last failed, so one session runs at a time.
   usage: 'usage',
   // One ranked poller per machine (lead.ts): who polls the queue and the match now (`{ by, until }`), what that session last read
   // (the queue state, the lanes and the match page, with a rev), and what any session's account and board reads found, for the rest.
@@ -3448,6 +3448,8 @@ async function syncCapture($: $) {
   const stats = await modelStatsOf($, cfg)
   const on = !!cfg.token && known && captureOn(held.raw) && stats !== false
   captureKnown = known || stats === false
+  // Usage weeks: Model stats off takes the weeks read and not sent yet with it (the player's own switch; a flag going off only makes them wait).
+  if (stats === false) await dropHeldUsage($).catch(() => undefined)
   // W7-3: the transcript fallback rides capture, and follows config's eval_backfill on every read.
   backfilling = on && backfillOn(held.raw)
   if (on === capturing) {
@@ -3706,19 +3708,89 @@ async function madeHere($: $, root: string): Promise<Set<string>> {
 
 // ------------------------------------------------------------------ usage weeks (usage.ts)
 // Dark: only while capture is on here (signed in, config's eval_capture, Model stats not off)
-// and config's eval_usage is. Once per install, then once a week: `sh` adds up Claude Code's
+// and config's eval_weeks is. Once per install, then once a week: `sh` adds up Claude Code's
 // own transcripts under this config dir by week, counted from the anchor the server holds for
-// the account (its first install), and the totals go to POST /usage: for the four weeks before
-// the anchor and each week since, the days the transcripts cover, the days with a call and four
-// token counts. Nothing else is read from a transcript, and nothing the script prints but
-// those sums reaches the mod. One session per machine runs it at a time (the store's `usage`),
-// a failure waits six hours, and a machine with no `sh` never sends a row. Never awaited by a
-// tick: the script may run for minutes, and the post is a request.
+// the account (its first install): for the four weeks before the anchor and each week since,
+// the days the transcripts cover, the days with a call and four token counts. Nothing else is
+// read from a transcript, and nothing the script prints but those sums reaches the mod. The
+// baseline is read at install, while the transcripts still reach back, and its totals wait in
+// the store: nothing is posted to POST /usage until GET /me says the account has a match
+// played (the setup pane and Settings say what will go, and Model stats turns it off). One
+// session per machine runs it at a time (the store's `usage`), a failure waits six hours, and
+// a machine with no `sh` never sends a row. Never awaited by a tick: the script may run for
+// minutes, and the post is a request.
+
+/** Claude Code's cleanupPeriodDays for this config dir (its settings.json beside the transcripts folder), 30 when it doesn't say. */
+async function transcriptRetention($: $, projects: string) {
+  const text = await $.fs.read(`${projects.replace(/[\\/]projects$/, '')}/settings.json`).catch(() => null)
+  return retentionDays(typeof text === 'string' ? text : null)
+}
+
+/** Whether usage weeks may still run and send for `key`: capture on in this session, Model stats not off in the store (another session, or another install's word, may have turned it off), config's eval_weeks on, and the same account signed in. Read again before every step that keeps or sends anything. */
+async function usageStillOn($: $, key: string) {
+  return capturing && (await modelStatsOf($)) !== false && usageOn((await read($, config)).raw) && keyOf(await serverCfg($)) === key
+}
 
 /**
- * One pass: nothing unless a week is waiting. The anchor is asked for once, then the script
- * runs over the weeks not handled yet, and their rows are posted. A week is handled once it is
- * posted, or once it has no day the transcripts cover (no row to send). Never throws.
+ * A reason to look, never leave to send: this session's own copy of GET /me says the account
+ * signed in here has a match played. The copy must be that account's own (another session may
+ * have signed this config dir into a different one since), and the post asks the server again.
+ */
+async function usagePlayed($: $, server: Pick<ServerConfig, 'handle'>) {
+  const me = (await read($, link)).me
+  return !!me && !!server.handle && me.handle === server.handle && (me.matches_played ?? 0) >= 1
+}
+
+/**
+ * The last word before a post: GET /me, asked now, for the account the held weeks belong to.
+ * `as` pins the request to the server and token the pass began with (api() would otherwise read
+ * the store again as it sends, and a sign-out, a Join or a server switch in another session
+ * changes it). The weeks go only when that token is still the one signed in, the account has a
+ * match played, and Model stats isn't off, here or on another install. Its answer is this
+ * session's copy from then on, and Model stats off there stops capture and drops the held
+ * weeks (syncCapture).
+ */
+async function usageMayPost($: $, key: string, as: { url: string; token: string; keepNote: true }) {
+  if (!(await usageStillOn($, key))) return false
+  const r = await api($, 'GET', '/me', undefined, as)
+  if (r.status !== 200) throw new Error(`GET /me answered ${r.status}`)
+  const signed = await serverCfg($)
+  if (signed.token !== as.token || signed.url !== as.url || keyOf(signed) !== key) return false
+  const j = r.json as { player?: ApiPlayer; settings?: { model_stats?: unknown } } | null
+  if (j?.player && typeof j.player === 'object') await update($, link, l => ({ ...l, me: j.player as ApiPlayer }))
+  const stats = j?.settings?.model_stats
+  if (typeof stats === 'boolean') {
+    await holdModelStats($, stats)
+    await syncCapture($)
+  }
+  return stats !== false && (j?.player?.matches_played ?? 0) >= 1 && (await usageStillOn($, key))
+}
+
+/** Model stats went off: the weeks read and not sent yet go too. Nothing else changes, so nothing is read twice if it comes back. */
+async function dropHeldUsage($: $) {
+  const raw = await storeGet<unknown>($, K.usage, null)
+  const held = (raw as { held?: unknown } | null)?.held
+  if (Array.isArray(held) && held.length > 0) await save($, K.usage, { ...(raw as object), held: [], again: null })
+}
+
+/**
+ * Changes the store's `usage` as it is now, never as a pass read it minutes ago: Model stats
+ * off may have dropped the held weeks meanwhile, and a pass must not write them back. Once
+ * another account is signed in here the store is no longer this pass's to write.
+ */
+async function usagePut($: $, key: string, change: (now: UsageState) => UsageState): Promise<UsageState> {
+  const now = usageState(await storeGet<unknown>($, K.usage, null), key)
+  if (keyOf(await serverCfg($)) !== key) return now
+  const next = change(now)
+  await save($, K.usage, next)
+  return next
+}
+
+/**
+ * One pass: nothing unless there is something to do. The anchor is asked for once. Then the
+ * script runs over the weeks not read yet, and their totals join the held weeks. Then, only
+ * once the server says the account has a finished match, the held weeks are posted, and they
+ * leave the store when the server holds them (or kept less of them twice). Never throws.
  */
 async function usageTick($: $) {
   if (usageRunning || usageFails >= USAGE_STRIKES || !capturing) return
@@ -3726,46 +3798,65 @@ async function usageTick($: $) {
   try {
     const cfg = await serverCfg($)
     if (!cfg.token || !usageOn((await read($, config)).raw)) return
+    // Every request of this pass goes to the server and with the token it began with, whatever the store says by then:
+    // weeks read under one account are never sent as another's.
+    const as = { url: cfg.url, token: cfg.token, keepNote: true } as const
     const key = keyOf(cfg)
     let s: UsageState = usageState(await storeGet<unknown>($, K.usage, null), key)
     const began = await $.clock.now()
-    if (!usageDue(s, began)) return
-    s = { ...s, tried: began }
-    await save($, K.usage, s)
+    // The anchor and the weeks are the server's: its time is the local clock plus the config read's skew.
+    if (!usageDue(s, { now: began, serverNow: began + configSkewMs(), played: await usagePlayed($, cfg) })) return
+    s = await usagePut($, key, now => ({ ...now, tried: began }))
     try {
       if (s.anchor === null) {
-        const r = await api($, 'GET', '/usage', undefined, { keepNote: true })
+        const r = await api($, 'GET', '/usage', undefined, as)
         const got = r.status === 200 ? usageAnswer(r.json) : null
         if (!got) throw new Error(`GET /usage answered ${r.status}`)
-        // The newest week the server holds for this install is handled, whatever this store says (a store wiped since).
-        s = { ...s, anchor: got.anchor, through: got.through === null ? s.through : Math.max(got.through, s.through ?? got.through) }
-        await save($, K.usage, s)
+        // The newest week the server holds for this install is read already, whatever this store says (a store wiped since).
+        s = await usagePut($, key, now => ({ ...now, anchor: got.anchor, through: got.through === null ? now.through : Math.max(got.through, now.through ?? got.through) }))
       }
-      const anchor = s.anchor as number
-      const plan = usagePlan({ anchor, through: s.through, now: await $.clock.now() })
+      const anchor = s.anchor
+      if (anchor === null) return
+      const plan = usagePlan({ anchor, through: s.through, now: (await $.clock.now()) + configSkewMs() })
       if (plan) {
         let rows: UsageWeek[] = []
         if (plan.readDays > 0) {
           const base = await projectsDir($)
           if (!base) throw new Error('no transcripts folder')
-          const r = await $.process.run(['sh', '-c', USAGE_SCRIPT, 'sh', base, String(plan.readDays), String(plan.coverDays)], { timeoutMs: USAGE_TIMEOUT_MS })
+          const retention = await transcriptRetention($, base)
+          const r = await $.process.run(['sh', '-c', USAGE_SCRIPT, 'sh', base, String(plan.readDays), String(Math.max(0, Math.min(plan.readDays, retention - 1)))], { timeoutMs: USAGE_TIMEOUT_MS })
           if (r.exitCode !== 0) throw new Error(`sh exited ${r.exitCode}`)
           const got = r.isStdoutTruncated ? null : readUsage(r.stdout)
           if (!got) throw new Error('output not whole')
-          rows = usageWeeks(got, { anchor, first: plan.first, last: plan.last, now: await $.clock.now() })
+          rows = usageWeeks(got, { anchor, first: plan.first, last: plan.last, now: (await $.clock.now()) + configSkewMs(), cover: coverDays(got, retention) })
         }
-        // Capture went off while the script ran (Model stats off, the flag off, signed out): nothing is sent, and the weeks wait.
-        if (!capturing || keyOf(await serverCfg($)) !== key) {
-          await save($, K.usage, { ...s, tried: 0 })
+        // A switch moved while the script ran (Model stats off, either flag off, signed out): nothing is kept of the read, and the weeks wait.
+        if (!(await usageStillOn($, key))) {
+          await usagePut($, key, now => ({ ...now, tried: 0 }))
           return
         }
-        if (rows.length > 0) {
-          const r = await api($, 'POST', '/usage', usageBody(rows), { keepNote: true })
-          if (r.status !== 200) throw new Error(`POST /usage answered ${r.status}`)
-        }
-        s = { ...s, through: plan.last }
+        // Read: the totals wait here, and the weeks are never read again.
+        s = await usagePut($, key, now => ({ ...now, through: plan.last, held: holdWeeks(now.held, rows) }))
       }
-      await save($, K.usage, { ...s, tried: 0, failed: 0 })
+      // Sent only once the server says, now, that this account has a finished match and Model stats on.
+      if (s.held.length > 0 && (await usageMayPost($, key, as))) {
+        const sending = usageState(await storeGet<unknown>($, K.usage, null), key).held
+        const newest = sending.at(-1)
+        if (newest) {
+          const r = await api($, 'POST', '/usage', usageBody(sending), as)
+          const got = r.status === 200 ? usageAnswer(r.json) : null
+          if (!got) throw new Error(`POST /usage answered ${r.status}`)
+          // The server says what it holds: less than was sent is sent once more on a later run, then let go.
+          let again = false
+          await usagePut($, key, now => {
+            const after = afterPost(now, { sent: newest.week, held: got.through })
+            again = after.again
+            return after.again ? { ...after.state, tried: 0, failed: began } : after.state
+          })
+          if (again) return
+        }
+      }
+      await usagePut($, key, now => ({ ...now, tried: 0, failed: 0 }))
       usageFails = 0
     } catch (err) {
       const message = clean(String((err as Error | undefined)?.message ?? err))
@@ -3773,7 +3864,7 @@ async function usageTick($: $) {
       const again = isTransientUsageFailure(message) || / answered \d+$/.test(message)
       usageFails = again ? usageFails + 1 : USAGE_STRIKES
       $.ui.log(`CCSR usage: failed${usageFails >= USAGE_STRIKES ? ', no more tries this session' : ''}: ${message}`, { to: 'debug' })
-      await save($, K.usage, { ...s, tried: 0, failed: again ? began : s.failed })
+      await usagePut($, key, now => ({ ...now, tried: 0, failed: again ? began : now.failed }))
     }
   } catch (err) {
     $.ui.log(`CCSR usage: ${clean(String((err as Error | undefined)?.message ?? err))}`, { to: 'debug' })
@@ -7596,6 +7687,9 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
   const s = await read($, settings)
   const draft = await read($, chatDraft)
   const me = cfg.handle ?? ''
+  // Usage weeks: while both switches are on for everyone, the setup pane says what Model stats will send, before a handle is picked.
+  const setupRaw = !cfg.token || l.unknownToken ? (await configOf($)).raw : null
+  const setupUsage = !!setupRaw && captureOn(setupRaw) && usageOn(setupRaw)
 
   if (!cfg.token || l.unknownToken)
     return (
@@ -7624,6 +7718,11 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
           <Button key="setup-share-off" label="Off" variant={s.share ? 'secondary' : 'primary'} onPress={() => a.setShare(false)} />
         </Box>
         <Text dimColor>{LINES.privacy}</Text>
+        {setupUsage && (
+          <Text key="setup-usage" dimColor wrap="wrap">
+            {EVAL.usageSetup}
+          </Text>
+        )}
         <Text dimColor>{MOD.autoUpdate}</Text>
       </Box>
     )

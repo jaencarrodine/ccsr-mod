@@ -219,7 +219,7 @@ export function privacyLines(cfg: ModConfig, rubric: string): string[] {
   if (captureOn(cfg.raw)) lines.push(EVAL.privacy)
   // W7-3: while the transcript fallback is on too, that the mod looks in Claude Code's logs here, and what it keeps from them.
   if (captureOn(cfg.raw) && backfillOn(cfg.raw)) lines.push(EVAL.logs)
-  // Usage weeks: while eval_usage is on too, that the mod adds up Claude Code's logs here by week, and what it sends of them.
+  // Usage weeks: while eval_weeks is on too, that the mod adds up Claude Code's logs here by week, what it sends of them, and that Off erases them.
   if (captureOn(cfg.raw) && usageOn(cfg.raw)) lines.push(EVAL.usage)
   // W4b: a server with notices (W4a) gets their counts back: ids and counts, never their words.
   if (Array.isArray(cfg.raw.notices)) lines.push(NOTICE.privacy)
@@ -368,9 +368,12 @@ export const EVAL = {
     'With Model stats on, each scored commit also sends the coding model, the effort, main session or subagent, the client and its version, and four token counts. Never a session id, a path, a command or a repo name.',
   /** W7-3: the transcript fallback, while config's eval_backfill is on too (dark, QA only). */
   logs: "With Model stats on, a scored commit with no call record takes its model from Claude Code's logs on this machine. From them the mod keeps only ids, times, the model, main session or subagent, the client and its version, and token counts. Never a prompt, a reply or code.",
-  /** Usage weeks, while config's eval_usage is on too. */
+  /** Usage weeks, while config's eval_weeks is on too: Settings' What leaves your machine. It says what Off does, since Model stats off is the only way to erase them. */
   usage:
-    "With Model stats on, the mod also adds up your Claude Code use by week, from four weeks before you joined, and sends only the totals: the days it could read, the days you used it, and four token counts. It reads Claude Code's logs on this machine for them. Never a prompt, a reply, code, a model or a repo.",
+    "With Model stats on, the mod also adds up your Claude Code use by week, from four weeks before you joined, and sends only the totals, after your first finished match: the days it could read, the days you used it, and four token counts. It reads Claude Code's logs on this machine for them. Never a prompt, a reply, code, a model or a repo. Model stats off stops it and erases the totals from the live database.",
+  /** Usage weeks on the setup pane, under the privacy line, before a handle is picked: what will go, when, and where the off switch is. */
+  usageSetup:
+    'With Model stats on, the mod also sends weekly totals of your Claude Code use, from four weeks before you join: days and token counts, never code. The first go after your first finished match. Model stats in Settings turns it off.',
 }
 
 // ------------------------------------------------------------------ notices
