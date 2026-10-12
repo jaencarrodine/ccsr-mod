@@ -119,6 +119,7 @@ import type { SurfaceKey } from './copy'
 // W5b: sign-in with a provider's device flow (`type Provider` comes from W3b's import block, above).
 import { IDENTITY, PROVIDER_NAMES } from './copy'
 import { SHARE_BEAT_MS, leadMs, leadOf, ledByOther, seenCopyOf, seenToTake, shareBody, shareOf, takeLead } from './lead'
+import { steady } from './steady'
 import type { SeenCopy, SeenField } from './lead'
 import { PROVIDERS, safeLink } from './actions'
 import { PROVIDER_HOSTS, cancelSignIn, choose, conflictChoices, dismissSignIn, flowIdOf, IDLE as SIGNIN0, join as joinFlow, linkedLogin, newInstallsVia, onJoin, onPoll, onResolve, onStart, onTick, pollDue, refLinked, signinMode, startSignIn as pressSignIn, tokenlessStart } from './identity'
@@ -1946,6 +1947,8 @@ async function calibrate($: $, count: number, runs: number, days: number, pairs:
 
 const SERVER0: ServerConfig = { url: DEFAULT_SERVER, token: null, handle: null }
 let flushing: Promise<void> | null = null
+/** The timer for the outbox's earliest retry while a ranked match is live or counting (flushOnce). */
+let flushSoon: { cancel: () => void } | null = null
 
 async function serverCfg($: $) {
   return { ...SERVER0, ...(await storeGet<Partial<ServerConfig>>($, K.server, {})) }
@@ -3393,6 +3396,15 @@ async function flushOnce($: $) {
     grindRank: reply ? reply.grind_week_rank : l.grindRank,
     note: refused.length ? `The server refused ${refused.length} score${refused.length === 1 ? '' : 's'} (${refused.slice(0, 2).join(', ')}); they count here only.` : l.note,
   }))
+  // A retry's backoff (2, 4, 8 s, then 15) had nothing to fire it: the next flush was the next score or slowSync's, 30 s on,
+  // so about two tries in a 1 minute grace. While a ranked match is live or counting, the earliest retry gets its own timer
+  // (PR 88's review, G3). One timer: a later flush that leaves retries sets it again.
+  const ranked = (await read($, link)).ranked?.summary?.status
+  if (retry.size > 0 && (ranked === 'live' || ranked === 'grace')) {
+    const at = Math.min(...[...retry.values()].map(x => x.nextAt))
+    flushSoon?.cancel()
+    flushSoon = $.clock.after(Math.max(250, at - (await $.clock.now())), () => void flushOutbox($).catch(() => null))
+  }
 }
 
 // ------------------------------------------------------------------ eval capture (W7-2)
@@ -4328,6 +4340,14 @@ async function reviveLoops($: $) {
 const RANKED0: RankedShared = { phase: 'idle', matchId: null, lengthsMin: null, queuedMin: [], since: 0, bucket: null }
 let stopRankedPoll: (() => void) | null = null
 const rankedWarned = new Set<string>()
+/** Between the scans a ranked match asks for near its bell and through its grace (scanNearBell). */
+const BELL_SCAN_MS = 15_000
+/** The match those scans are for, when the last one began, and whether its bell has had its own. */
+let bellScan = { id: '', at: 0, rung: false }
+/** The timer that scans at a ranked match's bell and through its grace whatever becomes of the polls (armBell), and its match. */
+let bellTimer: { id: string; cancel: () => void } | null = null
+/** A ranked clock stops moving this long after the match's result was due: a copy left live for good draws no more. */
+const RANKED_CLOCK_PAST_MS = 10 * 60_000
 /** A Queue press found no lanes cached: the ranked loop's next tick reads them once, whatever tab is on screen. */
 let lanesOnce = false
 /** Why the last lanes read got none, for a Queue press that still finds none cached: null after a read that answered. */
@@ -4786,6 +4806,81 @@ async function enterLive($: $, sent: ApiMatchSummary, isCurrent?: () => boolean)
 }
 
 /**
+ * A ranked match's scans near its bell (PR 88's review, G1). A commit made outside Claude (the player's own terminal or
+ * editor) has no hook: the scan every two minutes finds it, and a grace of 1 to 3 minutes can end first, so about half the
+ * hand commits made in a 15m match's last seconds missed it. So the session that follows the match asks for scans itself:
+ *   - in its last minutes (warnMs) and through its grace, every BELL_SCAN_MS: an unchanged repo costs one git call (its
+ *     refs' fingerprint), and a repo whose last scan left a commit unjudged (a rate limit, a timeout) is listed again, so
+ *     this is also what retries one; it finds a commit this clock dated before a bell the server had already rung, too;
+ *   - the first time it sees the bell (the server's grace, or the deadline passed on this clock): at once, whatever the
+ *     spacing says, and unforced first: the fingerprints find a new commit in the one repo that moved without listing the
+ *     rest of the watch list ahead of it (PR 89's check: twenty repos stood between the bell and a late commit). A forced
+ *     scan follows it, as practice's bell runs one: every repo listed again whatever its fingerprint says.
+ * Called by pollMatch on every tick, answered or not, and by the bell's own timer (armBell). Never awaited (a scan may
+ * wait on the judge), and runScan is single-flight: a scan asked for while one runs follows it. Only the session that
+ * polls runs this (lead.ts); the repos it scans are the machine's (the watch list).
+ */
+function scanNearBell($: $, id: string, s: ApiMatchSummary, t: number) {
+  if (!s.deadline || (s.status !== 'live' && s.status !== 'grace')) return
+  const left = Date.parse(s.deadline) - t
+  if (!Number.isFinite(left) || left > warnMs(s)) return
+  if (bellScan.id !== id) bellScan = { id, at: 0, rung: false }
+  const rung = s.status === 'grace' || left <= 0
+  const first = rung && !bellScan.rung
+  if (!first && t - bellScan.at < BELL_SCAN_MS) return
+  bellScan = { id, at: t, rung: bellScan.rung || rung }
+  const said = (err: unknown) => $.ui.log(`CCSR scan: ${(err as Error).message}`)
+  if (first) void runScan($).then(() => runScan($, true)).catch(said)
+  else void runScan($).catch(said)
+}
+
+/**
+ * The bell's own timer (PR 89's check). scanNearBell ran only on an answered poll, and the poll after the bell is the one
+ * the server sheds under load (429, then the loop backs off): with 40 s of them no scan ran until 45 s past the bell, most
+ * of a 1 minute grace. So the first answered page of a live match sets one timer for its bell, which then runs every
+ * BELL_SCAN_MS until the match is decided or its grace is well past, on this session's own copy of the match (its status
+ * may still say live: the deadline on this clock is what rings it). The judge and the outbox need no poll either.
+ */
+function armBell($: $, id: string, s: ApiMatchSummary, t: number) {
+  if (bellTimer?.id === id || !s.deadline || (s.status !== 'live' && s.status !== 'grace')) return
+  const deadline = Date.parse(s.deadline)
+  if (!Number.isFinite(deadline)) return
+  bellTimer?.cancel()
+  const tick = async () => {
+    const at = await $.clock.now()
+    const held = (await read($, link)).ranked
+    const sm = held && held.id === id ? held.summary : null
+    const ends = sm ? Date.parse(sm.grace_ends_at ?? '') || deadline + 10 * 60_000 : 0
+    if (!sm || (sm.status !== 'live' && sm.status !== 'grace') || at > ends + BELL_SCAN_MS) {
+      if (bellTimer?.id === id) bellTimer = null
+      return
+    }
+    scanNearBell($, id, sm, at)
+    const next = $.clock.after(BELL_SCAN_MS, () => void tick().catch(() => null))
+    if (bellTimer?.id === id) bellTimer = { id, cancel: () => next.cancel() }
+    else next.cancel()
+  }
+  const first = $.clock.after(Math.max(250, deadline - t + 250), () => void tick().catch(() => null))
+  bellTimer = { id, cancel: () => first.cancel() }
+}
+
+/**
+ * The clock of a ranked match, every second in every session (PR 89's check). The band and the pane take their time from
+ * the shared `now`, which in ranked moved only in slowSync, every 30 s: the clock to the bell read "0:00:42" while 38 to 14 s
+ * were left and "0:00:12" through the bell, and a session that wasn't polling drew its countdown to the result on the
+ * leader's 10 s beat, still up after the result's time. Practice has moved `now` every second all along (tick). While this
+ * session's copy of the match is live or counting, so does ranked: no poll, lease or answer is needed for a clock to move.
+ */
+async function rankedClock($: $) {
+  const sm = (await read($, link)).ranked?.summary
+  if (!sm || (sm.status !== 'live' && sm.status !== 'grace')) return
+  const t = await $.clock.now()
+  const due = Date.parse(sm.grace_ends_at ?? '') || Date.parse(sm.deadline ?? '')
+  if (Number.isFinite(due) && t > due + RANKED_CLOCK_PAST_MS) return
+  await update($, now, () => t)
+}
+
+/**
  * One page of the match. `late` (pollRanked, resultMissing): another session's poll already decided
  * it and rang the result, so this one plays no sound and leaves the phase alone. A session that was
  * following the match (`open`) still toasts the result in its own window; one that never was
@@ -4795,7 +4890,11 @@ async function pollMatch($: $, id: string, isCurrent: () => boolean, late: 'open
   const cur = (await read($, link)).ranked
   const cursor = cur && cur.id === id ? cur.cursor : 0
   const r = await api($, 'GET', `/matches/${id}/events?cursor=${cursor}`)
-  if (r.status !== 200 || !isCurrent()) return r
+  if (r.status !== 200 || !isCurrent()) {
+    // Not answered (shed after the bell, a restart, offline): the scans near the bell go by the copy this session holds.
+    if (r.status !== 200 && isCurrent() && cur && cur.id === id && cur.summary) scanNearBell($, id, cur.summary, await $.clock.now())
+    return r
+  }
   // Asked with a cursor this session's copy no longer has (Resync set it back to 0 while this read was out): merged, it would
   // move the cursor past the reset and the feed would lose everything before it for the rest of the match. The next read is from 0.
   const held = (await read($, link)).ranked
@@ -4824,6 +4923,8 @@ async function pollMatch($: $, id: string, isCurrent: () => boolean, late: 'open
       }
     if (left <= warn) await checkDirty($)
   }
+  scanNearBell($, id, s, t)
+  armBell($, id, s, t)
   if (s.status === 'finished' || s.status === 'void') {
     // What every other session draws goes out before the phase does, and before the toast and the result's sound (which is awaited
     // to its end, up to two seconds): a follower that found done with no result to draw yet sat between the two writes.
@@ -7111,6 +7212,9 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
         const race = raceFromServer(rk, me, t)
         const left = sm.deadline ? Date.parse(sm.deadline) - t : 0
         const hot = sm.status === 'live' && left <= warnMs(sm)
+        // The countdown to the result reads the clock itself: the shared `now` moves every 30 s in ranked (slowSync), which
+        // put this line up to 30 s over the grace, held it there, and left it up past the result's time (PR 88's review, G2).
+        const counting = sm.status === 'grace' ? countingLine(sm, await $.clock.now()) : ''
         const behind = them.points - mine.points
         const offline = l.online === false
         const d = await read($, dirty)
@@ -7125,7 +7229,7 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
               </Text>
             )}
             {sm.status === 'grace' ? (
-              <Text color={ORANGE}>{countingLine(sm, t)}</Text>
+              <Text color={ORANGE}>{counting}</Text>
             ) : offline ? (
               <Text dimColor wrap="truncate-end">
                 {MOD.offline}
@@ -7198,8 +7302,9 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
             {CHALLENGE.bandTitle}
           </Text>
           <Text wrap="truncate-end">{CHALLENGE.bandIncoming(incoming.from.handle, incoming.label)}</Text>
-          {!cf.practiceOnly && <Button key="band-ch-accept" label={CHALLENGE.accept} variant="primary" onPress={() => a.challengeAccept(incoming.id, 'band')} />}
-          <Button key="band-ch-decline" label={CHALLENGE.decline} onPress={() => a.challengeDecline(incoming.id)} />
+          {/* Keyed by the challenge: a press runs the newest closure its key has (steady.ts), so a key names what the press acts on. */}
+          {!cf.practiceOnly && <Button key={`band-ch-accept-${incoming.id}`} label={CHALLENGE.accept} variant="primary" onPress={() => a.challengeAccept(incoming.id, 'band')} />}
+          <Button key={`band-ch-decline-${incoming.id}`} label={CHALLENGE.decline} onPress={() => a.challengeDecline(incoming.id)} />
           <Button key="band-open" label="Open" onPress={() => a.open('match')} />
         </Box>
       )
@@ -8022,6 +8127,8 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
     const closed = sm.status === 'finished' || sm.status === 'void'
     const left = sm.deadline ? Date.parse(sm.deadline) - t : 0
     const hot = sm.status === 'live' && left <= warnMs(sm)
+    // As the band's: the clock itself, never the shared `now` (every 30 s in ranked).
+    const counting = sm.status === 'grace' ? countingLine(sm, await $.clock.now()) : ''
     const scores = r.events.filter((x): x is Extract<typeof x, { kind: 'score' }> => x.kind === 'score').slice(-12).reverse()
     const chats = r.events.filter((x): x is Extract<typeof x, { kind: 'chat' }> => x.kind === 'chat').slice(-8)
     const delta = (mine.rating_after ?? mine.rating_before) - mine.rating_before
@@ -8062,7 +8169,7 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
         {closed && rich && <Text bold>{line}</Text>}
         {sm.status === 'grace' && (
           <Box flexDirection="column">
-            <Text color={ORANGE}>{countingLine(sm, t)}</Text>
+            <Text color={ORANGE}>{counting}</Text>
             <Text dimColor>{MOD.countingRule}</Text>
           </Box>
         )}
@@ -11088,6 +11195,8 @@ async function boot($: $, cwd: string) {
     lookAround($)
   })
   $.clock.every(PANE_TICK_MS, () => void paneTick($).catch(err => $.ui.log(`CCSR pane: ${(err as Error).message}`)))
+  // A ranked match's clock: the shared `now`, every second while this session's copy of the match is live or counting.
+  $.clock.every(1000, () => void rankedClock($).catch(() => null))
   // Where the pane last drew, as the module before this one left it: a pane that was up through the reload hasn't just opened.
   await bootStep($, 'pane', async () => {
     paneKeptAt = (await read($, paneAt)) || 0
@@ -11216,6 +11325,14 @@ async function boot($: $, cwd: string) {
     onConfigTick((c, why) => void noticeConfigTick($, c, why).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`)))
   }
   void noticeEvent($, { on: 'session_start' }).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
+}
+
+/** The buttons the pane, the ready check and the band drew last, kept so an unchanged one is the same element on the next draw (steady.ts). */
+const steadyButtons = steady()
+
+/** A drawing's name for steadyButtons: the component, which instance of it, and the surface it draws on. */
+function siteOf(e: { component: string; requestId?: string; surface: string }) {
+  return `${e.component}\x00${e.requestId ?? ''}\x00${e.surface}`
 }
 
 async function commandText($: $, args: string, signal?: AbortSignal): Promise<string> {
@@ -11620,13 +11737,15 @@ export const register: Register = on => {
 
   on('command.run', { command: 'ccsr' }, async ($, e, next) => ({ text: await commandText($, e.args, next.signal) }))
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => renderPane($, e, actions($)))
+  // Each tree goes out through `steadyButtons` (steady.ts): a Button whose look did not change keeps the element, and so the
+  // handle, it had on the last draw, so a press that lands a draw late still runs.
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => steadyButtons.hold(await renderPane($, e, actions($)), siteOf(e)))
 
-  on('ui.render', { component: 'Pane', requestId: READY }, async ($, e) => readyDialog($, e))
+  on('ui.render', { component: 'Pane', requestId: READY }, async ($, e) => steadyButtons.hold(await readyDialog($, e), siteOf(e)))
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const tree = await bandOrPass($, e)
-    return tree ?? next(e)
+    return tree ? steadyButtons.hold(tree, siteOf(e)) : next(e)
   })
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
