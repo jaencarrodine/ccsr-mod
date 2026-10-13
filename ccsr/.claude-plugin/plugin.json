@@ -1,6 +1,6 @@
 {
   "name": "ccsr",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Claude Code Ship Race: ranked 1v1s on the work you're already doing. Your own Claude scores every commit; most points at the bell wins. Plus the Grind, a board that counts every commit. Needs Claude Code 2.1.287 or later (2.1.286 in the desktop app).",
   "types": "./types/index.d.ts",
   "homepage": "https://ccsr.gg",

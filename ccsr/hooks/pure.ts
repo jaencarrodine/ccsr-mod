@@ -44,6 +44,29 @@ export function drawable(s: string) {
   return s.replace(/[\p{Co}\p{Cs}]/gu, '')
 }
 
+/** The longest line `/ccsr link` answers a failed join with: the server's refusals are one short sentence. */
+export const LINK_REPLY_MAX = 200
+
+/**
+ * `/ccsr link <code>`'s answer to a join that didn't land. `problem` is the line Settings shows
+ * (the server's own message, or the mod's). A command's reply is a transcript row Claude reads,
+ * and a code that failed for any reason but being wrong still works for 10 minutes, so a line
+ * that carries the code is never passed on: `fallback` stands in. No server line carries one
+ * today; a later server's, or another server's, might. Compared as typed, and in capitals with
+ * everything but letters and digits dropped (the server reads a code in capitals without spaces
+ * or dashes), over the whole problem and not only the part that fits. What is passed on is one
+ * line with no control characters, LINK_REPLY_MAX long at most.
+ */
+export function linkReply(problem: string, code: string, fallback: string) {
+  const whole = clean(problem).replace(/\s+/g, ' ').trim()
+  const said = whole.toUpperCase()
+  const typed = code.trim().toUpperCase()
+  const bare = (s: string) => s.replace(/[^A-Z0-9]/g, '')
+  if ((typed !== '' && said.includes(typed)) || (bare(typed) !== '' && bare(said).includes(bare(typed)))) return fallback
+  // Cut first, then drawable: a cut through a surrogate pair leaves half of one.
+  return drawable(whole.slice(0, LINK_REPLY_MAX)).trim() || fallback
+}
+
 // ------------------------------------------------------------------ periods
 
 /** Grind periods: the week starts Monday 00:00 local time. */

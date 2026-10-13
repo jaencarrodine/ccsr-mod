@@ -158,6 +158,9 @@ import { CUSTOM } from './copy'
 // The #1 card's setter (Settings): what GET and PUT /me/number-one say, what Save sends, and its words.
 import { NUMBER_ONE_SET_MAX, drawable, numberOneKept, numberOnePatch, numberOneSaved } from './pure'
 import { NUMBER_ONE } from './copy'
+// `/ccsr link <code>`: its lines, and the reply that never carries the code.
+import { linkReply } from './pure'
+import { LINK_COMMAND } from './copy'
 
 // Every function that is handed $ lives in this file: the engine follows $
 // into same-file, top-level functions only, and state reads and writes must
@@ -2772,13 +2775,23 @@ async function signup($: $, raw: string): Promise<string> {
   return ''
 }
 
-/** Joins the account another install is signed in to, with the code it showed. */
-async function joinWithCode($: $, raw: string) {
+/**
+ * Joins the account another install is signed in to, with the code it showed. Says how it went,
+ * for `/ccsr link` (Settings' Link with a code reads nothing back): the handle this install now
+ * plays as, or the problem, which is the Server note either way; null with no code to send.
+ */
+async function joinWithCode($: $, raw: string): Promise<{ handle: string } | { problem: string } | null> {
   const code = raw.trim()
-  if (!code) return
+  if (!code) return null
   const r = await api($, 'POST', '/accounts/link', { code, install: await installLabel($) }, { token: null })
-  if (r.status !== 201) return update($, link, l => ({ ...l, note: signInProblem(r) }))
-  await signedIn($, r.json as SignInReply)
+  if (r.status !== 201) {
+    const problem = signInProblem(r)
+    await update($, link, l => ({ ...l, note: problem }))
+    return { problem }
+  }
+  const j = r.json as SignInReply
+  await signedIn($, j)
+  return { handle: j.player.handle }
 }
 
 /** Back in with the account's recovery key. */
@@ -11178,6 +11191,7 @@ const HELP = `CCSR commands:
 /ccsr quiet on|off       Quiet: the race band in a match, the noise around it off
 /ccsr last               your last result as a scorecard
 /ccsr status             one line of where you stand
+${LINK_COMMAND.help}
 Chat lives in the pane only, so it never reaches Claude.`
 
 /** The help text, with W6b's `/ccsr challenge` line only while challenges are on for this player. */
@@ -12038,6 +12052,7 @@ async function commandText($: $, args: string, signal?: AbortSignal): Promise<st
   }
   if (sub === 'help') return helpText(await configOf($))
   if (sub === 'challenge') return challengeCommand($, arg)
+  if (sub === 'link') return linkCommand($, arg)
   if (sub === 'last') {
     // This text reaches Claude: scores and handles only, never chat or an opponent's titles. The row draws as a scorecard.
     return (await recapText($)) ?? 'No result yet.'
@@ -12145,6 +12160,33 @@ async function challengeCommand($: $, arg: string) {
   const r = await openPane($, 'match')
   if (!r.isPlaced) return `CCSR pane is waiting: ${r.reason}`
   return code ? CHALLENGE.reply.opened : CHALLENGE.reply.form
+}
+
+/**
+ * `/ccsr link <code>`: Settings' Link with a code as a command, for an install whose buttons a
+ * script can't press. The terminal's classic renderer reports no clicks (docs/architecture.md,
+ * Traps), so in tmux on a remote box every button is keyboard only, and a slash command can be
+ * typed. It is the same join (joinWithCode: `POST /accounts/link`, then signedIn), so the Server
+ * note and the keyring follow as they do from Settings. An install that is signed in is refused
+ * and asks the server nothing: Settings shows a signed-in install no code box either. Signed in
+ * means what it means everywhere here, a token the server knows; one it doesn't know is kept
+ * with the ways in offered, and this is one of them.
+ *
+ * Its reply is a transcript row Claude reads, so it never carries the code: each line is
+ * LINK_COMMAND's or the problem Settings would show, and linkReply swaps a problem that carries
+ * the code for LINK_COMMAND.failed. The line the person typed is a transcript row too, and that
+ * one does carry it: a code works once, for 10 minutes, and a join that lands has used it up.
+ */
+async function linkCommand($: $, arg: string) {
+  const code = arg.trim()
+  if (!code) return LINK_COMMAND.usage
+  const cfg = await serverCfg($)
+  const l = await read($, link)
+  if (cfg.token && !l.unknownToken) return LINK_COMMAND.already(cfg.handle ?? l.me?.handle ?? 'your handle')
+  const out = await joinWithCode($, code)
+  if (!out) return LINK_COMMAND.usage
+  if ('problem' in out) return linkReply(out.problem, code, LINK_COMMAND.failed)
+  return LINK_COMMAND.linked(out.handle)
 }
 
 async function calibrateTool($: $, input: Record<string, unknown>) {

@@ -502,6 +502,21 @@ export const ACCOUNT = {
   scoredElsewhere: 'Scored by your other install.',
 }
 
+/**
+ * `/ccsr link <code>` (docs/copy.md, "The mod", Accounts and installs): Link with a code as a
+ * command, for an install whose buttons can't be pressed by a script. Its reply is a transcript
+ * row Claude reads, so no line here has a slot for the code. A join that fails answers the line
+ * Settings shows (the server's own, or the two the mod writes); `failed` stands in for one that
+ * would carry the code (linkReply in pure.ts).
+ */
+export const LINK_COMMAND = {
+  help: '/ccsr link <code>        link this install with a code from your other one',
+  usage: "Run /ccsr link <code> with a code from another install's Settings, under Link another install.",
+  already: (handle: string) => `This install already plays as ${handle}. To link it to another account, remove this install in Settings first.`,
+  linked: (handle: string) => `This install now plays as ${handle}.`,
+  failed: "This install wasn't linked. Make a new code in another install's Settings and run this again.",
+}
+
 // ------------------------------------------------------------------ sign-in with a provider (W5b)
 
 /** A sign-in provider's name as the mod writes it. GitHub is the only one; another needs a mod update for its link domain anyway. */
