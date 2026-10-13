@@ -1,4 +1,4 @@
-import type { ApiLane, Craft, FeedItem, ScoredCommit, WeekTotals } from '../types'
+import type { ApiLane, ApiMatchSide, Craft, FeedItem, ScoredCommit, WeekTotals } from '../types'
 import { cleanServer } from './config'
 
 // Pure values and helpers: no $ in this file, so everything here is unit tested.
@@ -6,7 +6,16 @@ import { cleanServer } from './config'
 export const RUBRIC = 'r3'
 export const DEFAULT_MODEL = 'claude-sonnet-5-5'
 export const FALLBACK_MODEL = 'sonnet'
-export const START_RATING = 1000
+/**
+ * The on-ramp (Jaen, 2026-10-13), the mod's copy of server/src/rules.ts: a new player's rating
+ * starts 200 under the ladder's middle (1000), and each of their first ONRAMP_WINS wins pays
+ * ONRAMP_BONUS on top of the Elo change. Ranked numbers always come from the server; these are
+ * for practice, so its numbers read like ranked's.
+ */
+export const ONRAMP_WINS = 10
+export const ONRAMP_BONUS = 20
+/** What a new player shows: the middle (1000) less the whole on-ramp. */
+export const START_RATING = 800
 export const STORE_VERSION = 2
 
 export const SCALE = [0, 1, 2, 3, 5, 8, 13, 21] as const
@@ -21,6 +30,18 @@ const DAY = 86_400_000
 /** Control characters (C0 except tab and newline, DEL, C1) get a whole tree refused; replace them. */
 export function clean(s: string) {
   return s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, ' ')
+}
+
+/**
+ * Text without the two other things that get a whole tree refused: a lone surrogate, and a
+ * private use character (U+10EEEE is one: the engine keeps it for its own image placeholder, and
+ * refuses any text child, Svg alt, Input value or Link label that holds it; read from Claude Code
+ * 2.1.295 and 2.1.296). Dropped, not replaced. The control characters are `clean`'s, above, and
+ * `cleanServer`'s (config.ts, every Cc and Cf): this adds only what neither takes out, so text a
+ * player wrote goes through one of those and then this before it is drawn.
+ */
+export function drawable(s: string) {
+  return s.replace(/[\p{Co}\p{Cs}]/gu, '')
 }
 
 // ------------------------------------------------------------------ periods
@@ -86,26 +107,49 @@ export function rollUp(list: ScoredCommit[], weeks: WeekTotals, t: number, keepW
 
 // ------------------------------------------------------------------ rating
 
+/** The tier floors of the on-ramp (Jaen, 2026-10-13): the middle (1000) is Bronze, and anything under 900 is Mud. */
 export const TIERS: readonly [string, number][] = [
-  ['Master', 1600],
-  ['Diamond', 1400],
-  ['Platinum', 1250],
-  ['Gold', 1100],
-  ['Silver', 950],
-  ['Bronze', 800],
-  ['Iron', 650],
+  ['Master', 1320],
+  ['Diamond', 1230],
+  ['Platinum', 1150],
+  ['Gold', 1080],
+  ['Silver', 1020],
+  ['Bronze', 960],
+  ['Iron', 900],
   ['Mud', 0],
 ]
 
-/** Mud is the floor (Jaen, 2026-10-07). Matches server/src/rules.ts. */
+/** Mud is the floor (Jaen, 2026-10-07) and where everyone starts (2026-10-13). Matches server/src/rules.ts. */
 export function tierOf(r: number) {
   return (TIERS.find(([, min]) => r >= min) ?? ['Mud', 0])[0]
 }
 
+/** What the on-ramp still owes after this many wins: 200 at none, 0 from the tenth. */
+export function owed(wins: number) {
+  return ONRAMP_BONUS * Math.max(0, ONRAMP_WINS - wins)
+}
+
+/** The rating Elo is worked out on: the rating as shown plus what the on-ramp still owes. A new player (800, no wins) plays as 1000. */
+export function playRating(rating: number, wins: number) {
+  return rating + owed(wins)
+}
+
+/** Plain Elo on the two ratings it is given: K 40 for the first 10 matches, then 24. */
 export function elo(mine: number, theirs: number, result: 0 | 0.5 | 1, played: number) {
   const expected = 1 / (1 + Math.pow(10, (theirs - mine) / 400))
   const k = played < 10 ? 40 : 24
   return Math.round(mine + k * (result - expected))
+}
+
+/**
+ * A practice rating after one result, by ranked's rule: Elo between the two play ratings (the
+ * bot's rating is the one it plays on), then ONRAMP_BONUS more for a win while the on-ramp
+ * still owes. `wins` is the wins before this result; ONRAMP_WINS or more means nothing is owed
+ * and this is plain Elo.
+ */
+export function practiceElo(mine: number, theirs: number, result: 0 | 0.5 | 1, played: number, wins: number) {
+  const play = playRating(mine, wins)
+  return mine + (elo(play, theirs, result, played) - play) + (result === 1 && wins < ONRAMP_WINS ? ONRAMP_BONUS : 0)
 }
 
 // ------------------------------------------------------------------ the #1 card's own words
@@ -142,8 +186,9 @@ export function numberOneOf(row: unknown): NumberOneOwn | null {
   const o = r.number_one
   if (r.rank !== 1 || typeof o !== 'object' || o === null || Array.isArray(o)) return null
   const src = o as Record<string, unknown>
-  // A line break or a tab reads as a space, then cleanServer drops what can't be drawn.
-  const text = typeof src.line === 'string' ? cleanServer(src.line.replace(/\s+/g, ' ')).replace(/ +/g, ' ').trim() : ''
+  // A line break or a tab reads as a space, then cleanServer and drawable drop what can't be drawn:
+  // one such character in the card's alt or its text would blank the Ranked tab for every viewer.
+  const text = typeof src.line === 'string' ? drawable(cleanServer(src.line.replace(/\s+/g, ' '))).replace(/ +/g, ' ').trim() : ''
   const line = text.length >= 1 && text.length <= NUMBER_ONE_LINE_MAX ? text : null
   const handle = typeof src.x === 'string' ? src.x.replace(/^@/, '') : ''
   const x = X_HANDLE.test(handle) ? handle : null
@@ -188,6 +233,67 @@ export function fitCardLine(line: string) {
 /** An X handle's profile page. The handle is `numberOneOf`'s, so the link is safe to draw. */
 export function xProfile(handle: string) {
   return `https://x.com/${handle}`
+}
+
+// The setter (Settings, "Your #1 line"): what GET and PUT /me/number-one say and what Save sends.
+
+/**
+ * The most a line may be when its player sets it: the server's bound on PUT /me/number-one, in
+ * characters. Save checks it first as a convenience; every other rule (dashes, emoji, an X
+ * handle's letters) is the server's alone, and its message is shown as it comes. The reader's
+ * NUMBER_ONE_LINE_MAX stays wider.
+ */
+export const NUMBER_ONE_SET_MAX = 80
+
+/** A box's text as Save compares and sends it: one line, each run of white space one space, trimmed (what the server does to a line). */
+export function numberOneTyped(text: string) {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * A box's text as the setter keeps it from typing or a paste: all of it, less what the engine
+ * won't draw (`clean`, then `drawable`). The box draws what is kept as its `value`, and one such
+ * character there would blank the whole Settings tab.
+ */
+export function numberOneKept(text: string) {
+  return drawable(clean(text))
+}
+
+/**
+ * GET /me/number-one's answer and PUT's, which has the same shape (`{ number_one: { line, x } }`,
+ * docs/api.md): what this player has saved, each a string or null. Null when the answer doesn't
+ * read. The values draw only in their own player's Settings boxes, so they are made safe to draw
+ * (cleanServer, then drawable: a stored line the engine refused would blank that player's Settings,
+ * Clear included) and held to no rule: the server holds those.
+ */
+export function numberOneSaved(json: unknown): NumberOneOwn | null {
+  if (typeof json !== 'object' || json === null || Array.isArray(json)) return null
+  const o = (json as Record<string, unknown>).number_one
+  if (typeof o !== 'object' || o === null || Array.isArray(o)) return null
+  const src = o as Record<string, unknown>
+  const one = (v: unknown) => (typeof v === 'string' ? numberOneTyped(drawable(cleanServer(v.replace(/\s+/g, ' ')))) : '') || null
+  return { line: one(src.line), x: one(src.x) }
+}
+
+/**
+ * What Save sends as PUT /me/number-one's body: exactly the keys whose box differs from what the
+ * server holds, an emptied box as null (null clears that one; a key left out is unchanged). An X
+ * handle is compared without its leading @, which the server takes or leaves. `saved` null means
+ * the read never landed: only a box with something in it goes then, so an empty box never clears a
+ * value this mod hasn't seen.
+ */
+export function numberOnePatch(typed: { line: string; x: string }, saved: NumberOneOwn | null): { line?: string | null; x?: string | null } {
+  const line = numberOneTyped(typed.line)
+  const x = numberOneTyped(typed.x)
+  const out: { line?: string | null; x?: string | null } = {}
+  if (saved === null) {
+    if (line) out.line = line
+    if (x) out.x = x
+    return out
+  }
+  if (line !== (saved.line ?? '')) out.line = line || null
+  if (x.replace(/^@/, '') !== (saved.x ?? '').replace(/^@/, '')) out.x = x || null
+  return out
 }
 
 // ------------------------------------------------------------------ match lengths (W2b)
@@ -235,7 +341,7 @@ const count = (x: unknown) => (typeof x === 'number' && Number.isFinite(x) && x 
  * GET /queue's `lanes` as the mod draws them: a lane needs a length in whole minutes
  * (5 to 1440); everything else on it is held to something drawable (a bad label is
  * the mod's own, a bad count 0, a bad wait unknown, ratings finite numbers, at most
- * 100, a bad swing none). The first of a repeated length wins; numeric order, at most
+ * 100, a bad swing or win none). The first of a repeated length wins; numeric order, at most
  * 8. Null when the answer has no lanes at all (a server from before W2).
  */
 export function lanesOf(raw: unknown): ApiLane[] | null {
@@ -254,6 +360,7 @@ export function lanesOf(raw: unknown): ApiLane[] | null {
       wait_ms: typeof wait === 'number' && Number.isFinite(wait) && wait >= 0 ? wait : null,
       ratings: Array.isArray(o.ratings) ? o.ratings.filter((r): r is number => typeof r === 'number' && Number.isFinite(r)).slice(0, 100) : [],
       swing: typeof o.swing === 'number' && Number.isFinite(o.swing) ? Math.abs(Math.round(o.swing)) : null,
+      win: typeof o.win === 'number' && Number.isFinite(o.win) ? Math.abs(Math.round(o.win)) : null,
     })
   }
   return out.sort((a, b) => a.length_min - b.length_min).slice(0, LENGTHS_MAX)
@@ -663,3 +770,46 @@ feature = new behaviour users or callers can use; fix = corrects wrong behaviour
 
 Reply with JSON only, no prose and no code fence:
 {"points": <0|1|2|3|5|8|13|21>, "craft": "<clean|neutral|sloppy>", "category": "<feature|fix|refactor|test|docs|perf|infra|chore>", "reason": "<at most 12 words>"}`
+
+/** The fields of a match side that say where it stands on placement. */
+type PlacementSide = Pick<ApiMatchSide, 'player' | 'tier_after' | 'placement_before' | 'placement_after'>
+
+/**
+ * Where a ranked side stands on placement, for the result card and band: still placing (how
+ * many played), or placed by this match (`placedIn`, a lowercase tier, which can be mud). By
+ * the server's count (`placement_before`, `placement_after`), never by the tiers: since the
+ * on-ramp a placed player can be in Mud, so Mud before and Iron after is an ordinary promotion
+ * as often as a placement, and a player can be placed into Mud. A server before those fields
+ * says only whether the player is placing now.
+ */
+export function placingOfSide(side: PlacementSide): { played: number; of: number; placedIn?: string } | undefined {
+  if (side.placement_before !== undefined && side.placement_after !== undefined) {
+    if (side.placement_after) return { played: side.placement_after.played, of: side.placement_after.of }
+    if (side.placement_before && side.tier_after) return { played: side.placement_before.of, of: side.placement_before.of, placedIn: side.tier_after.toLowerCase() }
+    return undefined
+  }
+  if (side.player.placement) return { played: side.player.placement.played, of: side.player.placement.of }
+  return undefined
+}
+
+/**
+ * Whether a side was placing going into its match and still is once it is decided, for the
+ * placed moment. By the server's count when it sends one. From a server before it: placing after
+ * is the side's ref (the player now), and placing before is the standing read before the match
+ * ended (`standingBefore`: GET /me's, in the match's bucket). Never the tiers.
+ */
+export function placingAround(side: PlacementSide, standingBefore: { placement: unknown } | null | undefined) {
+  if (side.placement_before !== undefined && side.placement_after !== undefined) return { before: !!side.placement_before, after: !!side.placement_after }
+  const after = !!side.player.placement
+  return { before: after || !!standingBefore?.placement, after }
+}
+
+/**
+ * A lane's even-match stakes as text: +win/-swing while a win pays more (the on-ramp's bonus),
+ * else ±swing; nothing without a swing. `win` is tested as a number, never against null: lanes
+ * are shared between this machine's sessions, and one an older mod's session read has no `win`
+ * at all.
+ */
+export function laneStakeText(x: { swing: number | null; win?: number | null }) {
+  return x.swing === null ? '' : typeof x.win === 'number' && x.win !== x.swing ? `+${x.win}/-${x.swing}` : `±${x.swing}`
+}

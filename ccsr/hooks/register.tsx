@@ -10,6 +10,7 @@ import {
   DEFAULT_MODEL,
   FALLBACK_MODEL,
   JUDGE_SYSTEM,
+  ONRAMP_WINS,
   PR_SUFFIX,
   RUBRIC,
   START_RATING,
@@ -19,13 +20,13 @@ import {
   catalogOf,
   clean,
   digestText,
-  elo,
   fitCardLine,
   hash,
   idKey,
   isNoise,
   isStashTitle,
   labelFor,
+  laneStakeText,
   lanesOf,
   lengthLabel,
   lengthsFromStore,
@@ -37,6 +38,10 @@ import {
   parseVerdict,
   periodStart,
   pickedLengths,
+  placingAround,
+  placingOfSide,
+  playRating,
+  practiceElo,
   recentOnSameFiles,
   resultInMs,
   rng,
@@ -150,6 +155,9 @@ import type { FinisherKind } from './finishers'
 import { GALLERY_PAGE, REPORT_REASONS, TITLE_PROBLEM, artCode, artProblems, artRefOf, artShown, customMeOf, customOf, customTiming, drawsArt, galleryOf, localProblems, problemsOf, titleFor, titleRefused, wrongSlotOf } from './finishers-custom'
 import type { Art, ArtRef, CustomMe, Problem, ReportReason } from './finishers-custom'
 import { CUSTOM } from './copy'
+// The #1 card's setter (Settings): what GET and PUT /me/number-one say, what Save sends, and its words.
+import { NUMBER_ONE_SET_MAX, drawable, numberOneKept, numberOnePatch, numberOneSaved } from './pure'
+import { NUMBER_ONE } from './copy'
 
 // Every function that is handed $ lives in this file: the engine follows $
 // into same-file, top-level functions only, and state reads and writes must
@@ -211,6 +219,8 @@ const FINISHER_UI0: FinisherUi = { key: '', me: null, busy: false, note: '' }
 const finisherUi = atom({ plugin: 'ccsr', key: 'finisherUi' } as const, FINISHER_UI0)
 /** W10e: moves on every change of the custom finishers' view and result state, which lives in module memory ("custom finishers", below), never here. */
 const customRev = atom({ plugin: 'ccsr', key: 'customRev' } as const, 0)
+/** The #1 card's setter: moves on every change of its Settings block, which lives in module memory ("the #1 card's own words, set", below), never here. */
+const numberOneRev = atom({ plugin: 'ccsr', key: 'numberOneRev' } as const, 0)
 
 // ================================================================== STORE
 
@@ -227,6 +237,8 @@ const K = {
   since: 'trackingSince',
   rating: 'rating',
   record: 'record',
+  // True once the practice rating started under the on-ramp (2026-10-13): from 800, by a first match or a reset since. A rating stored before it has no flag.
+  onramp: 'onramp',
   history: 'history',
   match: 'match',
   claims: 'claims',
@@ -1463,14 +1475,27 @@ async function backtestSession($: $, s: PastSession, signal?: AbortSignal): Prom
 
 // ================================================================== MATCH
 
-// Made-up rivals, the same handles every mockup uses.
+// Made-up rivals, the same handles every mockup uses, at the mock standings' ratings. Never shown:
+// they pick whose handle the bot takes, the nearest to you. 10xgary's is its own, in Gold, so
+// he is the rival a new player meets first.
 const RIVALS: readonly { handle: string; rating: number }[] = [
-  { handle: '10xgary', rating: 1172 },
-  { handle: 'nova_ships', rating: 1712 },
-  { handle: 'rk', rating: 1655 },
-  { handle: 'vex', rating: 1488 },
-  { handle: 'tokyo_drift', rating: 1391 },
+  { handle: '10xgary', rating: 1114 },
+  { handle: 'nova_ships', rating: 1355 },
+  { handle: 'rk', rating: 1288 },
+  { handle: 'vex', rating: 1191 },
+  { handle: 'tokyo_drift', rating: 1160 },
 ]
+
+/**
+ * The practice wins the on-ramp counts (pure.ts), so practice reads like ranked: from 800, each
+ * of the first 10 wins pays 20 more. A rating that starts under it (none stored yet, or reset
+ * since) counts the record's wins. One stored before it started at 1000 and keeps its number,
+ * so it is owed nothing: ONRAMP_WINS.
+ */
+async function rampWins($: $) {
+  const onRamp = (await $.store.get(K.onramp)) === true || (await $.store.get(K.rating)) == null
+  return onRamp ? (await storeGet<Record3>($, K.record, { w: 0, l: 0, d: 0 })).w : ONRAMP_WINS
+}
 
 const TAUNTS = ['gl hf', 'clock is ticking', 'nice one', 'that was a big diff', 'ok that one hurt', 'shipping, brb', 'gg incoming', 'whats your stack']
 const REPLIES = ['lol', 'fair', 'we will see', 'no way', 'respect', 'back to work', 'deploying now', 'haha true']
@@ -1511,8 +1536,10 @@ async function startPractice($: $, hours: number) {
   if (stored && stored.status === 'live' && Array.isArray(stored.plan)) return null
   const t = await $.clock.now()
   const mine = await storeGet($, K.rating, START_RATING)
+  // The bot is met where you play: your rating plus what the on-ramp still owes you (a new player, 800, plays as 1000).
+  const play = playRating(mine, await rampWins($))
   const r = rng(t)
-  const rival = [...RIVALS].sort((a, b) => Math.abs(a.rating - mine) - Math.abs(b.rating - mine))[Math.floor(r() * 2)] ?? RIVALS[0]!
+  const rival = [...RIVALS].sort((a, b) => Math.abs(a.rating - play) - Math.abs(b.rating - play))[Math.floor(r() * 2)] ?? RIVALS[0]!
   const sprint = hours < 1
   const rows = await storeGet<ScoredCommit[]>($, K.ledger, [])
   const pace = sprint ? 150 : myPace(rows, t) * (0.8 + r() * 0.4)
@@ -1523,7 +1550,7 @@ async function startPractice($: $, hours: number) {
     hours,
     startAt: t,
     deadline,
-    opp: { handle: rival.handle, rating: Math.round(mine + (r() - 0.5) * 120), pace },
+    opp: { handle: rival.handle, rating: Math.round(play + (r() - 0.5) * 120), pace },
     plan: botPlan(t, t, deadline, pace),
     myPoints: 0,
     oppPoints: 0,
@@ -1732,8 +1759,9 @@ async function ringBell($: $, onEvent: (text: string) => void, isForfeit: boolea
   const status: Match['status'] = isForfeit ? 'forfeit' : resultOf(m.myPoints, oppPoints)
   const rec = await storeGet<Record3>($, K.record, { w: 0, l: 0, d: 0 })
   const before = await storeGet($, K.rating, START_RATING)
+  const wins = await rampWins($)
   const result = status === 'won' ? 1 : status === 'draw' ? 0.5 : 0
-  const after = status === 'void' ? before : elo(before, m.opp.rating, result, rec.w + rec.l + rec.d)
+  const after = status === 'void' ? before : practiceElo(before, m.opp.rating, result, rec.w + rec.l + rec.d, wins)
   const done: Match = {
     ...m,
     oppPoints,
@@ -1750,6 +1778,8 @@ async function ringBell($: $, onEvent: (text: string) => void, isForfeit: boolea
   if (status !== 'void') {
     const nextRec = { w: rec.w + (result === 1 ? 1 : 0), l: rec.l + (result === 0 ? 1 : 0), d: rec.d + (result === 0.5 ? 1 : 0) }
     await save($, K.record, nextRec)
+    // Before the rating: once one is stored, the flag is all that says it started under the on-ramp.
+    if (wins < ONRAMP_WINS) await save($, K.onramp, true)
     await save($, K.rating, after)
     await update($, record, () => nextRec)
     await update($, rating, () => after)
@@ -1791,6 +1821,7 @@ async function botReply($: $, id: string, who: string, text: string) {
 async function replay($: $, s: PastSession, run: BacktestRun) {
   const r = rng(hash(s.id))
   const mine = await storeGet($, K.rating, START_RATING)
+  const play = playRating(mine, await rampWins($))
   const rival = pick(r, RIVALS)
   const hours = Math.max(0.25, (s.endAt - s.startAt) / 3_600_000)
   const pace = Math.max(6, (run.points / hours) * (0.75 + r() * 0.5))
@@ -1802,7 +1833,7 @@ async function replay($: $, s: PastSession, run: BacktestRun) {
     hours,
     startAt: s.startAt,
     deadline: s.endAt,
-    opp: { handle: rival.handle, rating: Math.round(mine + (r() - 0.5) * 100), pace },
+    opp: { handle: rival.handle, rating: Math.round(play + (r() - 0.5) * 100), pace },
     plan,
     myPoints: run.points,
     oppPoints,
@@ -2219,8 +2250,23 @@ async function claudeVersion($: $) {
 
 /** The floor this session has already said it is under (floorTold, or the toast for a queue dropped for it): once per floor, per session. */
 let floorSaid = ''
+/** When floorSaid was said (FLOOR_AGAIN_MS). */
+let floorSaidAt = 0
+/** A line that was not required came after floorSaid was said: the floor was lifted, or is being moved. */
+let floorLifted = false
+/**
+ * A floor that was lifted and put back is said again, but never within this long of saying it: while a floor is being
+ * moved, answers can name the old one and the new one in turn, and each turn would toast. A different floor is said at once.
+ */
+const FLOOR_AGAIN_MS = 5 * 60_000
+/** Whether this floor still has to be said: never said, or said, lifted since, and the wait over. */
+const floorOwed = (min: string, now: number) => floorSaid !== min || (floorLifted && now - floorSaidAt > FLOOR_AGAIN_MS)
 /** The floor a floorTold is deciding on now: two answers landing together never both say it. */
 let floorFlight = ''
+/** The release line this session knows the store holds (`url|latest|min`): what it wrote there, or found there (shareRelease). */
+let releaseShared = ''
+/** The release line a shareRelease is writing now: answers landing together never each write it. */
+let shareFlight = ''
 /** The release the update-is-out toast is being decided for now (noteRelease): the same, for the once-per-machine toast. */
 let outFlight = ''
 /** When, and from which server, this session last heard the release line it holds: its own answer, or the store's copy it took (lead.ts). */
@@ -2234,23 +2280,39 @@ let releaseHeard: ReleaseHeard | null = null
  * asks again every 30 s (adoptRelease), so it lands once the match is put away.
  */
 async function floorTold($: $, release: { latest: string; min: string }) {
-  if (standing(release) !== 'required' || floorSaid === release.min || floorFlight === release.min) return
-  // Claimed before the store is read: the answers a boot gets together each come through here.
+  if (standing(release) !== 'required') {
+    // The floor came down (a pin lifted): the same floor put back is said again (floorOwed).
+    if (floorSaid) floorLifted = true
+    return
+  }
+  if ((floorSaid === release.min && !floorLifted) || floorFlight === release.min) return
+  // Claimed before the clock or the store is read: the answers a boot gets together each come through here.
   floorFlight = release.min
   try {
-    if ((await rankedShared($)).phase !== 'idle' || floorSaid === release.min) return
+    const now = await $.clock.now()
+    // Asked again after the store read: a queue dropped for this floor may have said it meanwhile (noteCancelled).
+    if (!floorOwed(release.min, now) || (await rankedShared($)).phase !== 'idle' || !floorOwed(release.min, now)) return
     floorSaid = release.min
+    floorSaidAt = now
+    floorLifted = false
   } finally {
     if (floorFlight === release.min) floorFlight = ''
   }
   await ambient($, MOD.updateNeeded(release.min, VERSION), 'match', 10_000)
 }
 
-/** What this session heard goes into the store for the others, when it is news there too (never a write per answer). */
+/** A release line as one string, for "is this the one the store holds" (releaseShared). */
+const releaseKey = (url: string, latest: string, min: string) => `${url}|${latest}|${min}`
+
+/**
+ * What this session heard goes into the store for the others, when it is news there too (never a
+ * write per answer). `releaseShared` is set only once the line is known to be there, so a write the
+ * store refused (its lock, when many sessions write at once) is made again on the next answer.
+ */
 async function shareRelease($: $, url: string, latest: string, min: string) {
   const copy = releaseCopyOf(await storeGet<unknown>($, K.release, null))
-  if (copy && copy.url === url && copy.latest === latest && copy.min === min) return
-  await saveQuiet($, K.release, { url, latest, min, at: await $.clock.now() })
+  const there = !!copy && copy.url === url && copy.latest === latest && copy.min === min
+  if (there || (await saveQuiet($, K.release, { url, latest, min, at: await $.clock.now() }))) releaseShared = releaseKey(url, latest, min)
 }
 
 /**
@@ -2280,9 +2342,18 @@ async function adoptRelease($: $) {
 async function noteRelease($: $, url: string, latest: string, min: string) {
   const l = await read($, link)
   releaseHeard = { url, at: await $.clock.now() }
-  if (l.release?.latest !== latest || l.release?.min !== min) {
-    await update($, link, x => ({ ...x, release: { latest, min } }))
-    await shareRelease($, url, latest, min)
+  const news = l.release?.latest !== latest || l.release?.min !== min
+  if (news) await update($, link, x => ({ ...x, release: { latest, min } }))
+  // Shared when it is news here, and again for as long as the store isn't known to hold it (a refused write). Claimed before
+  // the store is read, so the answers a boot gets together make one write.
+  const key = releaseKey(url, latest, min)
+  if ((news || releaseShared !== key) && shareFlight !== key) {
+    shareFlight = key
+    try {
+      await shareRelease($, url, latest, min)
+    } finally {
+      if (shareFlight === key) shareFlight = ''
+    }
   }
   await floorTold($, { latest, min })
   const at = standing({ latest, min })
@@ -4798,7 +4869,8 @@ async function pollLanes($: $, isCurrent: () => boolean, bucket: string | null):
   }
   // W3b: asked for a bucket config lists and answered as another (Open): it isn't on for you now, so config is stale on buckets.
   if (bucket && of !== bucket) await staleBuckets($)
-  await noteCancelled($, q)
+  // Not a queue this session had you in (it was between matches): the floor's line is left to floorTold when it just said it.
+  await noteCancelled($, q, false)
   return r
 }
 
@@ -4813,14 +4885,18 @@ function failLine(r: { status: number; json: unknown }) {
 }
 
 /** The toast for why the last offer died or the server took you out of the queue (`cancelled`, on one read only). */
-async function noteCancelled($: $, q: ApiQueueState | null) {
+async function noteCancelled($: $, q: ApiQueueState | null, queued = true) {
   if (!q?.cancelled) return
   const reason = q.cancelled.reason
   if (reason === 'update_required') {
     const rel = (await read($, link)).release
-    if (rel) {
-      // The floor's line, said here: floorTold doesn't say it again once the queue is put away.
+    // The floor's line, always said for a queue this session had you in (`queued`: floorTold says nothing outside idle, and
+    // a floor said before, lifted and put back still drops you with a word). A lanes poll between matches carries the line
+    // and the drop in one answer, and floorTold has just said it there. Either way floorTold doesn't say it again after.
+    if (rel && (queued || floorSaid !== rel.min)) {
       floorSaid = rel.min
+      floorSaidAt = await $.clock.now()
+      floorLifted = false
       await ambient($, MOD.updateNeeded(rel.min, VERSION), 'match')
     }
   } else await ambient($, cancelledLine(String(reason)), 'match')
@@ -5456,6 +5532,8 @@ async function refreshBoards($: $) {
 /** Switches tabs, and starts or stops what the tab reads from the server. */
 async function selectTab($: $, t: Tab) {
   if (t === 'ranked') roastIndex++
+  // The #1 card's setter: a read that failed is asked again when Settings is opened again (set before the tab moves, so the draw that follows asks).
+  if (t === 'settings' && numberOneUi.read === 'failed') numberOneUi.read = 'no'
   await update($, tab, () => t)
   if (t === 'ranked' || t === 'grind') void refreshBoards($)
   // W5b: the linked account and the new installs, while sign-in is on.
@@ -6505,11 +6583,11 @@ async function noticeMatchEnd($: $, s: ApiMatchSummary, me: string) {
   const l = await read($, link)
   const { mine } = rankedSides(s, me)
   const outcome = s.status === 'void' ? 'void' : s.result === 'draw' ? 'draw' : s.winner === me ? 'win' : 'loss'
-  // Placing after: the summary's ref is the player now. Placing before: GET /me's standing in the match's bucket, read before
-  // the match ended; with none, a Mud tier before that isn't Mud after (placingOfSide's rule).
+  // By the server's count on the side (placingOfSide's rule), when it sends one. From a server before it: placing after is the
+  // summary's ref (the player now), and placing before is GET /me's standing in the match's bucket, read before the match ended.
+  // Never the tiers: a placed player can be in Mud, so Mud before and another tier after is as often a promotion.
   const before = meIn(l, bucketIdOf(s.bucket) ?? OPEN)
-  const placingAfter = !!mine.player.placement
-  const placingBefore = placingAfter || (before ? !!before.placement : mine.tier_before === 'Mud' && !!mine.tier_after && mine.tier_after !== 'Mud')
+  const { before: placingBefore, after: placingAfter } = placingAround(mine, before)
   for (const e of matchEndEvents({ outcome, tierBefore: mine.tier_before, tierAfter: mine.tier_after, placingBefore, placingAfter })) await noticeEvent($, e)
 }
 
@@ -7012,6 +7090,11 @@ export type Actions = {
   finisherReport: (matchId: string, reason: ReportReason) => void
   /** W10e: Play on the draft's preview or a gallery row's. */
   finisherPlay: (which: 'draft' | 'gallery') => void
+  /** The #1 card's setter in Settings: a box as typed, Enter in one (its text, then Save), then Save (the keys that changed) and Clear (both). */
+  numberOneType: (box: NumberOneBox, text: string, surface: string, drawn: number) => void
+  numberOneEnter: (box: NumberOneBox, text: string, surface: string, drawn: number) => void
+  numberOneSave: () => void
+  numberOneClear: () => void
   /** Settings' Resync (2026-10-12): this session and the store's ranked state start again from the server. */
   resync: () => void
 }
@@ -7228,7 +7311,7 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
       <Box gap={1} alignItems="center" flexWrap="wrap">
         {rich ? (
           <Svg
-            source={bandStrip({ kind: 'found', me, them: o.opponent.handle, theirRating: o.opponent.rating, seconds: secs, ...(challenge ? { mode: 'challenge' as const, of: offerSeconds(cf, secs) } : {}) })}
+            source={bandStrip({ kind: 'found', me, them: o.opponent.handle, theirRating: o.opponent.rating, theirPlacing: !!o.opponent.placement, seconds: secs, ...(challenge ? { mode: 'challenge' as const, of: offerSeconds(cf, secs) } : {}) })}
             alt={`${challenge ? 'Challenge' : 'Opponent found'}: ${line}. ${secs} seconds to accept.`}
           />
         ) : (
@@ -7297,7 +7380,7 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
             {rich ? (
               // The result's line is drawn in the strip, past a dashed rule, as the Grind strip draws a commit's title.
               <Svg
-                source={bandStrip({ kind: 'result', mode: modeWord(sm), outcome, hours: sm.length_min / 60, delta, ratingBefore: mine.rating_before, ratingAfter: mine.rating_after ?? mine.rating_before, mine: mine.points, theirs: them.points, placing: placingOfSide(mine), ...unratedOf(sm), line })}
+                source={bandStrip({ kind: 'result', mode: modeWord(sm), outcome, hours: sm.length_min / 60, delta, ratingBefore: mine.rating_before, ratingAfter: mine.rating_after ?? mine.rating_before, mine: mine.points, theirs: them.points, placing: placingFor(mine), ...unratedOf(sm), line })}
                 alt={line}
               />
             ) : (
@@ -7513,12 +7596,8 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
   )
 }
 
-/** Where a ranked side stands on placement, for the result card and band: still placing, or placed by this match. */
-function placingOfSide(side: ApiMatchSummary['sides'][number]) {
-  if (side.player.placement) return { played: side.player.placement.played, of: side.player.placement.of }
-  if (side.tier_before === 'Mud' && side.tier_after && side.tier_after !== 'Mud') return { played: 3, of: 3, placedIn: side.tier_after.toLowerCase() as TierKey }
-  return undefined
-}
+/** placingOfSide's answer (pure.ts) as the drawings take it: the tier it placed in as a tier key. */
+const placingFor = (side: ApiMatchSummary['sides'][number]) => placingOfSide(side) as { played: number; of: number; placedIn?: TierKey } | undefined
 
 function resultWord(m: Match) {
   return m.status === 'won' ? 'You won' : m.status === 'lost' ? 'You lost' : m.status === 'draw' ? 'Draw' : m.status === 'forfeit' ? 'Forfeit' : m.status === 'void' ? 'Void' : 'Live'
@@ -8029,7 +8108,7 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
     // Its lanes only: another bucket's still cached (a read in flight when the row moved, say) draw nothing until its own land.
     const shown: ApiLane[] = lanesIn(l, onScreen?.id ?? null) ?? []
     const picked = pickedLengths(sh.lengthsMin, shown)
-    const lanes = shown.map(x => ({ min: x.length_min, label: x.label, hours: x.length_min / 60, ticked: picked.includes(x.length_min), wait: waitLabel(x.wait_ms), waiting: x.waiting, swing: x.swing }))
+    const lanes = shown.map(x => ({ min: x.length_min, label: x.label, hours: x.length_min / 60, ticked: picked.includes(x.length_min), wait: waitLabel(x.wait_ms), waiting: x.waiting, swing: x.swing, win: typeof x.win === 'number' ? x.win : null }))
     // The picker line names only lengths offered: the shortest and the longest lane.
     const line = pickerLine(shown.map(x => x.label))
     const mine = meIn(l, bid)
@@ -8059,8 +8138,8 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
         )}
         {rich ? (
           <Svg
-            source={queueBar({ lanes: lanes.map(x => ({ hours: x.hours, ticked: x.ticked, wait: x.wait, waiting: x.waiting, swing: x.swing ?? undefined })), line })}
-            alt={`Queue up. Lose in public. ${line ? `${line} ` : ''}${lanes.map(x => `${x.label} ${x.ticked ? 'ticked' : 'not ticked'}, ${x.wait}, ${x.waiting} waiting${x.swing !== null ? `, swing ${x.swing}` : ''}`).join('. ')}.`}
+            source={queueBar({ lanes: lanes.map(x => ({ hours: x.hours, ticked: x.ticked, wait: x.wait, waiting: x.waiting, swing: x.swing ?? undefined, win: x.win ?? undefined })), line })}
+            alt={`Queue up. Lose in public. ${line ? `${line} ` : ''}${lanes.map(x => `${x.label} ${x.ticked ? 'ticked' : 'not ticked'}, ${x.wait}, ${x.waiting} waiting${x.swing !== null ? (typeof x.win === 'number' && x.win !== x.swing ? `, win ${x.win}, loss ${x.swing}` : `, swing ${x.swing}`) : ''}`).join('. ')}.`}
           />
         ) : (
           <Box flexDirection="column">
@@ -8073,7 +8152,7 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
             {line && <Text dimColor>{line}</Text>}
             {lanes.map(x => (
               <Text color={x.ticked ? ORANGE : STONE}>
-                {x.ticked ? '◉' : '○'} {x.label} · {x.wait} · {x.waiting} waiting{x.swing !== null ? ` · ±${x.swing}` : ''}{x.ticked ? '' : ' · off'}
+                {x.ticked ? '◉' : '○'} {x.label} · {x.wait} · {x.waiting} waiting{x.swing !== null ? ` · ${laneStakeText(x)}` : ''}{x.ticked ? '' : ' · off'}
               </Text>
             ))}
             <Text dimColor>1 pick lengths › 2 queue › 3 accept in 60s › 4 ship before the bell</Text>
@@ -8283,7 +8362,7 @@ async function rankedBody($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: 
               ratingAfter: mine.rating_after ?? mine.rating_before,
               commits: { mine: mine.commits, theirs: them.commits },
               biggest: { points: mine.biggest_commit?.points ?? 0, craft: (mine.biggest_commit?.craft as 'clean' | 'neutral' | 'sloppy' | undefined) ?? 'neutral' },
-              placing: placingOfSide(mine),
+              placing: placingFor(mine),
               ...unratedOf(sm),
             })}
             alt={line}
@@ -8718,15 +8797,16 @@ async function matchTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: nu
 
 // ---------------------------------------------------------------- ranked tab
 
-// The mock standings everything shares (Jaen, 2026-10-07): jaen is #1 at 1712, 41-9, and
-// is the one row left out here, since your own row is your real practice rating.
+// The mock standings everything shares (Jaen, 2026-10-07; the on-ramp's ratings, 2026-10-13):
+// jaen is #1 at 1412, 41-9, and is the one row left out here, since your own row is your real
+// practice rating.
 const SAMPLE: [string, number, string][] = [
-  ['10xgary', 1688, '38-12'],
-  ['nova_ships', 1655, '36-14'],
-  ['rk', 1488, '30-14'],
-  ['vex', 1391, '27-15'],
-  ['tokyo_drift', 1340, '22-16'],
-  ['quietcommit', 902, '5-11'],
+  ['10xgary', 1388, '38-12'],
+  ['nova_ships', 1355, '36-14'],
+  ['rk', 1288, '30-14'],
+  ['vex', 1191, '27-15'],
+  ['tokyo_drift', 1160, '22-16'],
+  ['quietcommit', 1001, '10-9'],
 ]
 
 async function rankedTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Promise<RenderElement> {
@@ -8784,7 +8864,7 @@ async function rankedTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): Pro
         </Box>
       )}
       <Text dimColor>
-        Elo: K 40 for your first 10 matches, then 24. Win, loss or draw only. Tiers: Mud, Iron 650, Bronze 800, Silver 950, Gold 1100, Platinum 1250, Diamond 1400, Master 1600.
+        Elo: K 40 for your first 10 matches, then 24. Win, loss or draw only. You start at 800. Your first 10 wins each pay 20 extra. Tiers: Mud, Iron 900, Bronze 960, Silver 1020, Gold 1080, Platinum 1150, Diamond 1230, Master 1320.
       </Text>
     </Box>,
   )
@@ -9273,6 +9353,8 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
         </Box>
       )}
       <Text dimColor>These stay on this machine and apply to every session; chat off also tells your opponent. The match-found check can't be turned off.</Text>
+      {/* The #1 card's setter (your line and your X handle), while config's number_one.custom is on and the server knows this install. Below the line about the switches above: what this block holds goes to the server. */}
+      {numberOneOn(cf.raw) && l.me && (await numberOneBlock($, e, els, a, cfg))}
       <Box gap={1} alignItems="center">
         <Text>Show my commit titles to opponents</Text>
         <Button key="share-on" label="On" variant={s.share ? 'primary' : 'secondary'} onPress={() => a.setShare(true)} />
@@ -9316,6 +9398,301 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
         <Link href={BUG_LINK} label="@speedrunjaen" />
         <Text>on X.</Text>
       </Box>
+    </Box>
+  )
+}
+
+// ---------------------------------------------------------------- the #1 card's own words, set (Settings)
+// The #1 card draws the line and the X handle its player set (numberOneCard, above). This is where
+// a player sets theirs: a block in Settings, drawn only while config's number_one.custom is on for
+// them and the server knows this install, so it is dark until the switch is flipped. Any signed-in
+// player may save one ahead of time; the server shows it only while they hold #1.
+//   - GET /me/number-one is read once per session and account, the first time the block draws
+//     (never at boot, never on a poll), by a request no draw waits for. A read that failed draws
+//     empty boxes and is asked again the next time Settings is opened (selectTab). A save's answer
+//     has the same shape and is the block's new state, so no read follows a save unless its answer
+//     doesn't read.
+//   - Save sends PUT /me/number-one with exactly the keys that changed (numberOnePatch); Clear
+//     sends both as null. The one check made here is the line's length. Every other rule is the
+//     server's, and a refusal is drawn in the server's own words (numberOneRefusal), with the
+//     boxes left as typed.
+//   - One save at a time. A press while one is out says so and sends nothing. A box the player
+//     types in while a save is out keeps what they typed when the answer lands: the answer fills
+//     only a box that still holds what it held when the save went (holdNumberOne).
+//   - The line and the handle are the player's own words: they live in this module's memory and
+//     draw only in their own two boxes. Never $.state, $.store, a toast, the band, the status
+//     line, a command reply, $.prompt or $.session.append. `numberOneRev` moves the redraw.
+//   - Nothing the engine won't draw reaches the tree: what the server holds goes through
+//     numberOneSaved, what is typed through numberOneKept, a refusal through drawable. One such
+//     character in a box's value blanks the whole Settings tab, Clear included.
+//   - In the terminal, Enter in a box makes that box a new element on its next draw; everywhere
+//     else a box keeps its key, and with it its focus and caret (numberOneKey). Until that draw
+//     the terminal still has the old box, with its text emptied: a key or an Enter from it is
+//     dropped (numberOneStale), or it would put '' in the mod's hands as if typed.
+//   - A box counts as typed in only while its text differs from what it last took from the
+//     server (`took`), never because a key or Enter was pressed in it. A read fills every box
+//     that isn't typed in when it lands. One that is keeps its text and never shows what the
+//     server holds for it; if the player empties it after that, Save sends null for it.
+//   - Mobile has no Input (Elements.mobile), so there the block says where to set it instead.
+
+/** A save that hasn't answered in this long no longer holds the buttons ($.http.fetch has no timeout). */
+const NUMBER_ONE_SAVE_MS = 20_000
+
+/** The setter's two boxes. */
+type NumberOneBox = 'line' | 'x'
+const NUMBER_ONE_BOXES: readonly NumberOneBox[] = ['line', 'x']
+
+/** The setter's state for one account. Module memory only (the player's own words are in it). */
+type NumberOneUi = {
+  /** `<server url>|<handle>`: whose this is. Another account's never draws. */
+  key: string
+  /** What the server holds, as last read (GET's answer, or a save's); null until one lands. */
+  saved: NumberOneOwn | null
+  /** The read: not asked yet, out, landed, or failed (asked again the next time Settings opens). */
+  read: 'no' | 'out' | 'done' | 'failed'
+  /** The two boxes, as typed (numberOneKept). */
+  line: string
+  x: string
+  /**
+   * What each box held when it last took what the server holds ('' before any). A box whose text
+   * differs was typed in since, and a read that lands late leaves it alone. One that only had
+   * Enter or Backspace pressed in it, or was typed in and put back, still takes the read.
+   */
+  took: { line: string; x: string }
+  /** When the save that is out was sent (0: none out), and how many were sent: only the newest one's answer is taken. */
+  savingAt: number
+  saves: number
+  /** The line under the buttons (a save out, its result, why not), and whether it is good news. */
+  note: string
+  ok: boolean
+}
+
+function numberOneUi0(key: string): NumberOneUi {
+  return { key, saved: null, read: 'no', line: '', x: '', took: { line: '', x: '' }, savingAt: 0, saves: 0, note: '', ok: true }
+}
+
+let numberOneUi: NumberOneUi = numberOneUi0('')
+/** How many times Enter was pressed in each box in the terminal since this module loaded: a terminal box's key carries its count. */
+const numberOneEnters: Record<NumberOneBox, number> = { line: 0, x: 0 }
+
+/**
+ * A box's key. In the terminal, `number-one-line-<n>` and `number-one-x-<n>`, n the Enters pressed
+ * in that box there. The terminal's Input keeps the text typed in a field by its key, draws it in
+ * place of `value`, and once a submit is handled sets it to the empty string, which stays until
+ * `value` changes from one draw to the next (read from Claude Code 2.1.295 and 2.1.296). So a box
+ * that kept its key through an Enter whose answer left its text as it was (nothing to save, a
+ * refusal, the box that wasn't edited) would draw empty while the mod still holds the text. A new
+ * key is a field nothing was typed in: it draws `value`, which is what the mod holds. The terminal
+ * keeps focus by the box's place, so the new box has it. One cost, between an Enter and the draw
+ * that follows it: the old box is still on screen, empty, and what is pressed in it (a key, a
+ * second Enter) is dropped on purpose (numberOneStale). The player sees the box blank for that
+ * moment, then their text back as it was at the Enter, without the key.
+ * Everywhere else the key is fixed (`number-one-line`, `number-one-x`). The desktop empties nothing
+ * on Enter, and it gives a box its typed text, focus and caret back after a redraw by its key, so
+ * a new key there would fix nothing and cost the box its focus after every Enter (PR 102's check).
+ */
+function numberOneKey(box: NumberOneBox, surface: string) {
+  return surface === 'terminal' ? `number-one-${box}-${numberOneEnters[box]}` : `number-one-${box}`
+}
+
+/**
+ * Whether an input event comes from a terminal box that is no longer the one drawn: Enter was
+ * pressed in it since (`drawn` is the count its element was drawn with), and the mod's next draw
+ * hasn't replaced it yet. The engine has already emptied that box's text, so its events carry
+ * that and not what the player wrote: a second Enter would send '', the mod would keep '' as
+ * typed, and Save would clear a stored line or handle the player never emptied; a key would
+ * replace the whole text with itself (PR 102's recheck, R1). Such an event changes nothing and
+ * sends nothing. Never true off the terminal: the count doesn't move there.
+ */
+function numberOneStale(box: NumberOneBox, surface: string, drawn: number) {
+  return surface === 'terminal' && drawn !== numberOneEnters[box]
+}
+
+/** This account's setter state: a fresh one when the account changed. */
+function numberOneFor(key: string) {
+  if (numberOneUi.key !== key) numberOneUi = numberOneUi0(key)
+  return numberOneUi
+}
+
+/**
+ * A box as typed (or pasted): kept less what the engine won't draw. No redraw: the box holds it.
+ * Nothing marks the box here. Enter sends a box's own text and Backspace in an empty box sends '',
+ * so an input event is no sign of typing; whether a box was typed in is read off its text
+ * (holdNumberOne).
+ */
+function typeNumberOne(box: NumberOneBox, text: string) {
+  numberOneUi[box] = numberOneKept(text)
+}
+
+/**
+ * What the server holds becomes the block's. A box takes it unless the player typed in it since:
+ * after a read, since the box last took a value (its text is no longer `took`'s); after a save,
+ * since that save went (its text is no longer `sent`'s, the boxes as they were when it was sent).
+ * So typing while a save is out is never lost to its answer, and the next Save sends it; and a
+ * box that isn't typed in when a read lands shows what the server holds from then on. A box that
+ * is typed in when the read lands is skipped and `took` stays as it was, so it never shows the
+ * stored value: emptied later, it is sent as null like any emptied box (numberOnePatch).
+ */
+function holdNumberOne(ui: NumberOneUi, saved: NumberOneOwn, sent: { line: string; x: string } | null) {
+  ui.saved = saved
+  for (const box of NUMBER_ONE_BOXES) {
+    if (ui[box] !== (sent ?? ui.took)[box]) continue
+    ui[box] = saved[box] ?? ''
+    ui.took[box] = ui[box]
+  }
+}
+
+/** A line under the block's buttons, then a redraw. */
+async function numberOneNote($: $, ui: NumberOneUi, note: string, isOk: boolean) {
+  ui.note = note
+  ui.ok = isOk
+  await update($, numberOneRev, n => n + 1)
+}
+
+/**
+ * GET /me/number-one for the block. The caller sets `read` to out first, in the same step as it
+ * checks it, so two draws never ask twice. A save that answered while this was out is newer: its
+ * answer stays. A save that went and left nothing behind (refused, unanswered, an answer that
+ * doesn't read) doesn't cost the read its values: without them the boxes would stay empty for
+ * the session, since a read that landed is never asked again.
+ */
+async function readNumberOne($: $, ui: NumberOneUi) {
+  const before = ui.saves
+  const r = await api($, 'GET', '/me/number-one', undefined, { keepNote: true })
+  if (numberOneUi !== ui || keyOf(await serverCfg($)) !== ui.key) return
+  const saved = r.status === 200 ? numberOneSaved(r.json) : null
+  ui.read = saved ? 'done' : 'failed'
+  if (saved && (ui.saves === before || ui.saved === null)) holdNumberOne(ui, saved, null)
+  await update($, numberOneRev, n => n + 1)
+}
+
+/** Starts the block's read when it hasn't been asked (or failed and Settings was opened again). Never awaited: a draw calls it. */
+function wantNumberOne($: $, ui: NumberOneUi) {
+  if (ui.read !== 'no') return
+  ui.read = 'out'
+  void readNumberOne($, ui).catch(err => {
+    ui.read = 'failed'
+    $.ui.log(`CCSR #1 line: ${(err as Error).message}`)
+  })
+}
+
+/**
+ * Why a save didn't go through: the server's own words when it gave some (its rules for a line
+ * and an X handle, the hourly limit, a room ban), else that it wasn't reached, or what it answered.
+ * Cut to a line's worth, then made drawable (the cut can leave half a pair).
+ */
+function numberOneRefusal(r: { status: number; json: unknown }) {
+  const err = errorOf(r.json)
+  if (err && err.message !== err.code) return drawable(cleanServer(err.message).slice(0, NOTE_MAX))
+  if (!reachedOf(r)) return NUMBER_ONE.offline
+  return r.status === 429 ? NUMBER_ONE.tooMany : MOD.answered(r.status)
+}
+
+/**
+ * Save (PUT /me/number-one with the keys that changed) or Clear (both null). The answer has GET's
+ * shape and is the block's new state: each box then shows what the server keeps, unless the
+ * player typed in it after the save went. A refusal, a 429 or no answer leaves the boxes exactly
+ * as typed and says why under the buttons. Nothing is sent while the switch is off, with nothing
+ * changed, for a line past the bound, or while a save is out (that press says so).
+ */
+async function saveNumberOne($: $, clear: boolean) {
+  const cfg = await serverCfg($)
+  if (!cfg.token || !numberOneOn((await configOf($, cfg)).raw)) return
+  const ui = numberOneFor(keyOf(cfg))
+  const t = await $.clock.now()
+  if (ui.savingAt && t - ui.savingAt < NUMBER_ONE_SAVE_MS) return numberOneNote($, ui, NUMBER_ONE.stillSaving, true)
+  // The boxes as this save takes them: its answer fills only a box that still holds this.
+  const sent = { line: ui.line, x: ui.x }
+  const body = clear ? { line: null, x: null } : numberOnePatch(sent, ui.saved)
+  if (Object.keys(body).length === 0) return numberOneNote($, ui, NUMBER_ONE.nothing, true)
+  if (typeof body.line === 'string' && [...body.line].length > NUMBER_ONE_SET_MAX) return numberOneNote($, ui, NUMBER_ONE.tooLong(NUMBER_ONE_SET_MAX), false)
+  const n = ++ui.saves
+  ui.savingAt = t
+  await numberOneNote($, ui, NUMBER_ONE.saving, true)
+  const r = await api($, 'PUT', '/me/number-one', body, { keepNote: true })
+  // Another account since, or a later save: this answer is nobody's.
+  if (numberOneUi !== ui || ui.saves !== n || keyOf(await serverCfg($)) !== ui.key) return
+  ui.savingAt = 0
+  if (r.status !== 200) return numberOneNote($, ui, numberOneRefusal(r), false)
+  const saved = numberOneSaved(r.json)
+  if (saved) {
+    holdNumberOne(ui, saved, sent)
+    // What the server holds is known now, so a read that failed has nothing left to ask.
+    if (ui.read === 'failed') ui.read = 'done'
+  } else if (ui.read !== 'out') {
+    // A 200 that doesn't read: the server is asked what it holds, once, and each box not typed in since the save went takes that.
+    for (const box of NUMBER_ONE_BOXES) if (ui[box] === sent[box]) ui.took[box] = ui[box]
+    ui.read = 'no'
+    wantNumberOne($, ui)
+  }
+  // A box typed in while this save was out (a press turned away with it, too) holds text the server doesn't have: the line says so.
+  const done = clear ? NUMBER_ONE.cleared : NUMBER_ONE.saved
+  const more = !!saved && Object.keys(numberOnePatch({ line: ui.line, x: ui.x }, saved)).length > 0
+  await numberOneNote($, ui, more ? `${done} ${NUMBER_ONE.since}` : done, true)
+}
+
+/**
+ * The #1 card's setter in Settings: a heading, the line's box, the X handle's box, Save and Clear,
+ * where it shows, and the line about the last save. Enter in either box saves, as the button does,
+ * and in the terminal that box is a new element on the next draw (numberOneKey). The boxes hold
+ * what was typed (module memory) across every redraw. On mobile, which has no Input, the heading,
+ * where it shows and where to set it.
+ */
+async function numberOneBlock($: $, e: RenderInput<'Pane'>, els: El, a: Actions, cfg: ServerConfig): Promise<RenderElement> {
+  await read($, numberOneRev)
+  const { Box, Text, Button, Input } = els
+  if (e.surface === 'mobile')
+    return (
+      <Box flexDirection="column">
+        <Text bold>{NUMBER_ONE.title}</Text>
+        <Text dimColor wrap="wrap">
+          {NUMBER_ONE.what}
+        </Text>
+        <Text dimColor wrap="wrap">
+          {NUMBER_ONE.elsewhere}
+        </Text>
+      </Box>
+    )
+  const ui = numberOneFor(keyOf(cfg))
+  wantNumberOne($, ui)
+  // Each box's count as this draw has it: its handlers carry it, so an event from a box the terminal has since replaced is told apart (numberOneStale).
+  const drawn = { line: numberOneEnters.line, x: numberOneEnters.x }
+  return (
+    <Box flexDirection="column">
+      <Text bold>{NUMBER_ONE.title}</Text>
+      <Input
+        key={numberOneKey('line', e.surface)}
+        label={NUMBER_ONE.lineLabel}
+        placeholder={NUMBER_ONE.linePlaceholder(NUMBER_ONE_SET_MAX)}
+        value={ui.line}
+        submitLabel={NUMBER_ONE.save}
+        onInput={v => a.numberOneType('line', v, e.surface, drawn.line)}
+        onSubmit={v => a.numberOneEnter('line', v, e.surface, drawn.line)}
+      />
+      <Input
+        key={numberOneKey('x', e.surface)}
+        label={NUMBER_ONE.xLabel}
+        placeholder={NUMBER_ONE.xPlaceholder}
+        value={ui.x}
+        submitLabel={NUMBER_ONE.save}
+        onInput={v => a.numberOneType('x', v, e.surface, drawn.x)}
+        onSubmit={v => a.numberOneEnter('x', v, e.surface, drawn.x)}
+      />
+      <Box gap={1} alignItems="center" flexWrap="wrap">
+        <Button key="number-one-save" label={NUMBER_ONE.save} variant="primary" onPress={() => a.numberOneSave()} />
+        <Button key="number-one-clear" label={NUMBER_ONE.clear} onPress={() => a.numberOneClear()} />
+      </Box>
+      <Text dimColor wrap="wrap">
+        {NUMBER_ONE.what}
+      </Text>
+      {ui.note &&
+        (ui.ok ? (
+          <Text wrap="wrap">{ui.note}</Text>
+        ) : (
+          <Text color={ORANGE} wrap="wrap">
+            {ui.note}
+          </Text>
+        ))}
     </Box>
   )
 }
@@ -11090,6 +11467,7 @@ async function resetGrind($: $) {
 }
 
 async function resetRating($: $) {
+  await save($, K.onramp, true)
   await save($, K.rating, START_RATING)
   await save($, K.record, { w: 0, l: 0, d: 0 })
   await update($, rating, () => START_RATING)
@@ -11231,6 +11609,20 @@ function actions($: $): Actions {
     finisherAskReport: matchId => go(askArtReport($, matchId)),
     finisherReport: (matchId, reason) => go(reportArt($, matchId, reason)),
     finisherPlay: which => go(replayFinisher($, which === 'draft' ? DRAFT_PLAY : GALLERY_PLAY)),
+    // The player's own words, kept out of $.state (a module variable): the box holds what was typed.
+    numberOneType: (box, text, surface, drawn) => {
+      if (numberOneStale(box, surface, drawn)) return
+      typeNumberOne(box, text)
+    },
+    numberOneEnter: (box, text, surface, drawn) => {
+      if (numberOneStale(box, surface, drawn)) return
+      typeNumberOne(box, text)
+      // In the terminal the box Enter was pressed in is a new element on its next draw (numberOneKey says why, and why only there).
+      if (surface === 'terminal') numberOneEnters[box]++
+      go(saveNumberOne($, false))
+    },
+    numberOneSave: () => go(saveNumberOne($, false)),
+    numberOneClear: () => go(saveNumberOne($, true)),
     resync: () => go(resync($)),
   }
 }
@@ -11242,12 +11634,12 @@ async function lab($: $, what: string, surface: string) {
     return note('Toast sent: top right of the transcript, a click dismisses it.')
   }
   if (what === 'status') {
-    $.ui.status('CCSR · Gold 1184 · Grind #212 this week · in a match')
+    $.ui.status('CCSR · Gold 1119 · Grind #212 this week · in a match')
     $.clock.after(6000, () => void refreshStatus($))
     return note('Status line replaced for 6 seconds, under the prompt.')
   }
   if (what === 'ask') {
-    const answer = await $.ui.ask('Match found: 3H vs 10xgary (Gold 1184). Accept?', { header: 'CCSR', options: ['Accept', 'Decline'] })
+    const answer = await $.ui.ask('Match found: 3H vs 10xgary (Gold 1119). Accept?', { header: 'CCSR', options: ['Accept', 'Decline'] })
     return note(`ui.ask answered: ${answer || '(dismissed)'}`)
   }
   if (what === 'copy') {
@@ -11765,7 +12157,7 @@ async function drawScorecard($: $, e: RenderInput<'CommandOutput'>): Promise<Ren
     )
   return (
     <Svg
-      source={scorecard({ outcome, hours: sm.length_min / 60, me: mine.player.handle, them: them.player.handle, mine: mine.points, theirs: them.points, commits: { mine: mine.commits, theirs: them.commits }, delta, ratingBefore: mine.rating_before, ratingAfter: mine.rating_after ?? mine.rating_before, placing: placingOfSide(mine), mode: modeWord(sm), ...unratedOf(sm) })}
+      source={scorecard({ outcome, hours: sm.length_min / 60, me: mine.player.handle, them: them.player.handle, mine: mine.points, theirs: them.points, commits: { mine: mine.commits, theirs: them.commits }, delta, ratingBefore: mine.rating_before, ratingAfter: mine.rating_after ?? mine.rating_before, placing: placingFor(mine), mode: modeWord(sm), ...unratedOf(sm) })}
       alt={rankedResultLine(sm, me)}
     />
   )

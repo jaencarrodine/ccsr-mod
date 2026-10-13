@@ -15,6 +15,8 @@ import { backfillOn } from './transcripts'
 import { usageOn } from './usage'
 // W10e: custom finishers' privacy line follows config's `finishers.custom.create`.
 import { customOf } from './finishers-custom'
+// The #1 card's setter: its privacy line follows config's `number_one.custom`.
+import { numberOneOn } from './pure'
 
 /** Approved in docs/copy.md. */
 export const LINES = {
@@ -88,6 +90,45 @@ export const ROASTS = [
   'Their Claude has a 401k now.',
   'Microwaving fish at the desk to intimidate an opponent in another country',
 ]
+
+/**
+ * The #1 card's setter in Settings (docs/copy.md, "The #1 card"): drawn while config's
+ * number_one.custom is on and the server knows this install. The line and the handle a player
+ * types are their own words, drawn in their boxes and never inside one of these. A save the
+ * server refuses shows the server's message as it comes; these are the mod's own lines around it.
+ * None reaches a command reply.
+ */
+export const NUMBER_ONE = {
+  title: 'Your #1 line',
+  lineLabel: 'Line',
+  linePlaceholder: (max: number) => `Up to ${max} characters`,
+  xLabel: 'X handle',
+  xPlaceholder: 'With or without the @',
+  save: 'Save',
+  clear: 'Clear',
+  /** The dim line under the buttons: where it shows, and that it is kept until then. */
+  what: 'Shows on the #1 card while you hold #1. Until then it waits.',
+  /** Under the buttons from the press until the server answers. */
+  saving: 'Saving.',
+  saved: 'Saved.',
+  cleared: 'Cleared.',
+  /** After Saved. or Cleared., when a box holds text typed while that save was out: the server doesn't have it. */
+  since: "What you typed since isn't saved yet.",
+  /** Save, Clear or Enter while a save is still out: that press sends nothing. */
+  stillSaving: 'Still saving. Try again in a moment.',
+  /** Save with both boxes as the server already has them: nothing is sent. */
+  nothing: 'Nothing to save.',
+  /** The one check the mod makes before the server does, in the server's words for it. */
+  tooLong: (max: number) => `Keep your line to ${max} characters.`,
+  /** A save that never reached the server. The boxes keep what was typed. */
+  offline: "Can't reach the server. Nothing was saved.",
+  /** A 429 with no message of its own (the server's says how long). */
+  tooMany: 'Too many saves this hour. Try again later.',
+  /** Mobile has no text box: in the boxes' place. */
+  elsewhere: "Set your line in the terminal or the desktop app. This screen can't type one.",
+  /** What leaves your machine, while the setter is on for this player. */
+  sends: 'Saving a #1 line sends the line and your X handle to CCSR. Both show on the #1 card while you hold #1.',
+}
 
 /** The mod's own lines (docs/copy.md, "The mod", approved 2026-10-08). */
 export const MOD = {
@@ -243,6 +284,8 @@ export function privacyLines(cfg: ModConfig, rubric: string): string[] {
   if (Array.isArray(cfg.raw.notices)) lines.push(NOTICE.privacy)
   // W10e: while making finishers is on for this player, what a submitted finisher sends.
   if (customOf(cfg.raw).create) lines.push(CUSTOM.privacy)
+  // The #1 card's setter: while number_one.custom is on for this player, what a saved line sends.
+  if (numberOneOn(cfg.raw)) lines.push(NUMBER_ONE.sends)
   return lines
 }
 

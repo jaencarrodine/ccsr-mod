@@ -173,6 +173,8 @@ export type ApiLane = {
   ratings: number[]
   /** What an even match here is worth to you, either way; null when the server's isn't a number. */
   swing: number | null
+  /** v0.6: what an even win pays (the swing, plus the on-ramp's 20 while it is owed); null from a server before it, and missing from lanes an older mod's session shared. */
+  win?: number | null
 }
 
 export type ApiPlayerRef = { handle: string; rating: number; tier: ApiTier; is_top_100: boolean; placement: { played: number; of: number } | null }
@@ -230,6 +232,13 @@ export type ApiMatchSide = {
   rating_after: number | null
   tier_before: ApiTier
   tier_after: ApiTier | null
+  /**
+   * v0.6: this side's placement going into the match and once it is decided (equal until then),
+   * by the server's count; null is placed. Not null before and null after: this match placed
+   * them. A server before v0.6 sends neither.
+   */
+  placement_before?: { played: number; of: number } | null
+  placement_after?: { played: number; of: number } | null
   /** W2: this side's stakes while a rated match is undecided; null once decided or unrated. */
   stakes?: ApiStakes | null
   chat_enabled: boolean
@@ -612,6 +621,12 @@ declare module 'claude-code' {
        * other players' art, titles and handles are in it, and every plugin can read `$.state`.
        */
       customRev: number
+      /**
+       * The #1 card's setter in Settings: moves on every change of its block (the read landing, a
+       * save's result), which lives in register.tsx's module memory, never state: the line and the
+       * X handle are the player's own words, and every plugin can read `$.state`.
+       */
+      numberOneRev: number
     }
   }
 }

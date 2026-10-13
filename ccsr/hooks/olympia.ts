@@ -274,16 +274,20 @@ function coinAt(id: Id, o: CoinOpts, cx: number, cy: number, r: number) {
 export type TierKey = 'mud' | 'iron' | 'bronze' | 'silver' | 'gold' | 'platinum' | 'diamond' | 'master'
 export type Tier = { key: TierKey; name: string; min: number; fill: string; deep: string }
 
-/** Mud is the floor, from 0, and where every new player starts (Jaen, 2026-10-07). The rest match docs/api.md. */
+/**
+ * Mud is the floor, from 0, and where every new player starts (Jaen, 2026-10-07). The floors
+ * are the on-ramp's (2026-10-13): a new player shows 800, the middle (1000) is Bronze, and a
+ * placed player under 900 is in Mud. They match docs/api.md.
+ */
 export const TIERS: readonly Tier[] = [
   { key: 'mud', name: 'Mud', min: 0, fill: '#8A6A4F', deep: '#6B4F39' },
-  { key: 'iron', name: 'Iron', min: 650, fill: '#73777B', deep: '#55595D' },
-  { key: 'bronze', name: 'Bronze', min: 800, fill: '#B47A49', deep: '#8E5A31' },
-  { key: 'silver', name: 'Silver', min: 950, fill: '#BFC2C4', deep: '#93979A' },
-  { key: 'gold', name: 'Gold', min: 1100, fill: '#D6AB3E', deep: '#AE8724' },
-  { key: 'platinum', name: 'Platinum', min: 1250, fill: '#AFC8C3', deep: '#7FA09A' },
-  { key: 'diamond', name: 'Diamond', min: 1400, fill: '#AFC9E6', deep: '#7499C6' },
-  { key: 'master', name: 'Master', min: 1600, fill: '#FF6A2A', deep: '#C94E18' },
+  { key: 'iron', name: 'Iron', min: 900, fill: '#73777B', deep: '#55595D' },
+  { key: 'bronze', name: 'Bronze', min: 960, fill: '#B47A49', deep: '#8E5A31' },
+  { key: 'silver', name: 'Silver', min: 1020, fill: '#BFC2C4', deep: '#93979A' },
+  { key: 'gold', name: 'Gold', min: 1080, fill: '#D6AB3E', deep: '#AE8724' },
+  { key: 'platinum', name: 'Platinum', min: 1150, fill: '#AFC8C3', deep: '#7FA09A' },
+  { key: 'diamond', name: 'Diamond', min: 1230, fill: '#AFC9E6', deep: '#7499C6' },
+  { key: 'master', name: 'Master', min: 1320, fill: '#FF6A2A', deep: '#C94E18' },
 ]
 
 export function tierOf(rating: number): Tier {
@@ -509,8 +513,13 @@ function placingCard(p: Placing, wins: number, losses: number) {
   return svg(W, 134, `Mud, placing: ${p.played} of ${p.of} matches played, ${wins}-${losses}.`, s, C.bone)
 }
 
-/** One length on the queue bar: its length in hours (0.25 is 15m), whether it's ticked, the wait and who's waiting, and what an even match there is worth to you either way. */
-export type Lane = { hours: number; ticked: boolean; wait: string; waiting: number; swing?: number }
+/**
+ * One length on the queue bar: its length in hours (0.25 is 15m), whether it's ticked, the wait
+ * and who's waiting. `swing`: what an even match there is worth to you either way. `win`: what
+ * an even win pays when that is more (the on-ramp's bonus), drawn as +win/-swing.
+ */
+export type Lane = { hours: number; ticked: boolean; wait: string; waiting: number; swing?: number; win?: number }
+const laneStake = (l: Lane) => (l.swing == null ? '' : l.win != null && l.win !== l.swing ? `+${l.win}/-${l.swing}` : `±${l.swing}`)
 
 /**
  * The top of the Match tab between matches: the call to queue, each length as a
@@ -534,7 +543,7 @@ export function queueBar(a: { lanes: Lane[]; line?: string }) {
     s += `<rect x="18" y="${y - 9}" width="36" height="18" fill="${C.bone2}" stroke="${C.ink}" stroke-width=".8"/><path d="M29 ${y - 6}V${y + 6}M43 ${y - 6}V${y + 6}" stroke="${C.ink}" stroke-width="1.2"/>`
     s += l.ticked ? token(36, y, 7, true) : `<circle cx="36" cy="${y}" r="6.5" fill="${C.bone}" stroke="${C.stone2}" stroke-dasharray="2 2"/>`
     s += T(64, y + 5, hrs(l.hours), { s: 15, w: 700, c: l.ticked ? C.ink : C.stone2 })
-    s += T(102, y - 3, `${l.wait} · ${l.waiting} waiting${l.swing != null ? ` · ±${l.swing}` : ''}`, { s: 8.5, c: l.ticked ? C.ink : C.stone2 })
+    s += T(102, y - 3, `${l.wait} · ${l.waiting} waiting${l.swing != null ? ` · ${laneStake(l)}` : ''}`, { s: 8.5, c: l.ticked ? C.ink : C.stone2 })
     s += `<line x1="102" y1="${y + 3}" x2="424" y2="${y + 3}" stroke="${C.ink}" stroke-opacity="${l.ticked ? 0.75 : 0.25}" stroke-dasharray="2 4"/>`
     if (l.ticked) s += `<line x1="102" y1="${y + 3}" x2="168" y2="${y + 3}" stroke="${C.or}" stroke-width="3"/>`
     s += `<path d="M430 ${y - 8}V${y + 8}" stroke="${C.ink}" stroke-width="1.6"/><circle cx="430" cy="${y - 9}" r="2.2" fill="${C.ink}"/>`
@@ -554,7 +563,7 @@ export function queueBar(a: { lanes: Lane[]; line?: string }) {
     if (e != null && nx != null) s += `<line x1="${e + 5}" y1="${y}" x2="${nx - 9}" y2="${y}" stroke="${C.ink}" stroke-opacity=".35" stroke-dasharray="2 3"/>`
     if (state === 'now') s += `<path d="M${x - 4} ${y + 12}l4 4l4 -4" fill="none" stroke="${C.or}" stroke-width="1.6"/>`
   })
-  const lanes = a.lanes.map(l => `${hrs(l.hours).toLowerCase()} ${l.ticked ? 'ticked' : 'not ticked'}, ${l.wait}, ${l.waiting} waiting${l.swing != null ? `, swing ${l.swing}` : ''}`).join('; ')
+  const lanes = a.lanes.map(l => `${hrs(l.hours).toLowerCase()} ${l.ticked ? 'ticked' : 'not ticked'}, ${l.wait}, ${l.waiting} waiting${l.swing != null ? (l.win != null && l.win !== l.swing ? `, win ${l.win}, loss ${l.swing}` : `, swing ${l.swing}`) : ''}`).join('; ')
   return svg(W, y + 22, `${COPY.queueUp} ${COPY.queueUp2} ${lanes}. ${TODO_COPY.steps.join(', then ')}.`, s, C.bone)
 }
 
@@ -640,7 +649,15 @@ export function queue(a: {
   s += `<rect x="${f(l0)}" y="${ay - 16}" width="${f(r0 - l0)}" height="24" fill="${C.or}" fill-opacity=".22"/><path d="M${f(l0 + 6)} ${ay - 16}H${f(l0)}V${ay + 8}H${f(l0 + 6)}M${f(r0 - 6)} ${ay - 16}H${f(r0)}V${ay + 8}H${f(r0 - 6)}" stroke="${C.or}" stroke-width="2" fill="none"/>`
   s += `<line x1="30" y1="${ay}" x2="400" y2="${ay}" stroke="${C.ink}"/>`
   for (let r = lo; r <= hi; r += 50) s += `<line x1="${f(X(r))}" y1="${ay}" x2="${f(X(r))}" y2="${ay + (r % 100 ? 3 : 6)}" stroke="${C.ink}"/>` + (r % 100 === 0 ? T(X(r), ay + 16, r, { s: 8, c: C.stone2, a: 'middle' }) : '')
-  for (const t of TIERS) if (t.min > lo && t.min < hi) s += `<line x1="${f(X(t.min))}" x2="${f(X(t.min))}" y1="${ay - 46}" y2="${ay}" stroke="${C.stone2}" stroke-opacity=".5" stroke-dasharray="1 3"/>` + badgeAt(t.key, X(t.min) - 6, ay - 60, 12, 0.8)
+  // The tier floors come 60 to 90 apart (37px here), so a tier's line often lands on a widen label: it steps over the label's row.
+  const labels = a.widens.map(g => [X(a.rating + g.range) - g.label.length * 5.5 - 3, X(a.rating + g.range) + 2] as const)
+  for (const t of TIERS)
+    if (t.min > lo && t.min < hi) {
+      const x = f(X(t.min))
+      const ys = labels.some(([l, r]) => X(t.min) >= l && X(t.min) <= r) ? [[ay - 46, ay - 34], [ay - 21, ay]] : [[ay - 46, ay]]
+      for (const [y1, y2] of ys) s += `<line x1="${x}" x2="${x}" y1="${y1}" y2="${y2}" stroke="${C.stone2}" stroke-opacity=".5" stroke-dasharray="1 3"/>`
+      s += badgeAt(t.key, X(t.min) - 6, ay - 60, 12, 0.8)
+    }
   s += token(X(a.rating), ay - 4, 8, true)
   const rows = a.waiting.slice(0, 4)
   rows.forEach((row, i) => {
@@ -681,7 +698,7 @@ export function readyCheck(a: { hours: number; seconds: number; me: Player; them
       s += `<rect x="${x}" y="218" width="88" height="24" fill="${hot ? C.or : 'none'}" stroke="${C.ink}" stroke-width=".9"/>` + T(x + 10, 234, lab, { s: 8.5, w: 600, ls: 1.5 }) + T(x + 80, 235, `${v > 0 ? '+' : ''}${v}`, { s: 12, w: 700, a: 'end' })
     })
   else s += `<rect x="96" y="218" width="288" height="24" fill="none" stroke="${C.ink}" stroke-width=".9" stroke-dasharray="3 2"/>` + T(240, 234, 'UNRATED · BRAGGING RIGHTS ONLY', { s: 8.5, w: 600, a: 'middle', ls: 1.5 })
-  const who = `${challenge ? 'Challenge' : 'Opponent found'}: ${a.them.handle}, ${tierOf(a.them.rating).name} ${a.them.rating}. ${secs} seconds to accept.`
+  const who = `${challenge ? 'Challenge' : 'Opponent found'}: ${a.them.handle}, ${a.them.placing ? 'Mud, placing' : `${tierOf(a.them.rating).name} ${a.them.rating}`}. ${secs} seconds to accept.`
   return svg(W, 252, st ? `${who} Win ${st.win}, draw ${st.draw}, loss ${st.loss}.` : `${who} Unrated.`, s, C.bone)
 }
 
@@ -1033,7 +1050,12 @@ export function tierFrieze(a: { handle: string; rating: number; placing?: Placin
   if (pl) s += T(8, 172, `placing ${pl.played} of ${pl.of} · tier shows after match ${pl.of}`, { s: 9, w: 600, c: C.or })
   else if (nx) {
     const nxX = 8 + (ci + 1) * 58
-    s += `<path d="M${f(X(a.rating) + 9)} 166H${nxX - 2}" stroke="${C.or}" stroke-dasharray="2 2"/>` + T(nxX + 40, 170, `${nx.min - a.rating} to ${nx.name}`, { s: 9, w: 600, c: C.or, a: 'end' })
+    const to = `${nx.min - a.rating} to ${nx.name}`
+    // The leader runs from your token to where the label starts, and only when there is room: at 800 the token sits at the far end of Mud's cell, over the label.
+    const from = X(a.rating) + 9
+    const until = nxX + 36 - to.length * 5.4
+    if (until - from >= 6) s += `<path d="M${f(from)} 166H${f(until)}" stroke="${C.or}" stroke-dasharray="2 2"/>`
+    s += T(nxX + 40, 170, to, { s: 9, w: 600, c: C.or, a: 'end' })
   }
   return svg(W, 184, `Tiers from ${TIERS[0]!.name} to Master. ${a.handle} is ${pl ? `placing, ${pl.played} of ${pl.of}` : `${cur.name} at ${a.rating}${nx ? `, ${nx.min - a.rating} to ${nx.name}` : ''}`}.`, s, C.bone)
 }
@@ -1215,7 +1237,8 @@ export type Strip =
   | { kind: 'setup' }
   | { kind: 'grind'; points: number; category: string; craft: Craft; week: number; rank?: number; title?: string }
   | { kind: 'queue'; seconds: number; hours: number[]; rating: number; range: number }
-  | { kind: 'found'; me: string; them: string; theirRating: number; seconds: number; mode?: 'ranked' | 'challenge'; of?: number }
+  // `theirPlacing`: the opponent is still placing, so their tier and number stay hidden (Mud, placing).
+  | { kind: 'found'; me: string; them: string; theirRating: number; theirPlacing?: boolean; seconds: number; mode?: 'ranked' | 'challenge'; of?: number }
   | { kind: 'race'; race: Race; offlineAgo?: string; mode?: string }
   | { kind: 'result'; mode?: string; outcome: 'won' | 'lost' | 'draw'; hours: number; delta: number; ratingBefore: number; ratingAfter: number; mine: number; theirs: number; placing?: Placing & { placedIn?: TierKey }; rated?: false; line?: string }
 
@@ -1263,7 +1286,7 @@ export function bandStrip(a: Strip) {
   } else if (a.kind === 'found') {
     bg = C.or
     const challenge = a.mode === 'challenge'
-    s += token(16, 18, 10, false, a.me.slice(0, 1).toUpperCase()) + T(31, 22, 'vs', { s: 9 }) + token(56, 18, 10, false, a.them.slice(0, 1).toUpperCase()) + T(76, 15, challenge ? 'CHALLENGE' : 'OPPONENT FOUND', { s: 8.5, w: 700, ls: 1 }) + T(76, 28, `${a.them} · ${tierOf(a.theirRating).name} ${a.theirRating}`, { s: 8.5 })
+    s += token(16, 18, 10, false, a.me.slice(0, 1).toUpperCase()) + T(31, 22, 'vs', { s: 9 }) + token(56, 18, 10, false, a.them.slice(0, 1).toUpperCase()) + T(76, 15, challenge ? 'CHALLENGE' : 'OPPONENT FOUND', { s: 8.5, w: 700, ls: 1 }) + T(76, 28, `${a.them} · ${a.theirPlacing ? 'Mud, placing' : `${tierOf(a.theirRating).name} ${a.theirRating}`}`, { s: 8.5 })
     s += `<circle cx="276" cy="18" r="13" fill="${C.paper}" stroke="${C.ink}" stroke-dasharray="2 2"/>${ring(276, 18, 13, a.seconds / (a.of !== undefined && a.of > 0 ? a.of : 60), C.ink, 3)}` + T(276, 21.5, a.seconds, { s: 9, w: 700, a: 'middle' })
     alt = `${challenge ? 'Challenge' : 'Opponent found'}: ${a.them}. ${a.seconds} seconds to accept.`
   } else if (a.kind === 'race') {
