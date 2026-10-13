@@ -10,14 +10,7 @@ It's just Claude Code with a clock and someone to lose to.
 
 ## Install
 
-Paste both lines into Claude Code:
-
-```
-/plugin marketplace add jaencarrodine/ccsr-mod
-/plugin install ccsr@ccsr
-```
-
-Or make your Claude do it. Paste this instead:
+Paste this into Claude Code and your Claude installs it for you:
 
 ```
 Install the CCSR mod for me. It's the ccsr plugin from the github.com/jaencarrodine/ccsr-mod marketplace: ranked matches inside Claude Code, where my own Claude scores my commits. Run these two commands in my shell:
@@ -26,6 +19,13 @@ claude plugin marketplace add jaencarrodine/ccsr-mod
 claude plugin install ccsr@ccsr
 
 If the claude command isn't found, stop there and tell me to run /plugin marketplace add jaencarrodine/ccsr-mod and then /plugin install ccsr@ccsr in Claude Code myself, one at a time. It needs Claude Code 2.1.287 or later (2.1.286 in the desktop app), so tell me if mine is older. When it's installed, tell me to start a new session and run /ccsr to pick a handle.
+```
+
+Or run the two commands yourself:
+
+```
+/plugin marketplace add jaencarrodine/ccsr-mod
+/plugin install ccsr@ccsr
 ```
 
 Then start a new session and run `/ccsr`. Pick a handle. It'll be on a lot of Ls.

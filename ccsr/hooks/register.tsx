@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, ModelCompleteResult, RenderElement, RenderInput, RenderNode, Register } from 'claude-code'
 
 import type { ApiAccount, ApiChatItem, ApiCoder, ApiInstall, ApiLane, ApiLobbyItem, ApiMatchSummary, ApiPlayer, ApiQueueState, ApiRankedRow, ApiRecentMatch, ApiRoom, ApiScoreReply, ApiSeason, BacktestRun, ConfigState, RankedMatch, RankedShared, ChatLine, FeedItem, LinkState, Match, ModSettings, OutboxItem, PastSession, Record3, ScanStatus, SavedAccount, ScoredCommit, ServerConfig, Keyring, Surfaces, Tab, WeekTotals } from '../types'
-import { DEFAULT_SERVER, backoffMs, errorOf, handleProblem, hungExpiryMs, loopWaitMs, mergeEvents, retryAfterMs, retryable, scoreBody, sha256hex, watchdogMs, withoutCoder } from './api'
+import { DEFAULT_SERVER, backoffMs, errorOf, handleProblem, hungExpiryMs, loopWaitMs, mergeEvents, retryAfterMs, retryable, scoreBody, sha256hex, watchdogMs, withoutCoder, withoutTitle } from './api'
 import { CONFIG0, REREAD_JITTER_MS, configPath, headerReread, jitterMs, lineOf, parseConfig, signupsOf } from './config'
 import type { ModConfig, Surface } from './config'
 import { CLAUDE_FLOOR, UPDATE_ARGV, UPDATE_COMMAND, VERSION, standing } from './version'
@@ -283,6 +283,8 @@ const K = {
   orphans: 'orphans',
   // W7-2: Model stats as GET /me last said it, `{ key: '<server url>|<handle>', on }`, so a session offline plays by it.
   modelStats: 'modelStats',
+  // A press on this machine of Grind tracking or commit titles, the two switches the server keeps a copy of, `{ key: '<server url>|<handle>', at, told, share?, tracking? }`: the fields pressed and not confirmed yet, when the last press was, and when the server took them (null while it hasn't).
+  prefsPress: 'prefsPress',
   // The watch list's look at Claude Code's transcripts: `{ seeded, tried, failed, at }`, when this install's seed ran, when an attempt last began, when one last failed, and when any session here last looked, so one session looks at a time.
   repoLook: 'repoLook',
   // Usage weeks: `{ key: '<server url>|<handle>', anchor, through, held, again, tried, failed }`: the account's anchor as the server gave it, the newest week this install has read, the weeks read and not sent yet (weekly totals only, waiting for the account's first finished match), a week being sent once more, and when a run last began and last failed, so one session runs at a time.
@@ -2581,8 +2583,10 @@ async function refreshAccount($: $) {
     // W3b: where you stand in each bucket on for you (W3a), read through standingFor; a server before W3a sends none.
     const kept = (me.json as { buckets?: unknown } | null)?.buckets
     await update($, link, l => ({ ...l, meBuckets: Array.isArray(kept) ? kept.slice(0, 8) : null }))
-    const j = me.json as { player: ApiPlayer; account?: ApiAccount; settings?: { model_stats?: unknown } }
+    const j = me.json as { player: ApiPlayer; account?: ApiAccount; settings?: { model_stats?: unknown; grind_tracking?: unknown; share_titles?: unknown } }
     await update($, link, l => ({ ...l, me: j.player, account: j.account ?? null, unknownToken: false }))
+    // The account's copy of Grind tracking and commit titles: off there turns the switch off here. Not waited for: nothing below reads it.
+    void heardPrefs($, j.settings, askedAt).catch(() => null)
     // W6b: the account's Challenges switch is the one this install shows.
     await heardChallenges($, j.player, askedAt)
     // W5b: this read serves the sign-in rows and the new-install warning too, while sign-in is on.
@@ -3488,7 +3492,8 @@ async function setServerUrl($: $, url: string) {
 async function enqueue($: $, rows: ScoredCommit[], coders?: Map<string, ApiCoder>) {
   const cfg = await serverCfg($)
   if (!cfg.token || rows.length === 0) return
-  const s = await read($, settings)
+  // The stored switch, not this session's copy: Titles turned private in another session a moment ago counts here.
+  const s = await storedSettings($)
   const salt = await saltOf($)
   const sent = new Set(await storeGet<string[]>($, K.sent, []))
   const t = await $.clock.now()
@@ -3523,7 +3528,9 @@ async function flushOnce($: $) {
   let reply: ApiScoreReply | null = null
   for (const item of due) {
     // A coder block goes only while capture is on (W7-2); once this session knows it's off, the score goes without it.
-    const r = await api($, 'POST', '/scores', captureKnown && !capturing ? withoutCoder(item.body) : item.body)
+    // A title goes only while titles are shared now, read as each score goes: one queued before they went private, or a batch on its way when they do, stays here.
+    const body = (await storedSettings($)).share ? item.body : withoutTitle(item.body)
+    const r = await api($, 'POST', '/scores', captureKnown && !capturing ? withoutCoder(body) : body)
     if (r.status >= 200 && r.status < 300) {
       done.add(item.pid)
       reply = r.json as ApiScoreReply
@@ -3602,6 +3609,163 @@ async function dropCoders($: $) {
   const box = await storeGet<OutboxItem[]>($, K.outbox, [])
   if (!box.some(b => b.body.coder)) return
   await save($, K.outbox, box.map(b => (b.body.coder ? { ...b, body: withoutCoder(b.body) } : b)))
+}
+
+// ------------------------------------------------------------------ the server's copy of two switches
+// Grind tracking and commit titles are switches on this machine, and the server keeps a copy of
+// each for the account: it drops the title of a score from a player it holds as private (and
+// hides their titles everywhere), and refuses a Grind score from one it holds as not tracking.
+// The copy used to go only at Join, so a switch flipped later never reached it: Titles read
+// "shown" here while no opponent ever saw one.
+//
+// The rule, in both directions:
+//   - The server's copy changes only on a press here: a press sends the one field pressed, every
+//     time, whatever this install thinks the server holds (pressPref, tellPrefs).
+//   - A switch here turns on only by a press here. An account read never turns one on, and never
+//     sends anything of its own: signing in on a new machine pushes no defaults over the account.
+//   - Off on the server turns the switch off here on the next account read (heardPrefs): the
+//     account went private, or stopped tracking, on another machine, and this one follows.
+// So nothing becomes more public without a press on the machine it leaves from.
+
+/**
+ * A press of Grind tracking or commit titles the server hasn't confirmed, by `<server url>|<handle>`:
+ * the fields pressed since it last confirmed, when the last press was, and when it took them (null
+ * while it hasn't: each account read and config tick sends them again, and GET /me's answer never
+ * turns the switch back; nor does a GET /me asked before they were confirmed).
+ */
+type PrefsPress = { key: string; at: number; told: number | null; share?: boolean; tracking?: boolean }
+
+/** The last telling of the two switches in this session: the next waits on it (tellPrefs). */
+let prefsTelling: Promise<unknown> = Promise.resolve()
+let prefsTicking = false
+/** When this session last sent them, and the least time between two sends nobody pressed for: an account read and the config tick it sets off are one retry, not two. */
+let prefsTriedAt = 0
+const PREFS_RETRY_MS = 30_000
+/** How long an On the server hasn't confirmed is told again. Past it the On is dropped: the account may have gone private on another machine since, and an old press must not undo that. An Off is owed until it is told. */
+const PREFS_ON_MAX_MS = 600_000
+
+/**
+ * The press kept for `key` as it stands now, without an On the server never confirmed within
+ * PREFS_ON_MAX_MS of its press. With nothing left owed it counts as settled when it was pressed,
+ * so the next account read's answer stands (off there turns the switch off here).
+ */
+async function agedPress($: $, key: string): Promise<PrefsPress | null> {
+  const press = await storeGet<PrefsPress | null>($, K.prefsPress, null)
+  if (!press || press.key !== key || press.told !== null) return press
+  if (press.share !== true && press.tracking !== true) return press
+  if ((await $.clock.now()) - press.at <= PREFS_ON_MAX_MS) return press
+  const kept: PrefsPress = { key, at: press.at, told: null }
+  if (press.share === false) kept.share = false
+  if (press.tracking === false) kept.tracking = false
+  if (kept.share === undefined && kept.tracking === undefined) kept.told = press.at
+  await save($, K.prefsPress, kept)
+  return kept
+}
+
+/** The settings as the store holds them now: a session's own copy can be 30 s behind a press made in another. */
+async function storedSettings($: $) {
+  return withDefaults(await storeGet<Partial<ModSettings>>($, K.settings, {}))
+}
+
+/**
+ * Grind tracking or commit titles was pressed (Settings, the live match's Titles button,
+ * `/ccsr share`, `/ccsr tracking`): the switch moves here, titles going private take their own out
+ * of the outbox, and the press is kept until the server confirms it. The telling isn't waited for:
+ * `$.http.fetch` has no timeout, and the switch has already moved.
+ */
+async function pressPref($: $, field: 'share' | 'tracking', isOn: boolean) {
+  await saveSettings($, field === 'share' ? { share: isOn } : { tracking: isOn })
+  if (field === 'share' && !isOn) await dropTitles($)
+  const cfg = await serverCfg($)
+  if (!cfg.token) return
+  const key = keyOf(cfg)
+  const cur = await agedPress($, key)
+  const owed = cur && cur.key === key && cur.told === null ? cur : null
+  const press: PrefsPress = { key, at: await $.clock.now(), told: null }
+  if (typeof owed?.share === 'boolean') press.share = owed.share
+  if (typeof owed?.tracking === 'boolean') press.tracking = owed.tracking
+  press[field] = isOn
+  await save($, K.prefsPress, press)
+  void tellPrefs($, true).catch(() => null)
+}
+
+/**
+ * Tells the server what was pressed and isn't confirmed (`PATCH /me` with only those fields). One
+ * at a time in a session, in order, so On then Off fast lands as Off. A press (`pressed`) the
+ * server doesn't take says so in the Server note.
+ */
+async function tellPrefs($: $, pressed = false) {
+  const run = prefsTelling.then(() => Promise.race([tellPrefsOnce($, pressed), waitMs($, 60_000)]))
+  // A request that never answers ($.http.fetch has no timeout) holds the next press a minute at most.
+  prefsTelling = run.catch(() => undefined)
+  return run
+}
+
+async function tellPrefsOnce($: $, pressed: boolean) {
+  // A press made while one is told is told next, so the last one pressed is the last one sent.
+  for (let round = 0; round < 5; round++) {
+    const cfg = await serverCfg($)
+    if (!cfg.token) return
+    const press = await agedPress($, keyOf(cfg))
+    if (!press || press.key !== keyOf(cfg) || press.told !== null) return
+    const t = await $.clock.now()
+    if (!pressed && t - prefsTriedAt < PREFS_RETRY_MS) return
+    prefsTriedAt = t
+    const body: { share_titles?: boolean; grind_tracking?: boolean } = {}
+    if (typeof press.share === 'boolean') body.share_titles = press.share
+    if (typeof press.tracking === 'boolean') body.grind_tracking = press.tracking
+    const r = Object.keys(body).length ? await api($, 'PATCH', '/me', body, { keepNote: !pressed }) : { status: 200, json: null }
+    if (r.status !== 200) {
+      if (pressed) await update($, link, l => ({ ...l, note: signInProblem(r) }))
+      // Not reached, or limited: it stays to be told, on the next account read or config tick.
+      if (retryable(r.status)) return
+    }
+    // Told, or refused for good (GET /me's answer then stands). What was pressed meanwhile is all that stays owed.
+    const cur = await storeGet<PrefsPress | null>($, K.prefsPress, null)
+    if (!cur || cur.key !== press.key || cur.told !== null) return
+    const left: PrefsPress = { key: cur.key, at: cur.at, told: null }
+    if (typeof cur.share === 'boolean' && cur.share !== press.share) left.share = cur.share
+    if (typeof cur.tracking === 'boolean' && cur.tracking !== press.tracking) left.tracking = cur.tracking
+    if (left.share === undefined && left.tracking === undefined) {
+      await save($, K.prefsPress, { key: cur.key, at: cur.at, told: await $.clock.now() } satisfies PrefsPress)
+      return
+    }
+    await save($, K.prefsPress, left)
+  }
+}
+
+/**
+ * GET /me answered (`askedAt`: when it was asked) with the account's copy of the two switches.
+ * Off there turns the switch off here: the account went private, or stopped tracking, on another
+ * machine. On there changes nothing here, and nothing is sent. Never over a press here the
+ * server hasn't confirmed (that press is told again instead), nor from a read asked before the
+ * last press here was confirmed.
+ */
+async function heardPrefs($: $, said: { grind_tracking?: unknown; share_titles?: unknown } | undefined, askedAt: number) {
+  const cfg = await serverCfg($)
+  if (!cfg.token) return
+  const key = keyOf(cfg)
+  const press = await agedPress($, key)
+  if (press?.key === key && press.told === null) return void tellPrefs($).catch(() => null)
+  if (press?.key === key && press.told !== null && askedAt < press.told) return
+  const s = await storedSettings($)
+  const patch: SettingsPatch = {}
+  if (said?.share_titles === false && s.share) patch.share = false
+  if (said?.grind_tracking === false && s.tracking) patch.tracking = false
+  if (patch.share === undefined && patch.tracking === undefined) return
+  // A press made while this read was being weighed wins.
+  const now = await storeGet<PrefsPress | null>($, K.prefsPress, null)
+  if (now?.key === key && (now.told === null || now.at !== press?.at)) return
+  await saveSettings($, patch)
+  if (patch.share === false) await dropTitles($)
+  if (patch.tracking === false) await refreshStatus($)
+}
+
+/** Titles went private: the ones still waiting in the outbox go too (flushOnce checks again as it sends). */
+async function dropTitles($: $) {
+  const box = await storeGet<OutboxItem[]>($, K.outbox, [])
+  if (!box.some(b => 'title' in b.body)) return
+  await save($, K.outbox, box.map(b => ('title' in b.body ? { ...b, body: withoutTitle(b.body) } : b)))
 }
 
 /** The Model stats switch in Settings: PATCH /me, then capture follows what the server answered. */
@@ -11524,8 +11688,8 @@ function actions($: $): Actions {
     setupSeen: () => go(setupSeen($)),
     askForfeit: isAsking => go(update($, forfeitAsk, () => isAsking)),
     setPreset: preset => go(setPreset($, preset)),
-    setTracking: isOn => go(saveSettings($, { tracking: isOn }).then(() => refreshStatus($))),
-    setShare: isOn => go(saveSettings($, { share: isOn })),
+    setTracking: isOn => go(pressPref($, 'tracking', isOn).then(() => refreshStatus($))),
+    setShare: isOn => go(pressPref($, 'share', isOn)),
     resetRating: () => go(resetRating($)),
     resetGrind: () => go(resetGrind($)),
     lab: (what, surface) => go(lab($, what, surface)),
@@ -11832,6 +11996,11 @@ async function boot($: $, cwd: string) {
     captureTicking = true
     onConfigTick(() => syncCapture($))
   }
+  // A press of Grind tracking or commit titles the server hasn't confirmed is told again (it asks nothing when none is owed).
+  if (!prefsTicking) {
+    prefsTicking = true
+    onConfigTick(() => void tellPrefs($).catch(() => null))
+  }
   // Usage weeks ride capture: after syncCapture on every config tick, and once at boot. Never awaited: the script may run for
   // minutes and the post is a request. usageTick never throws.
   if (!usageTicking) {
@@ -11936,7 +12105,7 @@ async function commandText($: $, args: string, signal?: AbortSignal): Promise<st
       await setSurface($, 'band', isOn ? 'after' : 'off')
       await setSurface($, 'bandMatch', isOn ? 'on' : 'off')
     } else if (sub === 'quiet') await setPreset($, isOn ? 'quiet' : 'full')
-    else await saveSettings($, sub === 'tracking' ? { tracking: isOn } : { share: isOn })
+    else await pressPref($, sub, isOn)
     await refreshStatus($)
     return `${sub === 'tracking' ? 'Grind tracking' : sub === 'share' ? 'Commit titles' : sub === 'band' ? 'Band' : 'Quiet'} ${arg}.${sub === 'quiet' && isOn ? ' The band stays during a match; the match-found check always shows.' : ''}`
   }

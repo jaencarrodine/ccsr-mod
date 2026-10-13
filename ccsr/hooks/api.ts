@@ -57,6 +57,13 @@ export function withoutCoder(body: ApiScoreBody): ApiScoreBody {
   return rest
 }
 
+/** The body with no title: titles went private after it was queued. */
+export function withoutTitle(body: ApiScoreBody): ApiScoreBody {
+  if (!('title' in body)) return body
+  const { title: _gone, ...rest } = body
+  return rest
+}
+
 /** Retry later (offline, rate limited, the server broke) or give up (the server refused the score itself). */
 export function retryable(status: number) {
   return status === 0 || status === 408 || status === 429 || status >= 500
