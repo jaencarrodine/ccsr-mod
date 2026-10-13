@@ -118,9 +118,9 @@ import { ACCOUNT, EVAL, FULL, LINES, MOD, QUIET, ROASTS, SURFACE_ROWS, SURFACE_W
 import type { SurfaceKey } from './copy'
 // W5b: sign-in with a provider's device flow (`type Provider` comes from W3b's import block, above).
 import { IDENTITY, PROVIDER_NAMES } from './copy'
-import { SHARE_BEAT_MS, leadMs, leadOf, ledByOther, seenCopyOf, seenToTake, shareBody, shareOf, takeLead } from './lead'
+import { SHARE_BEAT_MS, leadMs, leadOf, ledByOther, releaseCopyOf, releaseToTake, seenCopyOf, seenToTake, shareBody, shareOf, takeLead } from './lead'
 import { steady } from './steady'
-import type { SeenCopy, SeenField } from './lead'
+import type { ReleaseHeard, SeenCopy, SeenField } from './lead'
 import { PROVIDERS, safeLink } from './actions'
 import { PROVIDER_HOSTS, cancelSignIn, choose, conflictChoices, dismissSignIn, flowIdOf, IDLE as SIGNIN0, join as joinFlow, linkedLogin, newInstallsVia, onJoin, onPoll, onResolve, onStart, onTick, pollDue, refLinked, signinMode, startSignIn as pressSignIn, tokenlessStart } from './identity'
 import type { Answer as FlowAnswer, EndWhy, FlowRef, Send as FlowSend, SignIn, SignInFrom, Step as SignInStep } from './identity'
@@ -280,11 +280,22 @@ const K = {
   rankedLead: 'rankedLead',
   rankedShare: 'rankedShare',
   seen: 'seen',
+  // The server's release line as a session last heard it, `{ url, latest, min, at }`: every session takes it, so each one's
+  // Settings and Match tab say an update is out (or needed) without waiting for an answer of its own.
+  release: 'release',
 } as const
 
 type Verdict = Pick<ScoredCommit, 'points' | 'base' | 'craft' | 'category' | 'reason' | 'judge' | 'asked' | 'rubric' | 'scoredAt'>
 
 const SETTINGS0: ModSettings = { handle: 'jaen', tracking: true, share: false, model: DEFAULT_MODEL, surfaces: FULL }
+
+/**
+ * The judge every score is made with: the season's pinned model, for every player. Settings had
+ * a picker until 0.7.0; the server refuses a score from any other model (409 judge_mismatch) and
+ * the outbox drops a refusal for good, so a player who changed it scored nothing. `model` stays
+ * in the stored settings' shape and is never read.
+ */
+const JUDGE_MODEL = DEFAULT_MODEL
 
 /** Settings as stored, with every field present. Stores from before the 12 switches held four booleans and a Quiet flag; surfacesFrom carries them over. */
 function withDefaults(s: Partial<ModSettings>): ModSettings {
@@ -1011,7 +1022,7 @@ type ScoreOut = ScoredCommit | { skip: 'claimed' | 'resting' }
  */
 async function scoreRaw($: $, root: string, raw: RawCommit, pool: RawCommit[], sends = false): Promise<ScoreOut> {
   const pid = await patchId($, root, raw.sha)
-  const model = (await read($, settings)).model
+  const model = JUDGE_MODEL
   const meta = {
     pid,
     sha: raw.sha,
@@ -1838,7 +1849,7 @@ type CalRow = {
  */
 async function calibrate($: $, count: number, runs: number, days: number, pairs: boolean) {
   const t = await $.clock.now()
-  const model = (await read($, settings)).model
+  const model = JUDGE_MODEL
   const from = t - days * 86_400_000
   const pool: { root: string; raw: RawCommit; listed: RawCommit[] }[] = []
   const squashPairs: { root: string; sq: RawCommit; branch: RawCommit[]; listed: RawCommit[] }[] = []
@@ -1959,6 +1970,9 @@ function unflowed(msg: string) {
   return msg.replace(/\/identities\/flows\/[^\s/?#]+/g, '/identities/flows/')
 }
 
+/** When a request of this session's last failed to reach the server: a leader's snapshot written after it may say the server is back (applyShare). */
+let unreachedAt = 0
+
 /**
  * One request: `{ status, json, retryAfterMs }`, status 0 when the server
  * couldn't be reached, `retryAfterMs` what a 429 or 503 asked us to wait.
@@ -1974,6 +1988,7 @@ async function api($: $, method: string, path: string, body?: unknown, as: { url
   try {
     res = await $.http.fetch(`${cfg.url}${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) })
   } catch (err) {
+    unreachedAt = await $.clock.now()
     // A sign-in flow's id never goes in the note (W5b): it rides in the path, it can mint a token, and `link` is in $.state.
     await update($, link, l => ({ ...l, online: false, note: `Can't reach ${cfg.url}: ${unflowed(clean((err as Error).message)).slice(0, 100)}` }))
     return { status: 0, json: null, retryAfterMs: null }
@@ -1993,6 +2008,7 @@ async function api($: $, method: string, path: string, body?: unknown, as: { url
   // A proxy's error page means the server itself isn't answering. The server's own 503 (no_season,
   // try_again) comes with its error JSON: it was reached, so the mod stays online and its loop backs off.
   const reached = res.status < 502 || res.status > 504 || errorOf(json) !== null
+  if (!reached) unreachedAt = await $.clock.now()
   // W4b: reached after being offline fires the notices' back_online trigger.
   const wasOffline = (await read($, link)).online === false
   // A background read (`keepNote`: the lanes between matches) leaves a press's note alone; coming back online still clears the offline one.
@@ -2000,7 +2016,7 @@ async function api($: $, method: string, path: string, body?: unknown, as: { url
   if (reached && wasOffline) void noticeEvent($, { on: 'back_online' }).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
   const latest = res.headers?.['x-ccsr-latest']
   const min = res.headers?.['x-ccsr-min']
-  if (latest && min) await noteRelease($, latest, min)
+  if (latest && min) await noteRelease($, cfg.url, latest, min)
   // The config's version rides on every answer: a new one means read GET /config again (after a jitter, never inline).
   const version = res.headers?.['x-ccsr-config']
   if (version && !as.url) void noteConfigHeader($, version).catch(() => null)
@@ -2201,20 +2217,94 @@ async function claudeVersion($: $) {
   }
 }
 
-/** The server's release line, from its headers: keep it, and toast once per release that an update is out, between matches. */
-async function noteRelease($: $, latest: string, min: string) {
+/** The floor this session has already said it is under (floorTold, or the toast for a queue dropped for it): once per floor, per session. */
+let floorSaid = ''
+/** The floor a floorTold is deciding on now: two answers landing together never both say it. */
+let floorFlight = ''
+/** The release the update-is-out toast is being decided for now (noteRelease): the same, for the once-per-machine toast. */
+let outFlight = ''
+/** When, and from which server, this session last heard the release line it holds: its own answer, or the store's copy it took (lead.ts). */
+let releaseHeard: ReleaseHeard | null = null
+
+/**
+ * This mod is under the server's floor: say so once in this session, between matches. Every
+ * session says it for itself (a toast is its own window's), unlike the update-is-out toast, which
+ * one session shows for the machine: ranked can't be played until the update, so it has to reach
+ * the window the player is in. Outside idle it says nothing and nothing is marked said: slowSync
+ * asks again every 30 s (adoptRelease), so it lands once the match is put away.
+ */
+async function floorTold($: $, release: { latest: string; min: string }) {
+  if (standing(release) !== 'required' || floorSaid === release.min || floorFlight === release.min) return
+  // Claimed before the store is read: the answers a boot gets together each come through here.
+  floorFlight = release.min
+  try {
+    if ((await rankedShared($)).phase !== 'idle' || floorSaid === release.min) return
+    floorSaid = release.min
+  } finally {
+    if (floorFlight === release.min) floorFlight = ''
+  }
+  await ambient($, MOD.updateNeeded(release.min, VERSION), 'match', 10_000)
+}
+
+/** What this session heard goes into the store for the others, when it is news there too (never a write per answer). */
+async function shareRelease($: $, url: string, latest: string, min: string) {
+  const copy = releaseCopyOf(await storeGet<unknown>($, K.release, null))
+  if (copy && copy.url === url && copy.latest === latest && copy.min === min) return
+  await saveQuiet($, K.release, { url, latest, min, at: await $.clock.now() })
+}
+
+/**
+ * Takes the release line another session heard: this session's Settings and Match tab then say so
+ * too, with no request. The copy wins whenever it is newer than what this session last heard
+ * (releaseToTake), a floor that came down included. A floor not yet said here is offered to
+ * floorTold on every pass, so one learned of mid-match is said once the session is idle.
+ */
+async function adoptRelease($: $) {
   const l = await read($, link)
-  if (l.release?.latest !== latest || l.release?.min !== min) await update($, link, x => ({ ...x, release: { latest, min } }))
-  if (standing({ latest, min }) === 'current') return
+  const url = (await serverCfg($)).url
+  const copy = releaseCopyOf(await storeGet<unknown>($, K.release, null))
+  const take = releaseToTake(copy, url, l.release, releaseHeard)
+  if (take && copy) {
+    releaseHeard = { url, at: copy.at }
+    await update($, link, x => ({ ...x, release: take }))
+  }
+  const held = take ?? l.release
+  if (held) await floorTold($, held)
+}
+
+/**
+ * The server's release line, from its headers (`url`: the server that answered): keep it, and toast
+ * once per release that an update is out, between matches. Under the floor that toast is left out:
+ * floorTold's line says it, and Settings and the Match tab carry the Update button.
+ */
+async function noteRelease($: $, url: string, latest: string, min: string) {
+  const l = await read($, link)
+  releaseHeard = { url, at: await $.clock.now() }
+  if (l.release?.latest !== latest || l.release?.min !== min) {
+    await update($, link, x => ({ ...x, release: { latest, min } }))
+    await shareRelease($, url, latest, min)
+  }
+  await floorTold($, { latest, min })
+  const at = standing({ latest, min })
+  if (at === 'current') return
   // W4b: the notices' update_available trigger, kept armed while the mod sees an update (noticeEvent keeps it to one a
   // minute), one arming per newer release however far apart the answers naming it come (releaseArming). The clock is read
   // before releaseArmed, so two answers landing together never both begin an arming.
-  const at = await $.clock.now()
-  releaseArmed = releaseArming(releaseArmed, latest, at)
+  const now = await $.clock.now()
+  releaseArmed = releaseArming(releaseArmed, latest, now)
   void noticeEvent($, { on: 'update_available' }, releaseArmed.start).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
-  if ((await rankedShared($)).phase !== 'idle') return
-  if ((await storeGet<string>($, K.updateSeen, '')) === latest) return
-  await save($, K.updateSeen, latest)
+  // Claimed before the store is read, as in floorTold: two answers landing together both passed the check below and both toasted.
+  if (outFlight === latest) return
+  outFlight = latest
+  try {
+    // Under the floor the release is marked seen at once (its toast is floorTold's); else between matches only.
+    if (at !== 'required' && (await rankedShared($)).phase !== 'idle') return
+    if ((await storeGet<string>($, K.updateSeen, '')) === latest) return
+    await save($, K.updateSeen, latest)
+  } finally {
+    if (outFlight === latest) outFlight = ''
+  }
+  if (at === 'required') return
   await ambient($, `${MOD.updateOut(latest)} ${MOD.autoUpdate}`)
 }
 
@@ -4461,6 +4551,8 @@ let shareRev = ''
 /** That snapshot's content (shareBody), and when this session last wrote one: an unchanged one is written again only every SHARE_BEAT_MS. */
 let shareKnown = ''
 let shareAt = 0
+/** Whether that snapshot said its writer reached the server: a change is written at once, never left to the beat. */
+let shareOnline: boolean | null = null
 let shareCount = 0
 /** The decided match whose snapshot said it has custom art this session holds no ref for yet (followRanked reads it once, for a pane that shows it). */
 let artWanted: string | null = null
@@ -4507,20 +4599,27 @@ async function dropLead($: $) {
   if ((await leadRead($)).lead?.by === owner) await saveQuiet($, K.rankedLead, { by: owner, until: 0 })
 }
 
-/** What this session holds of the queue, the lanes and the match goes into the store for every session, when it moved (or every SHARE_BEAT_MS). */
-async function shareRanked($: $) {
+/**
+ * What this session holds of the queue, the lanes and the match goes into the store for every session, when it moved (or every
+ * SHARE_BEAT_MS). `asked`: this write follows a request of the tick's own, so it can say whether the server answered; a press's
+ * write says nothing, since `link.online` may be minutes old by then.
+ */
+async function shareRanked($: $, asked = false) {
   const l = await read($, link)
   // The match as link holds it, so without a decided win's art ref (keepArtRef): another player's art, title and handle never reach
   // the store. `art` only says there is one, so a session that draws the result reads the match once itself for it (followRanked).
   const ranked = l.ranked ? { ...l.ranked, art: artRefs.has(l.ranked.id) } : null
   const body = { key: await configKey($), queue: l.queue, lanes: l.lanes, lanesBucket: l.lanesBucket, ranked }
   const json = shareBody(body)
+  // Whether the request this tick just made reached the server: a follower asks nothing, so this is how its offline line clears (applyShare).
+  const online = asked ? l.online === true : null
   const t = await $.clock.now()
-  if (json === shareKnown && t - shareAt < SHARE_BEAT_MS) return
+  if (json === shareKnown && (online === null || online === shareOnline) && t - shareAt < SHARE_BEAT_MS) return
   const rev = `${owner}:${t}:${++shareCount}`
   // Recorded as written only once it is: a write that failed (the store's lock) is made again by the next call, not taken for done.
-  if (!(await saveQuiet($, K.rankedShare, { rev, at: t, by: owner, ...body }))) return
+  if (!(await saveQuiet($, K.rankedShare, { rev, at: t, by: owner, online, ...body }))) return
   shareKnown = json
+  if (online !== null) shareOnline = online
   shareAt = t
   shareRev = rev
 }
@@ -4552,9 +4651,15 @@ async function applyShare($: $) {
     }
   }
   const lanes = s.lanes as ApiLane[] | null
-  await update($, link, l => ({ ...l, queue: s.queue as ApiQueueState | null, ranked, ...(lanes ? { lanes, lanesBucket: s.lanesBucket } : {}) }))
+  // The leader reached the server after this session last failed to: back online here too. A session that follows asks the server
+  // nothing, so no request of its own would ever clear its offline line (2026-10-13: a 108 s drop left one on it until a Resync).
+  const back = s.online === true && s.at > unreachedAt && (await read($, link)).online === false
+  await update($, link, l => ({ ...l, ...(back && l.online === false ? { online: true, note: '' } : {}), queue: s.queue as ApiQueueState | null, ranked, ...(lanes ? { lanes, lanesBucket: s.lanesBucket } : {}) }))
+  // W4b's back_online trigger, as an answer of this session's own fires it (api): that answer finds the flag cleared now, and would never.
+  if (back) void noticeEvent($, { on: 'back_online' }).catch(err => $.ui.log(`CCSR notices: ${(err as Error).message}`))
   const now = await read($, link)
   shareKnown = shareBody({ key: s.key, queue: now.queue, lanes: now.lanes, lanesBucket: now.lanesBucket, ranked: sent })
+  if (s.online !== null) shareOnline = s.online
   shareAt = s.at
 }
 
@@ -4599,7 +4704,7 @@ async function pollRanked($: $, isCurrent: () => boolean): Promise<Answer | void
   if (!stopped && !isCurrent()) return r
   const t = await $.clock.now()
   if (ledByOther((await leadRead($)).lead, owner, t)) return r
-  await shareRanked($)
+  await shareRanked($, !!r)
   // Nothing left to poll here: the lease goes, so a session with the Match tab on screen takes it at its next tick.
   if (stopped) await dropLead($)
   // Backing off: the lease is held through the wait the loop takes next, so no follower takes a turn at a server that is down or shedding.
@@ -4713,7 +4818,11 @@ async function noteCancelled($: $, q: ApiQueueState | null) {
   const reason = q.cancelled.reason
   if (reason === 'update_required') {
     const rel = (await read($, link)).release
-    if (rel) await ambient($, MOD.updateNeeded(rel.min, VERSION), 'match')
+    if (rel) {
+      // The floor's line, said here: floorTold doesn't say it again once the queue is put away.
+      floorSaid = rel.min
+      await ambient($, MOD.updateNeeded(rel.min, VERSION), 'match')
+    }
   } else await ambient($, cancelledLine(String(reason)), 'match')
   // W3b: your bucket closed for you, or you stopped meeting its checklist: the neutral line (W1b's), and config says what's open now.
   if (reason === 'bucket_closed' || reason === 'verification_required') void refreshConfig($, 'bucket').catch(() => null)
@@ -4929,7 +5038,7 @@ async function pollMatch($: $, id: string, isCurrent: () => boolean, late: 'open
     // What every other session draws goes out before the phase does, and before the toast and the result's sound (which is awaited
     // to its end, up to two seconds): a follower that found done with no result to draw yet sat between the two writes.
     // Unless a press in another window took the lease while this read was out: that window's queue or match is the one to draw.
-    if (!ledByOther((await leadRead($)).lead, owner, t)) await shareRanked($)
+    if (!ledByOther((await leadRead($)).lead, owner, t)) await shareRanked($, true)
     // A late read leaves the store alone: it already said done, and since then another session may have dismissed the result or queued again.
     if (!late) await setRanked($, { phase: 'done', matchId: id })
     // Decided: the loop's next tick reads the lanes (for Queue again) if the Match tab is on screen, else stops.
@@ -6803,7 +6912,6 @@ export type Actions = {
   setPreset: (preset: 'full' | 'quiet') => void
   setTracking: (isOn: boolean) => void
   setShare: (isOn: boolean) => void
-  setModel: (m: string) => void
   resetRating: () => void
   resetGrind: () => void
   lab: (what: string, surface: string) => void
@@ -7093,7 +7201,7 @@ function offerBucket(o: ApiQueueState['offer'], sh: RankedShared) {
 // ------------------------------------------------------------------ band
 
 export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions): Promise<RenderElement | null> {
-  const { Box, Text, Button, Svg } = $.ui.resolve(e) as El
+  const { Box, Text, Button, Svg, Link } = $.ui.resolve(e) as El
   const rich = e.surface !== 'terminal'
   const m = await read($, match)
   const t = (await read($, now)) || (await $.clock.now())
@@ -7132,13 +7240,15 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
         {o.you_accepted ? (
           <Text dimColor>Accepted. Waiting for {o.opponent.handle}.</Text>
         ) : (
-          <>
+          // One row of its own, as the Match tab's: the two never stack and never part when the band wraps.
+          <Box gap={1} alignItems="center">
             <Button key="band-accept" label="Accept" variant="primary" onPress={() => a.accept()} />
             <Button key="band-decline" label="Decline" onPress={() => a.decline()} />
-          </>
+          </Box>
         )}
         {/* W6b: a challenge's taker waits on the sender for minutes, not a ranked check's one: they can still back out. */}
         {o.you_accepted && challenge && <Button key="band-decline" label="Decline" onPress={() => a.decline()} />}
+        {!o.you_accepted && clicksOff(e) && <Text dimColor>{MOD.noClicksShort}</Text>}
       </Box>
     )
   }
@@ -7177,11 +7287,17 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
       if (closed && t - ended <= 15 * 60_000) {
         const delta = (mine.rating_after ?? mine.rating_before) - mine.rating_before
         const line = rankedResultLine(sm, me)
+        const outcome = rankedOutcome(sm, me)
+        // Post to X (Post the L on a loss) exactly where the pane draws the finisher's share link (finisherFor): Finishers not Off, config's
+        // finishers and share on, a decided win with a finisher. Everything else has nothing to post and keeps Copy recap.
+        const post = (await finisherFor($, sm, me, cf))?.share ?? null
+        const chat = chatOk ? lastChat : undefined
         return (
           <Box gap={1} alignItems="center" flexWrap="wrap">
             {rich ? (
+              // The result's line is drawn in the strip, past a dashed rule, as the Grind strip draws a commit's title.
               <Svg
-                source={bandStrip({ kind: 'result', mode: modeWord(sm), outcome: rankedOutcome(sm, me), hours: sm.length_min / 60, delta, ratingBefore: mine.rating_before, ratingAfter: mine.rating_after ?? mine.rating_before, mine: mine.points, theirs: them.points, placing: placingOfSide(mine), ...unratedOf(sm) })}
+                source={bandStrip({ kind: 'result', mode: modeWord(sm), outcome, hours: sm.length_min / 60, delta, ratingBefore: mine.rating_before, ratingAfter: mine.rating_after ?? mine.rating_before, mine: mine.points, theirs: them.points, placing: placingOfSide(mine), ...unratedOf(sm), line })}
                 alt={line}
               />
             ) : (
@@ -7189,21 +7305,23 @@ export async function renderBand($: $, e: RenderInput<'AbovePrompt'>, a: Actions
                 CCSR
               </Text>
             )}
-            <Box flexDirection="column">
-              <Text bold>{line}</Text>
-              {!rich && (
-                <Text dimColor>
-                  {mine.points} : {them.points} vs {them.player.handle}
-                </Text>
-              )}
-              {lastChat && chatOk && (
-                <Text dimColor wrap="truncate-end">
-                  {clean(lastChat.handle)}: {clean(lastChat.text)}
-                </Text>
-              )}
-            </Box>
+            {(!rich || chat) && (
+              <Box flexDirection="column">
+                {!rich && <Text bold>{line}</Text>}
+                {!rich && (
+                  <Text dimColor>
+                    {mine.points} : {them.points} vs {them.player.handle}
+                  </Text>
+                )}
+                {chat && (
+                  <Text dimColor wrap="truncate-end">
+                    {clean(chat.handle)}: {clean(chat.text)}
+                  </Text>
+                )}
+              </Box>
+            )}
             {!cf.practiceOnly && <Button key="band-again" label="Queue again" variant="primary" onPress={() => a.queueAgain('band')} />}
-            <Button key="band-recap" label="Copy recap" onPress={x => a.copyRecap(x.surface)} />
+            {post ? <Link href={post.href} label={post.label} /> : <Button key="band-recap" label="Copy recap" onPress={x => a.copyRecap(x.surface)} />}
             <Button key="band-clear" label="Dismiss" role="dismiss" onPress={() => a.rankedClear()} />
           </Box>
         )
@@ -7455,7 +7573,7 @@ function roomy(n: RenderNode, Box: El['Box']): RenderNode {
   return { ...n, props: { ...p, gap: 1 }, children: groups.map(g => (g.length === 1 ? (g[0] as RenderNode) : Box({ flexDirection: 'column', children: g }))) }
 }
 
-/** The five tabs in the frame. Backtest opens from the Grind tab ("Score past sessions") and Lab from `/ccsr lab`. */
+/** The five tabs in the frame. Backtest opens from `/ccsr backtest` only (no button: it read like backfill) and Lab from `/ccsr lab`. */
 const TABS: ['match' | 'ranked' | 'grind' | 'chat' | 'settings', string][] = [
   ['match', 'Match'],
   ['ranked', 'Ranked'],
@@ -7463,6 +7581,16 @@ const TABS: ['match' | 'ranked' | 'grind' | 'chat' | 'settings', string][] = [
   ['chat', 'Chat'],
   ['settings', 'Settings'],
 ]
+
+/**
+ * The terminal's main screen (the classic renderer) reports no clicks, so a Button there is keyboard only: the person's
+ * focus chord (ctrl+x tab, which walks the band's buttons before it reaches the pane), then Tab and Enter. The terminal
+ * always says which layout it draws (`viewport.isFullscreen`, fixed for the session), and only its `false` counts: the
+ * mobile app says false too and has taps, and absent is unknown.
+ */
+function clicksOff(e: { surface: string; viewport?: { isFullscreen?: boolean } }) {
+  return e.surface === 'terminal' && e.viewport?.isFullscreen === false
+}
 
 export async function renderPane($: $, e: RenderInput<'Pane'>, a: Actions): Promise<RenderElement> {
   const els = $.ui.resolve(e) as El
@@ -7526,6 +7654,7 @@ export async function renderPane($: $, e: RenderInput<'Pane'>, a: Actions): Prom
           <Text>{sub}</Text>
         </Box>
       )}
+      {clicksOff(e) && <Text dimColor>{e.props.isFocused ? MOD.noClicksKeys : MOD.noClicks}</Text>}
       {rich ? (
         <Box flexDirection="column">
           <Svg source={tabsTop(framed)} alt={`Tabs: ${framed} is open`} />
@@ -7639,7 +7768,6 @@ async function grindTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions, t: nu
       )}
       <Box gap={1} flexWrap="wrap" alignItems="center">
         <Button key="scan" label={sc.busy ? 'Scanning...' : 'Scan now'} variant="primary" onPress={() => a.scanNow()} />
-        <Button key="past-sessions" label="Score past sessions" onPress={() => a.setTab('backtest')} />
         <Text dimColor wrap="truncate-end">
           {s.tracking ? `Tracking since ${when(since)}` : 'Tracking is off'} · {sc.note || 'not scanned yet'}
           {sc.lastAt ? ` · ${agoMs(sc.lastAt, Math.max(t, sc.lastAt))}` : ''}
@@ -9151,19 +9279,6 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
         <Button key="share-off" label="Off" variant={s.share ? 'secondary' : 'primary'} onPress={() => a.setShare(false)} />
       </Box>
       {l.me && captureOn(cf.raw) && (await modelStatsRow($, els, a, cfg))}
-      {e.surface !== 'mobile' && (
-        <Select
-          key="model"
-          label="Judge model (one per season once ranked exists)"
-          value={s.model}
-          options={[
-            { value: 'claude-sonnet-5-5', label: 'Sonnet 5.5 (pinned, default)' },
-            { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5 (cheaper)' },
-            { value: 'sonnet', label: 'sonnet (alias)' },
-          ]}
-          onSelect={v => a.setModel(v)}
-        />
-      )}
       <Box gap={1} flexWrap="wrap">
         <Button key="reset-rating" label={`Reset practice rating (${r})`} onPress={() => a.resetRating()} />
         <Button key="reset-grind" label={`Reset Grind: tracking starts now (${list.length} commits)`} onPress={() => a.resetGrind()} />
@@ -9180,7 +9295,8 @@ async function settingsTab($: $, e: RenderInput<'Pane'>, els: El, a: Actions): P
       <Text dimColor>{MOD.autoUpdate}</Text>
       {l.release && standing(l.release) !== 'current' && (
         <Box gap={1} alignItems="center" flexWrap="wrap">
-          <Text>{MOD.updateOut(l.release.latest)}</Text>
+          {/* Under the floor, the line the Match tab says: ranked can't be played until the update. */}
+          <Text>{standing(l.release) === 'required' ? MOD.updateNeeded(l.release.min, VERSION) : MOD.updateOut(l.release.latest)}</Text>
           <Button key="settings-update" label="Update" onPress={x => a.updateMod(x.surface)} />
         </Box>
       )}
@@ -9362,17 +9478,30 @@ async function finisherView($: $, e: RenderInput<'Pane'>, els: El, f: FinisherSh
 }
 
 /**
- * A decided ranked match's finisher, from the server's pick, above today's result card, which
- * stays. Null (today's card only) while config has finishers off, with Finishers set to Off, and
- * for a match with none (a draw, a void, a forfeit, a match decided before W10a).
+ * A decided ranked match's finisher as this player's screen may show it, and the share link that
+ * goes with it (null while config's `share` is off, or for an id the link can't carry). Null
+ * while config has finishers off, with Finishers set to Off, and for a match with none (a draw,
+ * a void, a forfeit, a match decided before W10a). The pane's finisher and the band's Post to X
+ * both read this, so the band never offers a post the pane wouldn't.
  */
-async function finisherBlock($: $, e: RenderInput<'Pane'>, els: El, a: Actions, sm: ApiMatchSummary, me: string): Promise<RenderElement | null> {
+async function finisherFor($: $, sm: ApiMatchSummary, me: string, held?: ModConfig) {
   const sw = (await read($, settings)).surfaces
   if (sw.finishers === 'off') return null
-  const cfg = finishersOf((await configOf($)).raw)
+  const cfg = finishersOf((held ?? (await configOf($))).raw)
   const f = cfg.on ? finisherOf(sm.finisher) : null
   const input = f ? finisherInput(sm, me, f, { theirs: sw.oppFinishers !== 'default' }) : null
   if (!f || !input) return null
+  return { sw, f, input, share: cfg.share ? shareLink(sm.id, input.view) : null }
+}
+
+/**
+ * A decided ranked match's finisher, from the server's pick, above today's result card, which
+ * stays. Null (today's card only) where finisherFor has none.
+ */
+async function finisherBlock($: $, e: RenderInput<'Pane'>, els: El, a: Actions, sm: ApiMatchSummary, me: string): Promise<RenderElement | null> {
+  const fin = await finisherFor($, sm, me)
+  if (!fin) return null
+  const { sw, f, input } = fin
   // W10e: the win's custom art, where this screen draws it (artShown): while it's being fetched, a line and no play yet; held,
   // it plays in our frame from the start; failed, the default kind plays. Either way it plays once, from its first draw.
   const art = await artFor($, e.surface, sm, input, sw.oppFinishers !== 'default', cleanServer(me))
@@ -9381,7 +9510,7 @@ async function finisherBlock($: $, e: RenderInput<'Pane'>, els: El, a: Actions, 
     return <Text dimColor>{CUSTOM.loading}</Text>
   }
   const play = await finisherStart($, sm.id, await $.clock.now())
-  const show: FinisherShow = { id: sm.id, input, play, replayKey: 'ranked-replay', replayLabel: FINISHER.replay, onReplay: () => a.finisherReplay(sm.id), share: cfg.share ? shareLink(sm.id, input.view) : null }
+  const show: FinisherShow = { id: sm.id, input, play, replayKey: 'ranked-replay', replayLabel: FINISHER.replay, onReplay: () => a.finisherReplay(sm.id), share: fin.share }
   if (art) return customFrame($, els, show, art.held, art.ref.by, await artActions($, els, a, sm, art.ref, cleanServer(me), kindOf(f.kind)))
   return finisherView($, e, els, show)
 }
@@ -10719,6 +10848,8 @@ async function slowSync($: $) {
   await syncFromStore($)
   // The account and the boards as another session's read last found them: taken, never asked for again.
   await adoptSeen($)
+  // And the release line: an update that is out, or needed, shows here without an answer of this session's own.
+  await adoptRelease($)
   const m = await read($, match)
   if (m && m.status === 'live' && m.kind === 'practice' && !stopTicker) startTicker($)
   // Another session joined the queue or a match: follow it here too.
@@ -11017,7 +11148,6 @@ function actions($: $): Actions {
     setPreset: preset => go(setPreset($, preset)),
     setTracking: isOn => go(saveSettings($, { tracking: isOn }).then(() => refreshStatus($))),
     setShare: isOn => go(saveSettings($, { share: isOn })),
-    setModel: m => go(saveSettings($, { model: m })),
     resetRating: () => go(resetRating($)),
     resetGrind: () => go(resetGrind($)),
     lab: (what, surface) => go(lab($, what, surface)),
@@ -11138,7 +11268,7 @@ async function lab($: $, what: string, surface: string) {
     }
   }
   if (what === 'judge') {
-    const model = (await read($, settings)).model
+    const model = JUDGE_MODEL
     const started = await $.clock.now()
     const r = await $.model.complete({ model, prompt: 'Reply with the single word: ready', maxTokens: 10 })
     const ms = (await $.clock.now()) - started
@@ -11267,6 +11397,7 @@ async function boot($: $, cwd: string) {
   // Never awaited: boot goes on as it did, and nothing below waits on the store for it.
   void applyShare($)
     .then(() => adoptSeen($))
+    .then(() => adoptRelease($))
     .then(() => refreshStatus($))
     .catch(err => $.ui.log(`CCSR ranked: ${(err as Error).message}`))
   await bootStep($, 'ranked', async () => {
@@ -11382,6 +11513,8 @@ async function commandText($: $, args: string, signal?: AbortSignal): Promise<st
     // Titles stay in the pane: this text reaches Claude, and session titles are other projects' prompts.
     const days = Math.max(1, Math.min(30, Number(arg) || 7))
     const list = (await discoverSessions($, days)).slice(0, 20)
+    // The command is the only way to past sessions, so they open before the scoring, not after: the pane shows each run as it goes.
+    await update($, tab, () => 'backtest')
     const lines: string[] = []
     let sum = 0
     for (const s of list) {
@@ -11390,7 +11523,6 @@ async function commandText($: $, args: string, signal?: AbortSignal): Promise<st
       sum += run.points
       lines.push(`  ${String(run.points).padStart(3)} pts  ${String(run.commits.length).padStart(2)} commits  ${s.project.padEnd(18).slice(0, 18)}  ${when(s.startAt)}  ${dur(s.endAt - s.startAt)}${run.status === 'partial' ? '  partial' : ''}`)
     }
-    await update($, tab, () => 'backtest')
     return [`Backtest, last ${days} days (${lines.length} sessions, ${sum} points). Open /ccsr for titles and commits.`, ...lines].join('\n')
   }
   if (sub === 'match' || sub === 'queue') {

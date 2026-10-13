@@ -68,9 +68,11 @@ export function ledByOther(held: Lead | null, by: string, now: number) {
 /**
  * The snapshot: the leader's queue state, lanes and match page, for the account `key` (server and
  * handle). The parts are the server's own answers as the leader kept them, written by this mod to
- * its own store, so only the envelope is checked.
+ * its own store, so only the envelope is checked. `online`: whether the request of the tick that
+ * wrote this reached the server, so `at` is when it did; null when the write followed no request
+ * (a press's), and from a mod that didn't say.
  */
-export type Share = { rev: string; at: number; by: string; key: string; queue: unknown; lanes: unknown; lanesBucket: string | null; ranked: unknown }
+export type Share = { rev: string; at: number; by: string; key: string; online: boolean | null; queue: unknown; lanes: unknown; lanesBucket: string | null; ranked: unknown }
 
 export function shareOf(raw: unknown): Share | null {
   if (!isObject(raw) || typeof raw.rev !== 'string' || typeof raw.by !== 'string' || typeof raw.key !== 'string' || typeof raw.at !== 'number') return null
@@ -80,6 +82,7 @@ export function shareOf(raw: unknown): Share | null {
     at: raw.at,
     by: raw.by,
     key: raw.key,
+    online: typeof raw.online === 'boolean' ? raw.online : null,
     queue: isObject(raw.queue) ? raw.queue : null,
     lanes: Array.isArray(raw.lanes) ? raw.lanes : null,
     lanesBucket: typeof raw.lanesBucket === 'string' ? raw.lanesBucket : null,
@@ -128,4 +131,34 @@ export function seenToTake(seen: SeenCopy | null, key: string, since: number, me
   const out: Partial<Record<SeenField, unknown>> = {}
   for (const f of SEEN_FIELDS) if (seen[f] !== undefined && (fresh || !ACCOUNT_FIELDS.includes(f))) out[f] = seen[f]
   return Object.keys(out).length ? out : null
+}
+
+/**
+ * The server's release line (x-ccsr-latest, x-ccsr-min) as one session last heard it, for the
+ * others, by server. A session hears it only on an answer of its own, and with one poller per
+ * machine and the config and account shared, most sessions get few: one sat on Settings on 0.6.0
+ * for an hour after 0.7.0 became required and never said so (2026-10-13).
+ */
+export type ReleaseCopy = { url: string; latest: string; min: string; at: number }
+
+export function releaseCopyOf(raw: unknown): ReleaseCopy | null {
+  if (!isObject(raw) || typeof raw.url !== 'string' || typeof raw.latest !== 'string' || typeof raw.min !== 'string' || typeof raw.at !== 'number') return null
+  if (raw.latest === '' || raw.min === '') return null
+  return { url: raw.url, latest: raw.latest, min: raw.min, at: raw.at }
+}
+
+/** When, and from which server, a session last heard the release line it holds: its own answer, or the copy it took. */
+export type ReleaseHeard = { url: string; at: number }
+
+/**
+ * The release line a session should take from the copy in the store: the copy as it is, lowering
+ * included (a floor can come down: mod_min set lower, a pin lifted), whenever it is newer than what
+ * the session last heard for this server, or the session holds nothing, or what it holds came from
+ * another server. null when the copy is for another server, is no newer than the session's own
+ * hearing, or says what the session already holds.
+ */
+export function releaseToTake(copy: ReleaseCopy | null, url: string, held: { latest: string; min: string } | null, heard: ReleaseHeard | null = null): { latest: string; min: string } | null {
+  if (!copy || copy.url !== url) return null
+  if (held && heard && heard.url === url && heard.at >= copy.at) return null
+  return held && held.latest === copy.latest && held.min === copy.min ? null : { latest: copy.latest, min: copy.min }
 }

@@ -98,7 +98,7 @@ export const MOD = {
   fill: "Commit what's working now.",
   hint: 'Only commits score.',
   lead: (who: string, a: number, b: number) => `${who} took the lead, ${a}-${b}.`,
-  offline: "Can't reach ccsr.gg. Scores wait here and send when it's back.",
+  offline: "Can't reach ccsr.gg. Scores wait here and send when it's back. If this stays up, press Resync in Settings.",
   notice: 'Counts in your match.',
   /** After the bell, until the result: your Claude may still be scoring a commit made before it. With no clock from the server. */
   counting: 'Bell. Still scoring commits made before it.',
@@ -108,6 +108,17 @@ export const MOD = {
   deciding: 'Bell. Working out the result.',
   /** Under it, in the pane. */
   countingRule: "Commits made after the bell don't count in this match.",
+  /**
+   * The terminal's main screen (Claude Code's classic renderer) reports no clicks, so every button is keyboard only there.
+   * Under the pane's header, on that screen alone. The chord is Claude Code's own and doesn't come straight here: it walks
+   * the band's buttons first when the band has any (Accept and Decline, Leave, Queue), then the pane, then the prompt. So
+   * the line never says "then Tab and Enter" before the pane has the keys: that would press a band button.
+   */
+  noClicks: 'No clicks in this terminal view. Run /tui fullscreen to click, or press ctrl+x tab until this pane has the keys.',
+  /** In its place once the pane holds the keyboard: the line changing is how the player knows the chord got here. */
+  noClicksKeys: 'This pane has the keys. Tab moves, Enter presses, Esc leaves.',
+  /** Beside the ready check in the band, where there's a minute to answer: the chord lands on the band's first button, Accept. Never once you've accepted (the first button is Decline then). */
+  noClicksShort: 'No clicks here: ctrl+x tab, then Enter.',
   // Settings, Resync (2026-10-12): the way out of a state the mod doesn't leave by itself.
   resyncTitle: 'Stuck or out of date?',
   resyncLead: 'Resync reads your account, queue and match from the server again.',

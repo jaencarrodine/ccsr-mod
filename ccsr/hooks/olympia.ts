@@ -1207,7 +1207,8 @@ export function scorecard(a: { outcome: 'won' | 'lost' | 'draw'; hours: number; 
 /**
  * Band strips: a 300 by 36 graphic at the left of the band; the line of text and the buttons sit
  * beside it. The Grind strip draws its line itself when given a `title` (the commit's title, past
- * a dashed rule, on two lines at most), and grows up to 480 wide to hold it. W6b: a challenge's ready check (`found`, `mode: 'challenge'`) runs `of` seconds (60
+ * a dashed rule, on two lines at most), and grows up to 480 wide to hold it; the result strip does
+ * the same with its `line` (the result's line). W6b: a challenge's ready check (`found`, `mode: 'challenge'`) runs `of` seconds (60
  * if not given), and its result (`rated: false`) says UNRATED where a ranked one has its rating.
  */
 export type Strip =
@@ -1216,7 +1217,7 @@ export type Strip =
   | { kind: 'queue'; seconds: number; hours: number[]; rating: number; range: number }
   | { kind: 'found'; me: string; them: string; theirRating: number; seconds: number; mode?: 'ranked' | 'challenge'; of?: number }
   | { kind: 'race'; race: Race; offlineAgo?: string; mode?: string }
-  | { kind: 'result'; mode?: string; outcome: 'won' | 'lost' | 'draw'; hours: number; delta: number; ratingBefore: number; ratingAfter: number; mine: number; theirs: number; placing?: Placing & { placedIn?: TierKey }; rated?: false }
+  | { kind: 'result'; mode?: string; outcome: 'won' | 'lost' | 'draw'; hours: number; delta: number; ratingBefore: number; ratingAfter: number; mine: number; theirs: number; placing?: Placing & { placedIn?: TierKey }; rated?: false; line?: string }
 
 export function bandStrip(a: Strip) {
   let w = 300
@@ -1224,6 +1225,17 @@ export function bandStrip(a: Strip) {
   let bg = C.paper
   let s = ''
   let alt = ''
+  /** A line of text past a dashed rule at `x`, on two lines at most (the second cut with an ellipsis); the strip grows up to 480 wide to hold it. */
+  const lineAt = (x: number, text: string) => {
+    const max = Math.floor((480 - 10 - (x + 10)) / 5.7)
+    const lines = wrapText(text, max)
+    if (lines.length > 2) lines[1] = `${lines[1]!.slice(0, max - 1)}…`
+    const shown = lines.slice(0, 2)
+    w = Math.max(w, Math.ceil(x + 10 + Math.max(...shown.map(l => l.length)) * 5.7 + 10))
+    s += `<path d="M${x} 7V29" stroke="${C.ink}" stroke-width=".6" stroke-dasharray="2 3"/>`
+    s += shown.length === 1 ? T(x + 10, 21.5, shown[0]!, { s: 9.5 }) : T(x + 10, 15, shown[0]!, { s: 9.5 }) + T(x + 10, 28, shown[1]!, { s: 9.5 })
+    alt += `: ${text}`
+  }
   if (a.kind === 'setup') {
     s += token(18, 18, 11, false, '?', true) + T(36, 15, 'PICK A HANDLE', { s: 9.5, w: 700, ls: 1 }) + T(36, 28, '{ solo queue for claude code }', { s: 8, c: C.stone2 })
     alt = 'Pick a handle'
@@ -1241,18 +1253,8 @@ export function bandStrip(a: Strip) {
     s += T(lx, 15, top, { s: 8, w: 600, ls: 0.6 }) + T(lx, 28, sub, { s: 8.5, c: C.stone2 })
     alt = `+${a.points} ${a.category}, Grind ${a.week}${a.rank ? `, rank ${a.rank}` : ''}`
     const title = a.title?.trim()
-    if (title) {
-      // The rule sits past the wider of the two label rows (monospace: 0.6 em a character, plus the top row's spacing).
-      const x = Math.max(150, Math.ceil(lx + Math.max(top.length * 5.4, sub.length * 5.1)) + 10)
-      const max = Math.floor((480 - 10 - (x + 10)) / 5.7)
-      const lines = wrapText(title, max)
-      if (lines.length > 2) lines[1] = `${lines[1]!.slice(0, max - 1)}…`
-      const shown = lines.slice(0, 2)
-      w = Math.max(w, Math.ceil(x + 10 + Math.max(...shown.map(l => l.length)) * 5.7 + 10))
-      s += `<path d="M${x} 7V29" stroke="${C.ink}" stroke-width=".6" stroke-dasharray="2 3"/>`
-      s += shown.length === 1 ? T(x + 10, 21.5, shown[0]!, { s: 9.5 }) : T(x + 10, 15, shown[0]!, { s: 9.5 }) + T(x + 10, 28, shown[1]!, { s: 9.5 })
-      alt += `: ${title}`
-    }
+    // The rule sits past the wider of the two label rows (monospace: 0.6 em a character, plus the top row's spacing).
+    if (title) lineAt(Math.max(150, Math.ceil(lx + Math.max(top.length * 5.4, sub.length * 5.1)) + 10), title)
   } else if (a.kind === 'queue') {
     const t = `${Math.floor(a.seconds / 60)}:${String(a.seconds % 60).padStart(2, '0')}`
     s += `<circle cx="16" cy="18" r="6" fill="${C.or}"/><circle cx="16" cy="18" r="10" fill="none" stroke="${C.or}" stroke-dasharray="2 2"/>` + T(32, 25, t, { s: 18, w: 300 }) + T(84, 15, 'IN QUEUE', { s: 8, w: 700, ls: 1 }) + T(84, 28, `${a.rating} ±${a.range}`, { s: 8.5, c: C.stone2 })
@@ -1288,6 +1290,8 @@ export function bandStrip(a: Strip) {
     s += T(40, 15, won ? 'VICTORY' : a.outcome === 'lost' ? 'LOSS' : 'DRAW', { s: 9, w: 700, c: won ? C.or : C.stone2, ls: 1.5 }) + T(40, 28, sub, { s: 8.5, c: !unrated && a.placing?.placedIn ? C.or : C.stone2 })
     s += T(150, 26, a.mine, { s: 18, w: 300, c: C.or }) + T(150 + String(a.mine).length * 11 + 4, 24, ':', { s: 12, c: C.stone2 }) + T(150 + String(a.mine).length * 11 + 12, 26, a.theirs, { s: 18, w: 300 }) + T(292, 23, `${a.mode ?? 'RANKED'} ${hrs(a.hours)}`, { s: 7.5, w: 600, a: 'end', c: C.stone2, ls: 1 })
     alt = `${won ? 'Victory' : a.outcome === 'lost' ? 'Loss' : 'Draw'}, ${a.mine} to ${a.theirs}`
+    const line = a.line?.trim()
+    if (line) lineAt(300, line)
   }
   return svg(w, h, alt, s, bg, { rx: 8, flat: true })
 }
